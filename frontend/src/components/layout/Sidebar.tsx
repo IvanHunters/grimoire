@@ -368,14 +368,21 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         console.log('Move note', note.title, 'to folder', targetFolderPath)
 
         // Update note folder via API
-        await fetch(`/api/notes/${note.id}`, {
+        const response = await fetch(`/api/notes/${note.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ folder: targetFolderPath })
         })
 
+        if (!response.ok) {
+          throw new Error(`Failed to update note: ${response.statusText}`)
+        }
+
+        console.log('Note moved successfully, refreshing...')
+
         // Refresh notes list
         await fetchNotes()
+        console.log('Notes refreshed')
       } else if (draggedItem.type === 'folder') {
         const folder = draggedItem.data as typeof folders[0]
 
@@ -392,16 +399,25 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         const folderName = folder.path.split('/').pop() || folder.path
         const newPath = `${targetFolderPath}/${folderName}`
 
+        console.log('Moving folder from', folder.path, 'to', newPath)
+
         // Move folder via API
-        await fetch('/api/folders/move', {
+        const response = await fetch('/api/folders/move', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ from: folder.path, to: newPath })
         })
 
+        if (!response.ok) {
+          throw new Error(`Failed to move folder: ${response.statusText}`)
+        }
+
+        console.log('Folder moved successfully, refreshing...')
+
         // Refresh both lists
         await fetchFolders()
         await fetchNotes()
+        console.log('Lists refreshed')
       }
     } catch (error) {
       console.error('Failed to move item:', error)
@@ -443,14 +459,21 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         console.log('Move note', note.title, 'to root')
 
         // Update note folder to empty (root)
-        await fetch(`/api/notes/${note.id}`, {
+        const response = await fetch(`/api/notes/${note.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ folder: '' })
         })
 
+        if (!response.ok) {
+          throw new Error(`Failed to update note: ${response.statusText}`)
+        }
+
+        console.log('Note moved to root successfully, refreshing...')
+
         // Refresh notes list
         await fetchNotes()
+        console.log('Notes refreshed')
       } else if (draggedItem.type === 'folder') {
         const folder = draggedItem.data as typeof folders[0]
 
@@ -466,16 +489,25 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         // Get just the folder name (last part of path)
         const folderName = folder.path.split('/').pop() || folder.path
 
+        console.log('Moving folder from', folder.path, 'to', folderName)
+
         // Move folder to root
-        await fetch('/api/folders/move', {
+        const response = await fetch('/api/folders/move', {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ from: folder.path, to: folderName })
         })
 
+        if (!response.ok) {
+          throw new Error(`Failed to move folder: ${response.statusText}`)
+        }
+
+        console.log('Folder moved to root successfully, refreshing...')
+
         // Refresh both lists
         await fetchFolders()
         await fetchNotes()
+        console.log('Lists refreshed')
       }
     } catch (error) {
       console.error('Failed to move item:', error)
