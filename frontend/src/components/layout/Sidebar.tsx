@@ -155,6 +155,50 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     traverse(folderNode)
     return result
   }
+
+  // Get all folder paths from tree
+  const getAllFolderPaths = (node: FolderNode): string[] => {
+    const paths: string[] = []
+    const traverse = (n: FolderNode) => {
+      if (n.path) paths.push(n.path)
+      if (n.children) n.children.forEach(traverse)
+    }
+    traverse(node)
+    return paths
+  }
+
+  // Get parent folder paths for a given path
+  const getParentPaths = (path: string): string[] => {
+    const parts = path.split('/')
+    const parents: string[] = []
+    for (let i = 1; i < parts.length; i++) {
+      parents.push(parts.slice(0, i).join('/'))
+    }
+    return parents
+  }
+
+  // Initialize: collapse all folders
+  useEffect(() => {
+    if (folderTree) {
+      const allPaths = getAllFolderPaths(folderTree)
+      setCollapsedFolders(new Set(allPaths))
+    }
+  }, [folderTree])
+
+  // Auto-expand folder when note is selected
+  useEffect(() => {
+    if (currentNote && currentNote.folder) {
+      setCollapsedFolders((prev) => {
+        const newSet = new Set(prev)
+        // Expand current folder
+        newSet.delete(currentNote.folder)
+        // Expand all parent folders
+        const parents = getParentPaths(currentNote.folder)
+        parents.forEach(parent => newSet.delete(parent))
+        return newSet
+      })
+    }
+  }, [currentNote?.id])
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [toggleVisible, setToggleVisible] = useState(false)
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(false)

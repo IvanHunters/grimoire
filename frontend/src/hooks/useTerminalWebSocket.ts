@@ -52,7 +52,7 @@ export function useTerminalWebSocket({ sessionId, dangerousMode = true, currentN
             folder: currentNote.folder || '',
             content: currentNote.content,
             type: currentNote.type || '',
-            projectPath: currentNote.project_path || '',
+            projectPath: currentNote.projectPath || '',
           } : null,
         }))
       }
