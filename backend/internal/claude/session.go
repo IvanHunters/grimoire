@@ -24,6 +24,7 @@ type ClaudeSession struct {
 	LastActivity  time.Time
 	Messages      []models.ClaudeMessage // History stored on backend
 	OutputBuffer  []byte                 // Circular buffer for terminal output (last 500KB)
+	outputChan    chan []byte            // Channel to broadcast PTY output to all WebSocket clients
 	mu            sync.Mutex
 }
 
@@ -131,4 +132,14 @@ func (s *ClaudeSession) GetOutputBuffer() []byte {
 	buffer := make([]byte, len(s.OutputBuffer))
 	copy(buffer, s.OutputBuffer)
 	return buffer
+}
+
+// SubscribeToOutput returns a channel that will receive all PTY output
+func (s *ClaudeSession) SubscribeToOutput() <-chan []byte {
+	return s.outputChan
+}
+
+// GetOutputChan returns the output channel (for internal use)
+func (s *ClaudeSession) GetOutputChan() chan<- []byte {
+	return s.outputChan
 }

@@ -1,7 +1,6 @@
 package websocket
 
 import (
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -151,9 +150,8 @@ func (h *Handler) handleInit(conn *websocket.Conn, msg *WSMessage) {
 		})
 	}
 
-	// Start streaming output from Claude subprocess
-	// Only start if not already streaming
-	go h.streamClaudeOutput(session, conn)
+	// Subscribe to PTY output for this WebSocket connection
+	go h.streamPTYOutput(session, conn)
 }
 
 // handleMessage sends a message to Claude subprocess
@@ -286,55 +284,36 @@ func (h *Handler) handleCloseSession(conn *websocket.Conn, msg *WSMessage) {
 	})
 }
 
-// streamClaudeOutput streams raw PTY output to WebSocket (for terminal emulator)
-func (h *Handler) streamClaudeOutput(session *claude.ClaudeSession, conn *websocket.Conn) {
-	h.logger.Info("starting PTY output stream", slog.String("session_id", session.ID))
-	buf := make([]byte, 4096)
+// streamPTYOutput subscribes to PTY output channel and sends to WebSocket
+func (h *Handler) streamPTYOutput(session *claude.ClaudeSession, conn *websocket.Conn) {
+	h.logger.Info("subscribing to PTY output", slog.String("session_id", session.ID))
 
-	for {
-		h.logger.Debug("waiting for PTY read", slog.String("session_id", session.ID))
-		n, err := session.PTY.Read(buf)
+	outputChan := session.SubscribeToOutput()
+
+	for data := range outputChan {
+		// Send to WebSocket
+		err := conn.WriteJSON(WSResponse{
+			Type:      "terminal_output",
+			SessionID: session.ID,
+			Content:   string(data),
+		})
 		if err != nil {
-			if err != io.EOF {
-				h.logger.Error("error reading from PTY", slog.Any("error", err))
-			} else {
-				h.logger.Info("PTY EOF reached", slog.String("session_id", session.ID))
-			}
-			break
+			h.logger.Error("failed to send terminal output to WebSocket", slog.Any("error", err))
+			return
 		}
 
-		h.logger.Info("PTY read data", slog.String("session_id", session.ID), slog.Int("bytes", n))
-
-		if n > 0 {
-			// Save output to session buffer for replay on reconnect
-			session.AppendOutput(buf[:n])
-
-			// Send raw bytes to WebSocket
-			err := conn.WriteJSON(WSResponse{
-				Type:      "terminal_output",
-				SessionID: session.ID,
-				Content:   string(buf[:n]),
-			})
-			if err != nil {
-				h.logger.Error("failed to send terminal output to WebSocket", slog.Any("error", err))
-				break
-			}
-
-			preview := string(buf[:n])
-			if len(preview) > 20 {
-				preview = preview[:20] + "..."
-			}
-			h.logger.Info("sent terminal output",
-				slog.String("session_id", session.ID),
-				slog.Int("bytes", n),
-				slog.String("preview", preview),
-			)
-
-			session.UpdateActivity()
+		preview := string(data)
+		if len(preview) > 20 {
+			preview = preview[:20] + "..."
 		}
+		h.logger.Debug("sent terminal output",
+			slog.String("session_id", session.ID),
+			slog.Int("bytes", len(data)),
+			slog.String("preview", preview),
+		)
 	}
 
-	h.logger.Info("PTY output stream ended", slog.String("session_id", session.ID))
+	h.logger.Info("PTY output subscription ended", slog.String("session_id", session.ID))
 }
 
 // isTUIGarbage checks if a line is TUI garbage that should be filtered

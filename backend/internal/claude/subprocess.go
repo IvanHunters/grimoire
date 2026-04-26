@@ -15,6 +15,46 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 )
 
+// startPTYReader reads from PTY and broadcasts to all subscribers
+func startPTYReader(session *ClaudeSession, logger *slog.Logger) {
+	logger.Info("starting PTY reader", slog.String("session_id", session.ID))
+	buf := make([]byte, 4096)
+
+	for {
+		n, err := session.PTY.Read(buf)
+		if err != nil {
+			if err.Error() != "EOF" && err.Error() != "read /dev/ptmx: input/output error" {
+				logger.Error("PTY read error", slog.Any("error", err))
+			}
+			logger.Info("PTY reader stopped", slog.String("session_id", session.ID))
+			return
+		}
+
+		if n > 0 {
+			data := make([]byte, n)
+			copy(data, buf[:n])
+
+			// Save to buffer
+			session.AppendOutput(data)
+
+			// Broadcast to all subscribers (non-blocking)
+			select {
+			case session.outputChan <- data:
+				logger.Debug("broadcast PTY output",
+					slog.String("session_id", session.ID),
+					slog.Int("bytes", n),
+				)
+			default:
+				logger.Warn("output channel full, dropping data",
+					slog.String("session_id", session.ID),
+				)
+			}
+
+			session.UpdateActivity()
+		}
+	}
+}
+
 // startClaudeSubprocess starts a new Claude subprocess using PTY
 func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger) (*ClaudeSession, error) {
 	// Setup MCP configuration automatically
@@ -58,6 +98,8 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 
 	// Create session
 	now := time.Now()
+	outputChan := make(chan []byte, 100) // Buffered channel for PTY output broadcast
+
 	session := &ClaudeSession{
 		ID:            sessionID,
 		Name:          "Terminal Session", // Default name, can be updated later
@@ -70,7 +112,11 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 		LastActivity:  now,
 		Messages:      make([]models.ClaudeMessage, 0),
 		OutputBuffer:  make([]byte, 0, 1024), // Initialize with small capacity
+		outputChan:    outputChan,
 	}
+
+	// Start PTY reader goroutine (runs once for the session lifetime)
+	go startPTYReader(session, logger)
 
 	// Start background goroutine to wait for process exit
 	// This prevents zombie processes
@@ -85,6 +131,8 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 				slog.String("session_id", sessionID),
 			)
 		}
+		// Close output channel when process exits
+		close(outputChan)
 	}()
 
 	logger.Info("claude subprocess started",
