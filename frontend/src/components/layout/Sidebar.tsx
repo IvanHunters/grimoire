@@ -13,7 +13,7 @@ interface SidebarProps {
 }
 
 function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
-  const { notes, folders, currentNote, fetchNotes, fetchFolders, deleteNote, deleteFolder } = useNotes()
+  const { notes, folders, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
     new Set((folders || []).filter((f) => f.isCollapsed).map((f) => f.path))
   )
@@ -113,7 +113,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
       {
         icon: 'fa-folder-plus',
         text: 'New Folder',
-        action: () => setNewNoteModal({ visible: true, defaultFolder: folderPath }),
+        action: () => handleCreateFolder(folderPath),
       },
       { divider: true, text: '' },
       {
@@ -211,10 +211,31 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
   }
 
   // Modal handlers
-  const handleCreateNote = (name: string, folder: string) => {
+  const handleCreateNote = async (name: string, folder: string) => {
     console.log('Create note:', name, 'in folder:', folder)
-    // TODO: API call to create note
-    // createNote({ title: name, folder, content: '' })
+
+    try {
+      await createNote(name, folder, '')
+      // Close modal
+      setNewNoteModal({ visible: false, defaultFolder: '' })
+    } catch (error) {
+      console.error('Failed to create note:', error)
+      alert('Failed to create note. See console for details.')
+    }
+  }
+
+  const handleCreateFolder = async (parentPath: string) => {
+    const folderName = prompt('Enter folder name:')
+    if (!folderName) return
+
+    const newPath = parentPath ? `${parentPath}/${folderName}` : folderName
+
+    try {
+      await createFolder(newPath)
+    } catch (error) {
+      console.error('Failed to create folder:', error)
+      alert('Failed to create folder. See console for details.')
+    }
   }
 
   const handleRename = async (newName: string) => {

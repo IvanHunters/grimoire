@@ -42,9 +42,14 @@ function HomePage() {
       const note = notes.find(n => n.id === noteId)
       if (note && note.id !== currentNote?.id) {
         setCurrentNote(note)
+      } else if (!note) {
+        // Note not found - show error and redirect to home
+        console.error('Note not found:', noteId)
+        alert(`Note not found (ID: ${noteId}). Redirecting to home.`)
+        navigate('/')
       }
     }
-  }, [noteId, notes, currentNote?.id, setCurrentNote])
+  }, [noteId, notes, currentNote?.id, setCurrentNote, navigate])
 
   // Reset resize widths when switching from split view
   useEffect(() => {
