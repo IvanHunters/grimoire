@@ -49,7 +49,8 @@ function HomePage() {
         navigate('/')
       }
     }
-  }, [noteId, notes, currentNote?.id, setCurrentNote, navigate])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [noteId, notes, currentNote?.id, setCurrentNote])
 
   // Reset resize widths when switching from split view
   useEffect(() => {
