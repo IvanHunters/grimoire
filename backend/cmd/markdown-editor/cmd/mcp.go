@@ -74,6 +74,8 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	// Register tools
 	registerNoteTools(s, mcpCtx)
 	registerGraphTools(s, mcpCtx)
+	registerFolderTools(s, mcpCtx)
+	registerNoteManagementTools(s, mcpCtx)
 
 	logger.Info("mcp server starting")
 
