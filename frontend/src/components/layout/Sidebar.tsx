@@ -13,7 +13,7 @@ interface SidebarProps {
 }
 
 function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
-  const { notes, folders, currentNote, deleteNote, deleteFolder } = useNotes()
+  const { notes, folders, currentNote, fetchNotes, deleteNote, deleteFolder } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
     new Set((folders || []).filter((f) => f.isCollapsed).map((f) => f.path))
   )
@@ -217,14 +217,35 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     // createNote({ title: name, folder, content: '' })
   }
 
-  const handleRename = (newName: string) => {
+  const handleRename = async (newName: string) => {
     console.log('Rename', renameModal.type, 'to:', newName)
-    // TODO: API call to rename
-    // if (renameModal.type === 'note') {
-    //   updateNote(renameModal.itemPath, { title: newName })
-    // } else {
-    //   renameFolder(renameModal.itemPath, newName)
-    // }
+
+    try {
+      if (renameModal.type === 'note') {
+        // Find note by path to get ID
+        const note = (notes || []).find(n => n.path === renameModal.itemPath)
+        if (note) {
+          // Update note title via API
+          await fetch(`/api/notes/${note.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ title: newName })
+          })
+
+          // Refresh notes list
+          await fetchNotes()
+        }
+      } else {
+        // Folder rename requires backend implementation (MoveFolder)
+        alert('Folder renaming is not implemented yet (backend TODO)')
+      }
+
+      // Close modal
+      setRenameModal({ visible: false, type: 'note', currentName: '', itemPath: '' })
+    } catch (error) {
+      console.error('Failed to rename:', error)
+      alert('Failed to rename. See console for details.')
+    }
   }
 
   const handleDelete = async () => {
