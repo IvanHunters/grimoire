@@ -17,7 +17,13 @@ function HomePage() {
   const { noteId } = useParams<{ noteId: string }>()
   const navigate = useNavigate()
   const { notes, currentNote, setCurrentNote, updateNote } = useNotes()
-  const [viewMode, setViewMode] = useState<ViewMode>('split')
+
+  // Load saved view mode from localStorage, default to 'preview'
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    const saved = localStorage.getItem('viewMode')
+    return (saved === 'editor' || saved === 'split' || saved === 'preview') ? saved : 'preview'
+  })
+
   const [editorWidth, setEditorWidth] = useState<number | null>(null)
   const [previewWidth, setPreviewWidth] = useState<number | null>(null)
   const [insertMarkdown, setInsertMarkdown] = useState<((type: string, value?: string) => void) | null>(null)
@@ -28,6 +34,11 @@ function HomePage() {
   const containerRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<HTMLDivElement>(null)
   const previewRef = useRef<HTMLDivElement>(null)
+
+  // Save view mode to localStorage when changed
+  useEffect(() => {
+    localStorage.setItem('viewMode', viewMode)
+  }, [viewMode])
 
   // Update editor content when note changes
   useEffect(() => {
