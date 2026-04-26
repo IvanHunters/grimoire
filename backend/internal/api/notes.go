@@ -73,7 +73,12 @@ func (h *Handler) CreateNote(w http.ResponseWriter, r *http.Request) {
 
 	// Generate note ID and path
 	noteID := uuid.New().String()
-	fileName := slugify(req.Title) + ".md"
+	slug := slugify(req.Title)
+	// Fallback to ID if slug is empty (e.g., non-Latin title)
+	if slug == "" {
+		slug = noteID
+	}
+	fileName := slug + ".md"
 
 	var path string
 	if req.Folder != "" {
@@ -179,7 +184,13 @@ func (h *Handler) UpdateNote(w http.ResponseWriter, r *http.Request) {
 			note.Folder = newFolder
 
 			// Recalculate path based on new folder
-			fileName := slugify(note.Title) + ".md"
+			slug := slugify(note.Title)
+			// Fallback to ID if slug is empty (e.g., non-Latin title)
+			if slug == "" {
+				slug = note.ID
+			}
+			fileName := slug + ".md"
+
 			if newFolder != "" {
 				note.Path = newFolder + "/" + fileName
 			} else {
