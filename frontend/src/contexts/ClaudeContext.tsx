@@ -54,8 +54,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'message_start':
         // Claude started generating response
         if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) =>
-            prev.map((s) =>
+          setSessions((prev) => 
+            (prev || []).map((s) =>
               s.id === currentSessionId
                 ? { ...s, isActive: true }
                 : s
@@ -67,8 +67,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'content_delta':
         // Streaming content chunk
         if (currentSessionId && message.sessionId === currentSessionId && message.content) {
-          setSessions((prev) =>
-            prev.map((s) => {
+          setSessions((prev) => 
+            (prev || []).map((s) => {
               if (s.id !== currentSessionId) return s
 
               const lastMessage = s.messages[s.messages.length - 1]
@@ -109,8 +109,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'tool_use':
         // Claude is using a tool
         if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) =>
-            prev.map((s) => {
+          setSessions((prev) => 
+            (prev || []).map((s) => {
               if (s.id !== currentSessionId) return s
 
               const lastMessage = s.messages[s.messages.length - 1]
@@ -136,8 +136,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'message_complete':
         // Claude finished generating response
         if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) =>
-            prev.map((s) =>
+          setSessions((prev) => 
+            (prev || []).map((s) =>
               s.id === currentSessionId
                 ? { ...s, isActive: false, lastActivity: new Date() }
                 : s
@@ -150,8 +150,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         // Error occurred
         console.error('Claude error:', message.error)
         if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) =>
-            prev.map((s) => {
+          setSessions((prev) => 
+            (prev || []).map((s) => {
               if (s.id !== currentSessionId) return s
               return {
                 ...s,
@@ -174,8 +174,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'stopped':
         // Generation stopped by user
         if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) =>
-            prev.map((s) =>
+          setSessions((prev) => 
+            (prev || []).map((s) =>
               s.id === currentSessionId
                 ? { ...s, isActive: false }
                 : s
@@ -187,10 +187,10 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'session_history':
         // Received session history (when switching to existing session)
         if (message.sessionId && message.messages) {
-          setSessions((prev) => {
+          setSessions((prev) =>  {
             const exists = prev.find((s) => s.id === message.sessionId)
             if (exists) {
-              return prev.map((s) =>
+              return (prev || []).map((s) =>
                 s.id === message.sessionId
                   ? { ...s, messages: message.messages as Message[] }
                   : s
@@ -223,7 +223,7 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         lastActivity: new Date(),
       }
 
-      setSessions((prev) => [...prev, newSession])
+      setSessions((prev) =>  [...prev, newSession])
       setCurrentSessionId(sessionId)
 
       // Send init message to backend
@@ -256,7 +256,7 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         sessionId,
       })
 
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId))
+      setSessions((prev) =>  (prev || []).filter((s) => s.id !== sessionId))
 
       if (currentSessionId === sessionId) {
         setCurrentSessionId(null)
@@ -272,8 +272,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         sessionId,
       })
 
-      setSessions((prev) =>
-        prev.map((s) =>
+      setSessions((prev) => 
+        (prev || []).map((s) =>
           s.id === sessionId
             ? { ...s, messages: [], isActive: false }
             : s
@@ -295,8 +295,8 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         timestamp: new Date(),
       }
 
-      setSessions((prev) =>
-        prev.map((s) =>
+      setSessions((prev) => 
+        (prev || []).map((s) =>
           s.id === currentSessionId
             ? { ...s, messages: [...s.messages, userMessage], isActive: true }
             : s

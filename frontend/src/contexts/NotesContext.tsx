@@ -100,7 +100,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         folder,
         content,
       })
-      setNotes((prev) => [...prev, newNote])
+      setNotes((prev) => [...(prev || []), newNote])
       return newNote
     } catch (err) {
       setError('Failed to create note')
@@ -115,7 +115,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       const updated = await notesAPI.updateNote(id, { content })
 
       setNotes((prev) =>
-        prev.map((note) => (note.id === id ? updated : note))
+        (prev || []).map((note) => (note.id === id ? updated : note))
       )
 
       if (currentNote?.id === id) {
@@ -132,7 +132,7 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     try {
       setError(null)
       await notesAPI.deleteNote(id)
-      setNotes((prev) => prev.filter((note) => note.id !== id))
+      setNotes((prev) => (prev || []).filter((note) => note.id !== id))
 
       if (currentNote?.id === id) {
         setCurrentNote(null)
