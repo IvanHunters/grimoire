@@ -17,6 +17,153 @@ import (
 )
 
 func registerAttachmentTools(s *server.MCPServer, ctx *MCPContext) {
+	// upload_file_from_path - Upload a file from local filesystem
+	s.AddTool(
+		mcp.NewTool("upload_file_from_path",
+			mcp.WithDescription("Upload a file from local filesystem path and attach to note"),
+			mcp.WithString("note_id",
+				mcp.Required(),
+				mcp.Description("Note ID or path where to attach the file"),
+			),
+			mcp.WithString("file_path",
+				mcp.Required(),
+				mcp.Description("Local filesystem path to the file to upload"),
+			),
+			mcp.WithString("alt_text",
+				mcp.Description("Alt text for images or link text for other files (optional)"),
+			),
+		),
+		func(reqCtx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			noteID := request.GetString("note_id", "")
+			filePath := request.GetString("file_path", "")
+			altText := request.GetString("alt_text", "")
+
+			timeoutCtx, cancel := context.WithTimeout(reqCtx, 10*time.Second)
+			defer cancel()
+
+			// Get note
+			note, err := ctx.store.GetNote(timeoutCtx, noteID)
+			if err != nil {
+				note, err = ctx.store.GetNoteByPath(timeoutCtx, noteID)
+				if err != nil {
+					return &mcp.CallToolResult{
+						Content: []mcp.Content{
+							mcp.NewTextContent(fmt.Sprintf("Note not found: %s", noteID)),
+						},
+					}, nil
+				}
+			}
+
+			// Read file from filesystem
+			fileBytes, err := os.ReadFile(filePath)
+			if err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.NewTextContent(fmt.Sprintf("Failed to read file: %v", err)),
+					},
+				}, nil
+			}
+
+			// Validate file size (10MB max)
+			maxSize := int64(10485760)
+			if int64(len(fileBytes)) > maxSize {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.NewTextContent("File too large (max 10MB)"),
+					},
+				}, nil
+			}
+
+			// Get file extension and base name
+			ext := filepath.Ext(filePath)
+			baseName := filepath.Base(filePath)
+			if altText == "" {
+				// Use filename without extension as alt text
+				altText = strings.TrimSuffix(baseName, ext)
+			}
+
+			// Generate unique filename
+			uniqueFilename := uuid.New().String() + ext
+
+			// Create directory structure: YYYY/MM/
+			now := time.Now()
+			yearMonth := now.Format("2006/01")
+
+			// Get uploads directory from config
+			uploadsDir := "./data/uploads"
+			if ctx.config != nil {
+				uploadsDir = ctx.config.UploadsDir
+			}
+
+			uploadDir := filepath.Join(uploadsDir, yearMonth)
+
+			if err := os.MkdirAll(uploadDir, 0755); err != nil {
+				ctx.logger.Error("failed to create upload directory", "error", err)
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.NewTextContent(fmt.Sprintf("Failed to create directory: %v", err)),
+					},
+				}, nil
+			}
+
+			// Save file
+			destPath := filepath.Join(uploadDir, uniqueFilename)
+			if err := os.WriteFile(destPath, fileBytes, 0644); err != nil {
+				ctx.logger.Error("failed to save file", "error", err)
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.NewTextContent(fmt.Sprintf("Failed to save file: %v", err)),
+					},
+				}, nil
+			}
+
+			// Generate URL
+			url := fmt.Sprintf("/uploads/%s/%s", yearMonth, uniqueFilename)
+
+			// Detect file type and create appropriate markdown
+			var fileMarkdown string
+			lowerExt := strings.ToLower(ext)
+			isImage := lowerExt == ".png" || lowerExt == ".jpg" || lowerExt == ".jpeg" ||
+			           lowerExt == ".gif" || lowerExt == ".svg" || lowerExt == ".webp"
+
+			if isImage {
+				fileMarkdown = fmt.Sprintf("\n\n![%s](%s)", altText, url)
+			} else {
+				fileMarkdown = fmt.Sprintf("\n\n[%s](%s)", altText, url)
+			}
+
+			// Insert markdown link at the end of note
+			note.Content += fileMarkdown
+
+			// Update note
+			if err := ctx.store.UpdateNote(timeoutCtx, note); err != nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{
+						mcp.NewTextContent(fmt.Sprintf("Failed to update note: %v", err)),
+					},
+				}, nil
+			}
+
+			// Publish event
+			ctx.eventBus.Publish(events.Event{
+				Type: events.EventNoteUpdated,
+				Note: note,
+			})
+
+			fileType := "File"
+			if isImage {
+				fileType = "Image"
+			}
+
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					mcp.NewTextContent(fmt.Sprintf("%s uploaded and attached to note!\nOriginal: %s\nURL: %s\nMarkdown: %s",
+						fileType, baseName, url, fileMarkdown)),
+				},
+			}, nil
+		},
+	)
+
 	// upload_image - Upload an image and insert markdown link into note
 	s.AddTool(
 		mcp.NewTool("upload_image",

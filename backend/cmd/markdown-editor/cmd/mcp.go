@@ -55,6 +55,7 @@ func CreateMCPServer(store *storage.MongoStorage, logger *slog.Logger, cfg *conf
 	registerFolderTools(s, mcpCtx)
 	registerNoteManagementTools(s, mcpCtx)
 	registerAttachmentTools(s, mcpCtx)
+	registerContentEditingTools(s, mcpCtx)
 
 	return s
 }
