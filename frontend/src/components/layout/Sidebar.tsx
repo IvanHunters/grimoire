@@ -15,7 +15,7 @@ interface SidebarProps {
 function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
   const { notes, folders, currentNote } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
-    new Set(folders.filter((f) => f.isCollapsed).map((f) => f.path))
+    new Set((folders || []).filter((f) => f.isCollapsed).map((f) => f.path))
   )
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [toggleVisible, setToggleVisible] = useState(false)
@@ -102,7 +102,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     e.preventDefault()
     e.stopPropagation()
 
-    const folder = folders.find((f) => f.path === folderPath)
+    const folder = (folders || []).find((f) => f.path === folderPath)
 
     const items: ContextMenuItem[] = [
       {
@@ -186,7 +186,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     }
 
     // Switch to note (via URL navigation)
-    const note = notes.find(n => n.id === noteId)
+    const note = (notes || []).find(n => n.id === noteId)
     if (note) {
       onNoteSelect?.(note)
     }
@@ -409,9 +409,9 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
       {/* Folder tree */}
       <div className="flex-1 overflow-y-auto p-2">
         <div className="space-y-1">
-          {folders.map((folder) => {
+          {(folders || []).map((folder) => {
             const isCollapsed = collapsedFolders.has(folder.path)
-            const folderNotes = notes.filter((note) => note.folder === folder.path)
+            const folderNotes = (notes || []).filter((note) => note.folder === folder.path)
 
             return (
               <div key={folder.path}>
@@ -514,7 +514,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
             ) : (
               <div className="space-y-1">
                 {chatHistory.map(noteId => {
-                  const note = notes.find(n => n.id === noteId)
+                  const note = (notes || []).find(n => n.id === noteId)
                   const isActive = currentChatNoteId === noteId
                   const isOrphaned = !note
 
@@ -583,7 +583,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         onDrop={handleRootDrop}
       >
         <div className="text-xs text-gray-500 px-2">
-          {notes.length} notes
+          {(notes || []).length} notes
         </div>
       </div>
     </aside>
