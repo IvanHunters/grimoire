@@ -15,6 +15,7 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/api"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	mw "github.com/ivanohotnikov/markdown-editor/internal/middleware"
+	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -62,6 +63,18 @@ func main() {
 
 	db := client.Database(cfg.MongoDBDatabase)
 
+	// Ensure indexes
+	store := storage.NewMongoStorage(db)
+	if err := store.EnsureIndexes(ctx); err != nil {
+		logger.Error("failed to ensure indexes", slog.Any("error", err))
+		os.Exit(1)
+	}
+	if err := store.EnsureFolderIndexes(ctx); err != nil {
+		logger.Error("failed to ensure folder indexes", slog.Any("error", err))
+		os.Exit(1)
+	}
+	logger.Info("indexes created")
+
 	// Create handler
 	handler := api.NewHandler(cfg, db, logger)
 
@@ -77,32 +90,32 @@ func main() {
 	// Routes
 	r.Get("/health", handler.Health)
 
-	// API routes (to be implemented in later phases)
+	// API routes
 	r.Route("/api", func(r chi.Router) {
-		// Notes endpoints (Phase 3)
-		// r.Get("/notes", handler.ListNotes)
-		// r.Get("/notes/{id}", handler.GetNote)
-		// r.Post("/notes", handler.CreateNote)
-		// r.Put("/notes/{id}", handler.UpdateNote)
-		// r.Delete("/notes/{id}", handler.DeleteNote)
-		// r.Get("/notes/project-suggestions", handler.ProjectSuggestions)
+		// Notes endpoints
+		r.Get("/notes", handler.ListNotes)
+		r.Get("/notes/project-suggestions", handler.ProjectSuggestions)
+		r.Get("/notes/{id}", handler.GetNote)
+		r.Post("/notes", handler.CreateNote)
+		r.Put("/notes/{id}", handler.UpdateNote)
+		r.Delete("/notes/{id}", handler.DeleteNote)
 
-		// Folders endpoints (Phase 3)
-		// r.Get("/folders", handler.ListFolders)
-		// r.Post("/folders", handler.CreateFolder)
-		// r.Delete("/folders", handler.DeleteFolder)
-		// r.Put("/folders/move", handler.MoveFolder)
+		// Folders endpoints
+		r.Get("/folders", handler.ListFolders)
+		r.Post("/folders", handler.CreateFolder)
+		r.Delete("/folders", handler.DeleteFolder)
+		r.Put("/folders/move", handler.MoveFolder)
 
-		// Search endpoint (Phase 3)
-		// r.Get("/search", handler.Search)
+		// Search endpoint
+		r.Get("/search", handler.Search)
 
-		// Upload endpoint (Phase 3)
-		// r.Post("/upload", handler.Upload)
+		// Upload endpoint
+		r.Post("/upload", handler.Upload)
 	})
 
 	// Serve static files (uploads)
-	// fileServer := http.FileServer(http.Dir(cfg.UploadsDir))
-	// r.Handle("/uploads/*", http.StripPrefix("/uploads/", fileServer))
+	fileServer := http.FileServer(http.Dir(cfg.UploadsDir))
+	r.Handle("/uploads/*", http.StripPrefix("/uploads/", fileServer))
 
 	// Create HTTP server
 	srv := &http.Server{
