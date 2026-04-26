@@ -13,7 +13,7 @@ interface SidebarProps {
 }
 
 function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
-  const { notes, folders, currentNote, fetchNotes, deleteNote, deleteFolder } = useNotes()
+  const { notes, folders, currentNote, fetchNotes, fetchFolders, deleteNote, deleteFolder } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
     new Set((folders || []).filter((f) => f.isCollapsed).map((f) => f.path))
   )
@@ -236,8 +236,21 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
           await fetchNotes()
         }
       } else {
-        // Folder rename requires backend implementation (MoveFolder)
-        alert('Folder renaming is not implemented yet (backend TODO)')
+        // Rename folder by moving to new path
+        const oldPath = renameModal.itemPath
+        const pathParts = oldPath.split('/')
+        pathParts[pathParts.length - 1] = newName
+        const newPath = pathParts.join('/')
+
+        // Call MoveFolder API
+        await fetch('/api/folders/move', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: oldPath, to: newPath })
+        })
+
+        // Refresh folders list
+        await fetchFolders()
       }
 
       // Close modal
