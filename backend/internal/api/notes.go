@@ -96,6 +96,28 @@ func (h *Handler) CreateNote(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	store := storage.NewMongoStorage(h.db)
+
+	// Auto-create folder if specified
+	if req.Folder != "" {
+		// Create all parent folders
+		parts := strings.Split(req.Folder, "/")
+		currentPath := ""
+		for _, part := range parts {
+			if currentPath == "" {
+				currentPath = part
+			} else {
+				currentPath = currentPath + "/" + part
+			}
+
+			folder := &models.Folder{
+				Path: currentPath,
+			}
+
+			// Ignore error if folder already exists
+			_ = store.CreateFolder(ctx, folder)
+		}
+	}
+
 	if err := store.CreateNote(ctx, note); err != nil {
 		h.logger.Error("failed to create note", "error", err)
 		http.Error(w, "Failed to create note", http.StatusInternalServerError)
