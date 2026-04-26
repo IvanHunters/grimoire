@@ -101,6 +101,12 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         content,
       })
       setNotes((prev) => [...(prev || []), newNote])
+
+      // Refresh folders list if folder was specified (backend auto-creates it)
+      if (folder) {
+        await fetchFolders()
+      }
+
       return newNote
     } catch (err) {
       setError('Failed to create note')
