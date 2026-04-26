@@ -43,9 +43,14 @@ export default function SearchModal({ visible, onClose, onNoteSelect }: SearchMo
 
         // Create results with snippets
         const searchResults = notes.map((note: Note) => {
-          // Extract snippet around first occurrence of query
-          const content = note.content.toLowerCase()
           const queryLower = query.toLowerCase()
+          const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi')
+
+          // Highlight query in title
+          const highlightedTitle = note.title.replace(regex, '<mark>$1</mark>')
+
+          // Extract snippet around first occurrence of query in content
+          const content = note.content.toLowerCase()
           const index = content.indexOf(queryLower)
 
           let snippet = ''
@@ -59,17 +64,16 @@ export default function SearchModal({ visible, onClose, onNoteSelect }: SearchMo
             if (end < note.content.length) snippet = snippet + '...'
 
             // Highlight query in snippet
-            const regex = new RegExp(`(${query})`, 'gi')
             snippet = snippet.replace(regex, '<mark>$1</mark>')
           } else {
-            // If not in content, might be in title - just show start of content
+            // If not in content, just show start of content
             snippet = note.content.slice(0, 100)
             if (note.content.length > 100) snippet += '...'
           }
 
           return {
             id: note.id,
-            title: note.title,
+            title: highlightedTitle,
             path: note.path,
             snippet: snippet,
           }
@@ -165,7 +169,10 @@ export default function SearchModal({ visible, onClose, onNoteSelect }: SearchMo
                 >
                   <div className="flex items-center gap-2 mb-1">
                     <FileText className="w-4 h-4 text-gray-400" />
-                    <div className="font-medium text-gray-900">{result.title}</div>
+                    <div
+                      className="font-medium text-gray-900"
+                      dangerouslySetInnerHTML={{ __html: result.title }}
+                    />
                   </div>
                   <div className="text-xs text-gray-500 mb-2">{result.path}</div>
                   <div
