@@ -65,11 +65,8 @@ backend/
 # Install dependencies
 go mod download
 
-# Build HTTP server
-go build -o server ./cmd/server
-
-# Build WebSocket server
-go build -o websocket ./cmd/websocket
+# Build single binary
+go build -o bin/markdown-editor ./cmd/markdown-editor
 ```
 
 ## Configuration
@@ -90,25 +87,31 @@ See `.env.example` for all available options.
 docker compose up -d
 ```
 
-### Start HTTP Server
+### Start All Servers (HTTP + WebSocket)
 
 ```bash
-./server
+./bin/markdown-editor serve
 # or
-go run ./cmd/server
+go run ./cmd/markdown-editor serve
 ```
 
-Server will start on `:8080`
+This starts:
+- HTTP API server on `:8080`
+- WebSocket server on `:3000`
 
-### Start WebSocket Server
+### MCP Server
+
+MCP server is **automatically configured** when Claude subprocess starts!
+
+You can also run it manually:
 
 ```bash
-./websocket
+./bin/markdown-editor mcp
 # or
-go run ./cmd/websocket
+go run ./cmd/markdown-editor mcp
 ```
 
-WebSocket server will start on `:3000`
+**No manual setup required** - backend auto-creates `.claude/mcp_servers.json` for each Claude session.
 
 ## API Endpoints
 
@@ -178,6 +181,31 @@ Types: `session_started`, `message_start`, `content_delta`, `tool_use`, `message
 
 ## Features
 
+### Real-time Events (New!)
+
+When Claude modifies notes through MCP, all connected WebSocket clients receive instant notifications:
+
+**Event types:**
+- `note_created` - New note created
+- `note_updated` - Note modified
+- `note_deleted` - Note removed
+- `folder_created` - New folder
+- `folder_deleted` - Folder removed
+
+**WebSocket message format:**
+```json
+{
+  "type": "note_created",
+  "note": {
+    "id": "...",
+    "title": "...",
+    "content": "..."
+  }
+}
+```
+
+Frontend automatically updates UI when Claude makes changes - zero refresh needed!
+
 ### Wikilinks & Backlinks
 
 Notes support wikilinks in format `[[note-title]]` or `[[note-title|alias]]`.
@@ -192,6 +220,31 @@ When creating a project note, backend searches for matching projects in `~/git/g
 
 1. Exact match by normalized title
 2. Fuzzy match (contains)
+
+### Automatic MCP Configuration
+
+Backend automatically configures Claude CLI to use MCP server:
+
+1. When starting Claude subprocess, creates `.claude/mcp_servers.json` in working directory
+2. Determines binary path dynamically (`/path/to/markdown-editor mcp`)
+3. Passes MongoDB credentials via environment variables
+4. Claude auto-discovers and connects to MCP server
+
+**No manual setup needed!** Just start the backend and Claude subprocess will have access to all MCP tools.
+
+Configuration created:
+```json
+{
+  "markdown-editor": {
+    "command": "/absolute/path/to/markdown-editor",
+    "args": ["mcp"],
+    "env": {
+      "MONGODB_URI": "mongodb://localhost:27017",
+      "MONGODB_DATABASE": "markdown_editor"
+    }
+  }
+}
+```
 
 ### PTY-based Subprocess
 
