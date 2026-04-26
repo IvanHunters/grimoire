@@ -16,7 +16,7 @@ import ChatPanel from '../components/chat/ChatPanel'
 function HomePage() {
   const { noteId } = useParams<{ noteId: string }>()
   const navigate = useNavigate()
-  const { notes, currentNote, setCurrentNote } = useNotes()
+  const { notes, currentNote, setCurrentNote, updateNote } = useNotes()
   const [viewMode, setViewMode] = useState<ViewMode>('split')
   const [editorWidth, setEditorWidth] = useState<number | null>(null)
   const [previewWidth, setPreviewWidth] = useState<number | null>(null)
@@ -94,6 +94,22 @@ function HomePage() {
   const handleContentChange = (content: string) => {
     setEditorContent(content)
   }
+
+  // Auto-save content with debounce
+  useEffect(() => {
+    if (!currentNote || editorContent === currentNote.content) {
+      return
+    }
+
+    const timeoutId = setTimeout(() => {
+      console.log('Auto-saving note:', currentNote.id)
+      updateNote(currentNote.id, editorContent).catch((error) => {
+        console.error('Failed to save note:', error)
+      })
+    }, 1000) // 1 second debounce
+
+    return () => clearTimeout(timeoutId)
+  }, [editorContent, currentNote, updateNote])
 
   const handleNoteSelect = (note: typeof notes[0]) => {
     // Update URL to reflect selected note
