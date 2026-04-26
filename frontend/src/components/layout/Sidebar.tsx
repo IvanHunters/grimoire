@@ -348,38 +348,64 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     setDragOverFolder(null)
   }
 
-  const handleFolderDrop = (e: React.DragEvent, targetFolderPath: string) => {
+  const handleFolderDrop = async (e: React.DragEvent, targetFolderPath: string) => {
     e.preventDefault()
     e.stopPropagation()
 
     if (!draggedItem) return
 
-    if (draggedItem.type === 'note') {
-      const note = draggedItem.data as typeof notes[0]
+    try {
+      if (draggedItem.type === 'note') {
+        const note = draggedItem.data as typeof notes[0]
 
-      // Don't move if already in this folder
-      if (note.folder === targetFolderPath) {
-        setDraggedItem(null)
-        setDragOverFolder(null)
-        return
+        // Don't move if already in this folder
+        if (note.folder === targetFolderPath) {
+          setDraggedItem(null)
+          setDragOverFolder(null)
+          return
+        }
+
+        console.log('Move note', note.title, 'to folder', targetFolderPath)
+
+        // Update note folder via API
+        await fetch(`/api/notes/${note.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folder: targetFolderPath })
+        })
+
+        // Refresh notes list
+        await fetchNotes()
+      } else if (draggedItem.type === 'folder') {
+        const folder = draggedItem.data as typeof folders[0]
+
+        // Don't allow dropping folder into itself
+        if (folder.path === targetFolderPath || targetFolderPath.startsWith(folder.path + '/')) {
+          setDraggedItem(null)
+          setDragOverFolder(null)
+          return
+        }
+
+        console.log('Move folder', folder.path, 'into', targetFolderPath)
+
+        // Construct new path: targetFolder/folderName
+        const folderName = folder.path.split('/').pop() || folder.path
+        const newPath = `${targetFolderPath}/${folderName}`
+
+        // Move folder via API
+        await fetch('/api/folders/move', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: folder.path, to: newPath })
+        })
+
+        // Refresh both lists
+        await fetchFolders()
+        await fetchNotes()
       }
-
-      console.log('Move note', note.title, 'to folder', targetFolderPath)
-      // TODO: API call to update note.folder
-      // updateNote(note.id, { folder: targetFolderPath })
-    } else if (draggedItem.type === 'folder') {
-      const folder = draggedItem.data as typeof folders[0]
-
-      // Don't allow dropping folder into itself
-      if (folder.path === targetFolderPath || targetFolderPath.startsWith(folder.path + '/')) {
-        setDraggedItem(null)
-        setDragOverFolder(null)
-        return
-      }
-
-      console.log('Move folder', folder.path, 'into', targetFolderPath)
-      // TODO: API call to move folder
-      // moveFolder(folder.path, targetFolderPath)
+    } catch (error) {
+      console.error('Failed to move item:', error)
+      alert('Failed to move. See console for details.')
     }
 
     setDraggedItem(null)
@@ -397,38 +423,63 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     setDragOverFolder(null)
   }
 
-  const handleRootDrop = (e: React.DragEvent) => {
+  const handleRootDrop = async (e: React.DragEvent) => {
     e.preventDefault()
     e.stopPropagation()
 
     if (!draggedItem) return
 
-    if (draggedItem.type === 'note') {
-      const note = draggedItem.data as typeof notes[0]
+    try {
+      if (draggedItem.type === 'note') {
+        const note = draggedItem.data as typeof notes[0]
 
-      // Don't move if already in root
-      if (!note.folder || note.folder === '') {
-        setDraggedItem(null)
-        setDragOverFolder(null)
-        return
+        // Don't move if already in root
+        if (!note.folder || note.folder === '') {
+          setDraggedItem(null)
+          setDragOverFolder(null)
+          return
+        }
+
+        console.log('Move note', note.title, 'to root')
+
+        // Update note folder to empty (root)
+        await fetch(`/api/notes/${note.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folder: '' })
+        })
+
+        // Refresh notes list
+        await fetchNotes()
+      } else if (draggedItem.type === 'folder') {
+        const folder = draggedItem.data as typeof folders[0]
+
+        // Check if already in root
+        if (!folder.path.includes('/')) {
+          setDraggedItem(null)
+          setDragOverFolder(null)
+          return
+        }
+
+        console.log('Move folder', folder.path, 'to root')
+
+        // Get just the folder name (last part of path)
+        const folderName = folder.path.split('/').pop() || folder.path
+
+        // Move folder to root
+        await fetch('/api/folders/move', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: folder.path, to: folderName })
+        })
+
+        // Refresh both lists
+        await fetchFolders()
+        await fetchNotes()
       }
-
-      console.log('Move note', note.title, 'to root')
-      // TODO: API call to update note.folder to empty/root
-      // updateNote(note.id, { folder: '' })
-    } else if (draggedItem.type === 'folder') {
-      const folder = draggedItem.data as typeof folders[0]
-
-      // Check if already in root
-      if (!folder.path.includes('/')) {
-        setDraggedItem(null)
-        setDragOverFolder(null)
-        return
-      }
-
-      console.log('Move folder', folder.path, 'to root')
-      // TODO: API call to move folder to root
-      // moveFolder(folder.path, '')
+    } catch (error) {
+      console.error('Failed to move item:', error)
+      alert('Failed to move. See console for details.')
     }
 
     setDraggedItem(null)
