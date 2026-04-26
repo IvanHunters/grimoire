@@ -748,15 +748,20 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
 
       {/* Sidebar footer - drop zone for root */}
       <div
-        className={`border-t border-gray-200 p-2 ${
-          dragOverFolder === 'root' ? 'drag-over' : ''
+        className={`border-t border-gray-200 p-2 transition-colors ${
+          dragOverFolder === 'root' ? 'drag-over bg-purple-50' : ''
         }`}
         onDragOver={handleRootDragOver}
         onDragLeave={handleRootDragLeave}
         onDrop={handleRootDrop}
       >
-        <div className="text-xs text-gray-500 px-2">
-          {(notes || []).length} notes
+        <div className="text-xs px-2">
+          <span className="text-gray-500">{(notes || []).length} notes</span>
+          {dragOverFolder === 'root' && (
+            <span className="ml-2 text-purple-600 font-medium">
+              📁 Drop here for root
+            </span>
+          )}
         </div>
       </div>
     </aside>
