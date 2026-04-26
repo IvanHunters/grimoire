@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
+	"github.com/ivanohotnikov/markdown-editor/internal/events"
 )
 
 var upgrader = websocket.Upgrader{
@@ -51,6 +52,16 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	h.logger.Info("websocket connection established",
 		slog.String("remote", r.RemoteAddr),
 	)
+
+	// Subscribe to events
+	eventBus := events.GetEventBus()
+	eventChan := eventBus.Subscribe()
+	defer eventBus.Unsubscribe(eventChan)
+
+	// Start event listener goroutine
+	done := make(chan struct{})
+	go h.handleEvents(conn, eventChan, done)
+	defer close(done)
 
 	// Message loop
 	for {
@@ -323,4 +334,55 @@ func (h *Handler) streamClaudeOutput(session *claude.ClaudeSession, conn *websoc
 // SetCheckOrigin sets the origin checker for WebSocket upgrader
 func (h *Handler) SetCheckOrigin(check func(*http.Request) bool) {
 	upgrader.CheckOrigin = check
+}
+
+// handleEvents listens for events and sends them to WebSocket client
+func (h *Handler) handleEvents(conn *websocket.Conn, eventChan chan events.Event, done chan struct{}) {
+	for {
+		select {
+		case event := <-eventChan:
+			// Convert event to WebSocket response
+			var wsType string
+			switch event.Type {
+			case events.EventNoteCreated:
+				wsType = "note_created"
+			case events.EventNoteUpdated:
+				wsType = "note_updated"
+			case events.EventNoteDeleted:
+				wsType = "note_deleted"
+			case events.EventFolderCreated:
+				wsType = "folder_created"
+			case events.EventFolderDeleted:
+				wsType = "folder_deleted"
+			default:
+				continue
+			}
+
+			// Send event to client
+			response := map[string]interface{}{
+				"type": wsType,
+			}
+
+			if event.Note != nil {
+				response["note"] = event.Note
+			}
+			if event.Folder != nil {
+				response["folder"] = event.Folder
+			}
+			if event.NoteID != "" {
+				response["noteId"] = event.NoteID
+			}
+			if event.Path != "" {
+				response["path"] = event.Path
+			}
+
+			if err := conn.WriteJSON(response); err != nil {
+				h.logger.Error("failed to send event to client", slog.Any("error", err))
+				return
+			}
+
+		case <-done:
+			return
+		}
+	}
 }

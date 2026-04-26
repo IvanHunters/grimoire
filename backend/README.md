@@ -15,18 +15,23 @@ Go backend for markdown editor with Claude AI integration.
 
 ## Architecture
 
-### Two-Server Pattern
+### Single Binary with Multiple Modes
 
-1. **HTTP Server** (`:8080`) - REST API for CRUD operations
-2. **WebSocket Server** (`:3000`) - Claude chat with real-time streaming
+One binary `markdown-editor` with subcommands:
+- **`serve`** - Runs HTTP (`:8080`) + WebSocket (`:3000`) servers together
+- **`mcp`** - Runs MCP server for Claude Code integration (stdio)
 
 ### Project Structure
 
 ```
 backend/
 ├── cmd/
-│   ├── server/       # HTTP server entry point
-│   └── websocket/    # WebSocket server entry point
+│   └── markdown-editor/  # Single entry point with subcommands
+│       ├── main.go
+│       └── cmd/
+│           ├── root.go   # Root command
+│           ├── serve.go  # HTTP + WebSocket servers
+│           └── mcp.go    # MCP server
 ├── internal/
 │   ├── api/          # HTTP handlers
 │   ├── storage/      # MongoDB operations

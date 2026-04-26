@@ -1,4 +1,4 @@
-package main
+package cmd
 
 import (
 	"context"
@@ -9,25 +9,34 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
+	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/spf13/cobra"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type MCPContext struct {
-	store  *storage.MongoStorage
-	logger *slog.Logger
+	store    *storage.MongoStorage
+	logger   *slog.Logger
+	eventBus *events.EventBus
 }
 
-func main() {
+var mcpCmd = &cobra.Command{
+	Use:   "mcp",
+	Short: "Start MCP server for Claude Code integration",
+	Long:  `Starts Model Context Protocol server using stdio transport for Claude Code`,
+	RunE:  runMCP,
+}
+
+func runMCP(cmd *cobra.Command, args []string) error {
 	// Load configuration
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to load config: %w", err)
 	}
 
 	// Setup logger
@@ -42,8 +51,7 @@ func main() {
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(cfg.MongoDBURI))
 	if err != nil {
-		logger.Error("failed to connect to mongodb", slog.Any("error", err))
-		os.Exit(1)
+		return fmt.Errorf("failed to connect to mongodb: %w", err)
 	}
 	defer client.Disconnect(context.Background())
 
@@ -51,8 +59,9 @@ func main() {
 	store := storage.NewMongoStorage(db)
 
 	mcpCtx := &MCPContext{
-		store:  store,
-		logger: logger,
+		store:    store,
+		logger:   logger,
+		eventBus: events.GetEventBus(),
 	}
 
 	// Create MCP server
@@ -69,13 +78,14 @@ func main() {
 
 	// Start server (stdio mode)
 	if err := server.ServeStdio(s); err != nil {
-		logger.Error("server error", slog.Any("error", err))
-		os.Exit(1)
+		return fmt.Errorf("server error: %w", err)
 	}
+
+	return nil
 }
 
 func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
-	// list_notes - List all notes in a folder
+	// list_notes
 	s.AddTool(
 		mcp.NewTool("list_notes",
 			mcp.WithDescription("List all notes, optionally filtered by folder"),
@@ -85,7 +95,6 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		),
 		func(reqCtx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			folder := request.GetString("folder", "")
-
 			timeoutCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
 			defer cancel()
 
@@ -111,7 +120,7 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		},
 	)
 
-	// read_note - Read a note by path or ID
+	// read_note
 	s.AddTool(
 		mcp.NewTool("read_note",
 			mcp.WithDescription("Read a note by its path or ID"),
@@ -122,14 +131,11 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		),
 		func(reqCtx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			id := request.GetString("id", "")
-
 			timeoutCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
 			defer cancel()
 
-			// Try to get by ID first
 			note, err := ctx.store.GetNote(timeoutCtx, id)
 			if err != nil {
-				// Try by path
 				note, err = ctx.store.GetNoteByPath(timeoutCtx, id)
 				if err != nil {
 					return &mcp.CallToolResult{
@@ -151,7 +157,7 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		},
 	)
 
-	// create_note - Create a new note
+	// create_note
 	s.AddTool(
 		mcp.NewTool("create_note",
 			mcp.WithDescription("Create a new note"),
@@ -172,7 +178,6 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 			content := request.GetString("content", "")
 			folder := request.GetString("folder", "")
 
-			// Generate note path
 			fileName := normalizeTitle(title) + ".md"
 			path := fileName
 			if folder != "" {
@@ -198,6 +203,12 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 				}, nil
 			}
 
+			// Publish event
+			ctx.eventBus.Publish(events.Event{
+				Type: events.EventNoteCreated,
+				Note: note,
+			})
+
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{
 					mcp.NewTextContent(fmt.Sprintf("Note created: %s (ID: %s)", note.Path, note.ID)),
@@ -206,7 +217,7 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		},
 	)
 
-	// search_notes - Full-text search
+	// search_notes
 	s.AddTool(
 		mcp.NewTool("search_notes",
 			mcp.WithDescription("Search notes by content"),
@@ -217,7 +228,6 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		),
 		func(reqCtx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			query := request.GetString("query", "")
-
 			timeoutCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
 			defer cancel()
 
@@ -243,7 +253,7 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 		},
 	)
 
-	// create_folder - Create a folder
+	// create_folder
 	s.AddTool(
 		mcp.NewTool("create_folder",
 			mcp.WithDescription("Create a new folder"),
@@ -279,7 +289,6 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 	)
 }
 
-// normalizeTitle converts title to lowercase slug
 func normalizeTitle(title string) string {
 	result := ""
 	for _, r := range title {
@@ -291,7 +300,6 @@ func normalizeTitle(title string) string {
 			result += "-"
 		}
 	}
-	// Remove consecutive hyphens
 	for i := 0; i < len(result)-1; i++ {
 		if result[i] == '-' && result[i+1] == '-' {
 			result = result[:i] + result[i+1:]

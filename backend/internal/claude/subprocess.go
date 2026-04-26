@@ -1,10 +1,12 @@
 package claude
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -14,6 +16,12 @@ import (
 
 // startClaudeSubprocess starts a new Claude subprocess using PTY
 func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, logger *slog.Logger) (*ClaudeSession, error) {
+	// Setup MCP configuration automatically
+	mcpConfigPath, err := setupMCPConfig(workingDir, logger)
+	if err != nil {
+		logger.Warn("failed to setup MCP config, continuing without it", slog.Any("error", err))
+	}
+
 	// Build command arguments
 	args := []string{}
 	if dangerousMode {
@@ -25,7 +33,12 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 	cmd.Dir = workingDir
 
 	// Set environment variables
-	cmd.Env = os.Environ()
+	env := os.Environ()
+	if mcpConfigPath != "" {
+		// Claude CLI will read MCP config from .claude directory in working dir
+		logger.Info("mcp config created", slog.String("path", mcpConfigPath))
+	}
+	cmd.Env = env
 
 	// Start with PTY
 	ptmx, err := pty.Start(cmd)
@@ -113,4 +126,53 @@ func shutdownSession(session *ClaudeSession, logger *slog.Logger) error {
 	)
 
 	return nil
+}
+
+// setupMCPConfig creates MCP configuration for Claude CLI
+func setupMCPConfig(workingDir string, logger *slog.Logger) (string, error) {
+	// Get absolute path to markdown-editor binary
+	execPath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("failed to get executable path: %w", err)
+	}
+	execDir := filepath.Dir(execPath)
+	mcpBinary := filepath.Join(execDir, "markdown-editor")
+
+	// Verify MCP binary exists
+	if _, err := os.Stat(mcpBinary); os.IsNotExist(err) {
+		return "", fmt.Errorf("mcp binary not found at %s", mcpBinary)
+	}
+
+	// Create .claude directory in working dir
+	claudeDir := filepath.Join(workingDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create .claude directory: %w", err)
+	}
+
+	// Create MCP config
+	mcpConfig := map[string]interface{}{
+		"markdown-editor": map[string]interface{}{
+			"command": mcpBinary,
+			"args":    []string{"mcp"},
+			"env": map[string]string{
+				"MONGODB_URI":      os.Getenv("MONGODB_URI"),
+				"MONGODB_DATABASE": os.Getenv("MONGODB_DATABASE"),
+			},
+		},
+	}
+
+	configPath := filepath.Join(claudeDir, "mcp_servers.json")
+	configFile, err := os.Create(configPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create mcp config file: %w", err)
+	}
+	defer configFile.Close()
+
+	encoder := json.NewEncoder(configFile)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(mcpConfig); err != nil {
+		return "", fmt.Errorf("failed to write mcp config: %w", err)
+	}
+
+	return configPath, nil
 }
