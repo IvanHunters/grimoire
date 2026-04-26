@@ -91,7 +91,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	httpRouter.Use(middleware.Compress(5))
 
 	// Create MCP server
-	mcpServer := CreateMCPServer(store, logger)
+	mcpServer := CreateMCPServer(store, logger, cfg)
 	mcpHTTPServer := server.NewStreamableHTTPServer(mcpServer)
 
 	// Routes

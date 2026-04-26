@@ -23,6 +23,7 @@ type MCPContext struct {
 	store    *storage.MongoStorage
 	logger   *slog.Logger
 	eventBus *events.EventBus
+	config   *config.Config
 }
 
 var mcpCmd = &cobra.Command{
@@ -33,11 +34,12 @@ var mcpCmd = &cobra.Command{
 }
 
 // CreateMCPServer создаёт и настраивает MCP сервер
-func CreateMCPServer(store *storage.MongoStorage, logger *slog.Logger) *server.MCPServer {
+func CreateMCPServer(store *storage.MongoStorage, logger *slog.Logger, cfg *config.Config) *server.MCPServer {
 	mcpCtx := &MCPContext{
 		store:    store,
 		logger:   logger,
 		eventBus: events.GetEventBus(),
+		config:   cfg,
 	}
 
 	// Create MCP server
@@ -52,6 +54,7 @@ func CreateMCPServer(store *storage.MongoStorage, logger *slog.Logger) *server.M
 	registerGraphTools(s, mcpCtx)
 	registerFolderTools(s, mcpCtx)
 	registerNoteManagementTools(s, mcpCtx)
+	registerAttachmentTools(s, mcpCtx)
 
 	return s
 }
@@ -82,7 +85,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	db := client.Database(cfg.MongoDBDatabase)
 	store := storage.NewMongoStorage(db)
 
-	s := CreateMCPServer(store, logger)
+	s := CreateMCPServer(store, logger, cfg)
 
 	logger.Info("mcp server starting")
 
