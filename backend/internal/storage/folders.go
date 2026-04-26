@@ -137,6 +137,116 @@ func BuildFolderTree(folders []*models.Folder) *models.FolderNode {
 	return root
 }
 
+// MoveFolder renames/moves a folder and updates all affected notes and subfolders
+func (s *MongoStorage) MoveFolder(ctx context.Context, fromPath, toPath string) error {
+	// Validate paths
+	if fromPath == "" || toPath == "" {
+		return fmt.Errorf("from and to paths are required")
+	}
+	if fromPath == toPath {
+		return fmt.Errorf("from and to paths are the same")
+	}
+
+	// Check if destination folder already exists
+	foldersCollection := s.db.Collection(foldersCollection)
+	count, err := foldersCollection.CountDocuments(ctx, bson.M{"path": toPath})
+	if err != nil {
+		return fmt.Errorf("failed to check destination folder: %w", err)
+	}
+	if count > 0 {
+		return fmt.Errorf("destination folder already exists: %s", toPath)
+	}
+
+	// Check if source folder exists
+	count, err = foldersCollection.CountDocuments(ctx, bson.M{"path": fromPath})
+	if err != nil {
+		return fmt.Errorf("failed to check source folder: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("source folder not found: %s", fromPath)
+	}
+
+	// 1. Update all notes in this folder and subfolders
+	notesCollection := s.db.Collection(notesCollection)
+
+	// Find all notes that need updating
+	notesFilter := bson.M{
+		"$or": []bson.M{
+			{"folder": fromPath},
+			{"folder": bson.M{"$regex": "^" + regexp.QuoteMeta(fromPath) + "/"}},
+		},
+	}
+
+	cursor, err := notesCollection.Find(ctx, notesFilter)
+	if err != nil {
+		return fmt.Errorf("failed to find notes in folder: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var notes []*models.Note
+	if err := cursor.All(ctx, &notes); err != nil {
+		return fmt.Errorf("failed to decode notes: %w", err)
+	}
+
+	// Update each note's folder and path
+	for _, note := range notes {
+		oldFolder := note.Folder
+		oldPath := note.Path
+
+		// Replace folder prefix
+		newFolder := strings.Replace(oldFolder, fromPath, toPath, 1)
+		newPath := strings.Replace(oldPath, fromPath, toPath, 1)
+
+		// Update note
+		update := bson.M{
+			"$set": bson.M{
+				"folder":     newFolder,
+				"path":       newPath,
+				"updated_at": time.Now(),
+			},
+		}
+
+		_, err := notesCollection.UpdateOne(ctx, bson.M{"id": note.ID}, update)
+		if err != nil {
+			return fmt.Errorf("failed to update note %s: %w", note.ID, err)
+		}
+	}
+
+	// 2. Update the folder itself
+	update := bson.M{"$set": bson.M{"path": toPath}}
+	_, err = foldersCollection.UpdateOne(ctx, bson.M{"path": fromPath}, update)
+	if err != nil {
+		return fmt.Errorf("failed to update folder path: %w", err)
+	}
+
+	// 3. Update all subfolders
+	subfoldersFilter := bson.M{"path": bson.M{"$regex": "^" + regexp.QuoteMeta(fromPath) + "/"}}
+
+	cursor, err = foldersCollection.Find(ctx, subfoldersFilter)
+	if err != nil {
+		return fmt.Errorf("failed to find subfolders: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var subfolders []*models.Folder
+	if err := cursor.All(ctx, &subfolders); err != nil {
+		return fmt.Errorf("failed to decode subfolders: %w", err)
+	}
+
+	for _, subfolder := range subfolders {
+		oldPath := subfolder.Path
+		newPath := strings.Replace(oldPath, fromPath, toPath, 1)
+
+		update := bson.M{"$set": bson.M{"path": newPath}}
+		_, err := foldersCollection.UpdateOne(ctx, bson.M{"path": oldPath}, update)
+		if err != nil {
+			return fmt.Errorf("failed to update subfolder %s: %w", oldPath, err)
+		}
+	}
+
+	return nil
+}
+
 // EnsureFolderIndexes creates required MongoDB indexes for folders collection
 func (s *MongoStorage) EnsureFolderIndexes(ctx context.Context) error {
 	collection := s.db.Collection(foldersCollection)

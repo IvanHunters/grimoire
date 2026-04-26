@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -96,11 +97,17 @@ func (h *Handler) MoveFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: Implement folder moving logic
-	// This requires:
-	// 1. Update all notes in the folder to new folder path
-	// 2. Update folder path itself
-	// 3. Update all subfolders
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
 
-	http.Error(w, "Not implemented yet", http.StatusNotImplemented)
+	store := storage.NewMongoStorage(h.db)
+
+	// Move folder and update all affected notes and subfolders
+	if err := store.MoveFolder(ctx, req.From, req.To); err != nil {
+		h.logger.Error("failed to move folder", "from", req.From, "to", req.To, "error", err)
+		http.Error(w, fmt.Sprintf("Failed to move folder: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
