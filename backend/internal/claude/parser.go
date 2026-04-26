@@ -11,9 +11,9 @@ type ToolUse struct {
 	Args string
 }
 
-// parseToolUse extracts tool name from Claude output
+// ParseToolUse extracts tool name from Claude output
 // Format: "🔧 tool_name" or "Tool: tool_name" or similar
-func parseToolUse(line string) *ToolUse {
+func ParseToolUse(line string) *ToolUse {
 	// Pattern 1: "🔧 tool_name(args)"
 	re1 := regexp.MustCompile(`🔧\s+(\w+)(?:\((.*?)\))?`)
 	matches := re1.FindStringSubmatch(line)
@@ -46,8 +46,8 @@ func parseToolUse(line string) *ToolUse {
 	return nil
 }
 
-// detectInterrupted checks if the line indicates an interruption
-func detectInterrupted(line string) bool {
+// DetectInterrupted checks if the line indicates an interruption
+func DetectInterrupted(line string) bool {
 	lowerLine := strings.ToLower(line)
 
 	keywords := []string{
@@ -82,8 +82,8 @@ func isHTMLTag(tag string) bool {
 	return htmlTags[strings.ToLower(tag)]
 }
 
-// isMessageComplete checks if a line indicates message completion
-func isMessageComplete(line string) bool {
+// IsMessageComplete checks if a line indicates message completion
+func IsMessageComplete(line string) bool {
 	// Common indicators of message completion
 	indicators := []string{
 		"message complete",
@@ -102,8 +102,8 @@ func isMessageComplete(line string) bool {
 	return false
 }
 
-// stripANSI removes ANSI escape codes from a string
-func stripANSI(s string) string {
+// StripANSI removes ANSI escape codes from a string
+func StripANSI(s string) string {
 	// ANSI escape code pattern
 	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 	return ansiRegex.ReplaceAllString(s, "")
