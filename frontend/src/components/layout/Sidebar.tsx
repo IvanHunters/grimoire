@@ -23,7 +23,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
   const [chatHistory, setChatHistory] = useState<string[]>([]) // Note IDs with chat history
   const sidebarRef = useRef<HTMLElement>(null)
   const toggleRef = useRef<HTMLButtonElement>(null)
-  const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const hoverTimeoutRef = useRef<number | null>(null)
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{
@@ -115,7 +115,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         text: 'New Folder',
         action: () => setNewNoteModal({ visible: true, defaultFolder: folderPath }),
       },
-      { divider: true },
+      { divider: true, text: '' },
       {
         icon: 'fa-trash',
         text: 'Delete Folder',
@@ -157,7 +157,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         text: 'Chat with this note',
         action: () => handleOpenChatWithNote(note.id),
       },
-      { divider: true },
+      { divider: true, text: '' },
       {
         icon: 'fa-trash',
         text: 'Delete Note',

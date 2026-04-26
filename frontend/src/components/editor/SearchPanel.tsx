@@ -3,7 +3,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 interface SearchPanelProps {
   visible: boolean
   onClose: () => void
-  textareaRef: React.RefObject<HTMLTextAreaElement>
+  textareaRef: React.RefObject<HTMLTextAreaElement | null>
   onUpdateHighlights: (matches: Array<{ index: number; length: number }>, currentMatch: number) => void
   onSyncScroll?: () => void
   showReplaceInitially?: boolean

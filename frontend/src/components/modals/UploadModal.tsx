@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { X, Upload, File, Image as ImageIcon } from 'lucide-react'
+import { X, Upload, File } from 'lucide-react'
 
 interface UploadModalProps {
   visible: boolean

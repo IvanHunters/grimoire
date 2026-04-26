@@ -10,8 +10,7 @@ let mermaidInitialized = false
 
 function MermaidDiagram({ code }: MermaidDiagramProps) {
   const mermaidRef = useRef<HTMLDivElement>(null)
-  const idRef = useRef(`mermaid-${++diagramCounter}-${Date.now()}`)
-  const [error, setError] = useState<string | null>(null)
+  const [, setError] = useState<string | null>(null)
 
   useEffect(() => {
     // Initialize mermaid once
