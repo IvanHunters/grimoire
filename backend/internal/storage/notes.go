@@ -116,6 +116,8 @@ func (s *MongoStorage) UpdateNote(ctx context.Context, note *models.Note) error 
 	update := bson.M{
 		"$set": bson.M{
 			"title":          note.Title,
+			"path":           note.Path,
+			"folder":         note.Folder,
 			"content":        note.Content,
 			"type":           note.Type,
 			"project_path":   note.ProjectPath,
