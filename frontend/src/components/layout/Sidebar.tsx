@@ -13,7 +13,7 @@ interface SidebarProps {
 }
 
 function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
-  const { notes, folders, currentNote } = useNotes()
+  const { notes, folders, currentNote, deleteNote, deleteFolder } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
     new Set((folders || []).filter((f) => f.isCollapsed).map((f) => f.path))
   )
@@ -227,14 +227,26 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     // }
   }
 
-  const handleDelete = () => {
+  const handleDelete = async () => {
     console.log('Delete', deleteModal.type, ':', deleteModal.itemPath)
-    // TODO: API call to delete
-    // if (deleteModal.type === 'note') {
-    //   deleteNote(deleteModal.itemPath)
-    // } else {
-    //   deleteFolder(deleteModal.itemPath)
-    // }
+
+    try {
+      if (deleteModal.type === 'note') {
+        // Find note by path to get ID
+        const note = (notes || []).find(n => n.path === deleteModal.itemPath)
+        if (note) {
+          await deleteNote(note.id)
+        }
+      } else {
+        await deleteFolder(deleteModal.itemPath)
+      }
+
+      // Close modal
+      setDeleteModal({ visible: false, type: 'note', itemName: '', itemPath: '' })
+    } catch (error) {
+      console.error('Failed to delete:', error)
+      alert('Failed to delete. See console for details.')
+    }
   }
 
   // Drag and drop handlers
