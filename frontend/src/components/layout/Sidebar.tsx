@@ -527,6 +527,29 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
       {/* Folder tree */}
       <div className="flex-1 overflow-y-auto p-2">
         <div className="space-y-1">
+          {/* Root notes (notes without folder) */}
+          {(notes || [])
+            .filter((note) => !note.folder || note.folder === '')
+            .map((note) => (
+              <button
+                key={note.id}
+                draggable
+                onClick={() => handleNoteClick(note)}
+                onContextMenu={(e) => handleNoteContextMenu(e, note)}
+                onDragStart={(e) => handleNoteDragStart(e, note)}
+                onDragEnd={handleNoteDragEnd}
+                className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left transition ${
+                  currentNote?.id === note.id
+                    ? 'bg-purple-100 text-purple-900'
+                    : 'hover:bg-gray-100 text-gray-700'
+                }`}
+              >
+                <FileText className="w-4 h-4 text-gray-500" />
+                <span className="text-sm truncate">{note.title}</span>
+              </button>
+            ))}
+
+          {/* Folders and their notes */}
           {(folders || []).map((folder) => {
             const isCollapsed = collapsedFolders.has(folder.path)
             const folderNotes = (notes || []).filter((note) => note.folder === folder.path)
