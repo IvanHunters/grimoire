@@ -2,14 +2,16 @@ import { useState } from 'react'
 import { Search, FileDown, FilePlus } from 'lucide-react'
 import { useNotes } from '../../contexts/NotesContext'
 import NewNoteModal from '../modals/NewNoteModal'
+import SearchModal from '../modals/SearchModal'
 
 interface HeaderProps {
   onNoteSelect?: (note: any) => void
 }
 
 function Header({ onNoteSelect }: HeaderProps) {
-  const { folders, createNote } = useNotes()
+  const { folders, createNote, notes } = useNotes()
   const [showNewNoteModal, setShowNewNoteModal] = useState(false)
+  const [showSearchModal, setShowSearchModal] = useState(false)
 
   const handleNewNote = () => {
     setShowNewNoteModal(true)
@@ -26,8 +28,14 @@ function Header({ onNoteSelect }: HeaderProps) {
   }
 
   const handleSearch = () => {
-    // Will be implemented with modal
-    console.log('Global search')
+    setShowSearchModal(true)
+  }
+
+  const handleSearchNoteSelect = (noteId: string) => {
+    const note = notes.find(n => n.id === noteId)
+    if (note) {
+      onNoteSelect?.(note)
+    }
   }
 
   const handleExport = () => {
@@ -90,6 +98,13 @@ function Header({ onNoteSelect }: HeaderProps) {
         onClose={() => setShowNewNoteModal(false)}
         folders={folders.map((f) => ({ path: f.path, name: f.name }))}
         onCreate={handleCreateNote}
+      />
+
+      {/* Search Modal */}
+      <SearchModal
+        visible={showSearchModal}
+        onClose={() => setShowSearchModal(false)}
+        onNoteSelect={handleSearchNoteSelect}
       />
     </>
   )

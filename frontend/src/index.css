@@ -90,6 +90,14 @@ body {
   z-index: 11;
 }
 
+/* Search results highlighting */
+mark {
+  background-color: #fef08a;
+  padding: 2px 4px;
+  border-radius: 2px;
+  font-weight: 500;
+}
+
 /* Sidebar toggle */
 #sidebar {
   transition: margin-left 0.3s ease;

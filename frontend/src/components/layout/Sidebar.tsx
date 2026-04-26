@@ -177,11 +177,13 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     return parents
   }
 
-  // Initialize: collapse all folders
+  // Initialize: collapse all folders (only on first mount)
+  const initializedRef = useRef(false)
   useEffect(() => {
-    if (folderTree) {
+    if (folderTree && !initializedRef.current) {
       const allPaths = getAllFolderPaths(folderTree)
       setCollapsedFolders(new Set(allPaths))
+      initializedRef.current = true
     }
   }, [folderTree])
 
