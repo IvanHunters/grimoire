@@ -55,6 +55,10 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
           rehypePlugins={[rehypePrism]}
+          urlTransform={(url) => {
+            // Preserve wikilink: protocol (ReactMarkdown removes it by default)
+            return url
+          }}
           components={{
             // Custom heading renderers with ID generation
             h1: ({ node, children, ...props }) => {

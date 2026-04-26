@@ -18,6 +18,7 @@ import (
 	mw "github.com/ivanohotnikov/markdown-editor/internal/middleware"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 	"github.com/ivanohotnikov/markdown-editor/internal/websocket"
+	"github.com/mark3labs/mcp-go/server"
 	"github.com/spf13/cobra"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -73,6 +74,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := store.EnsureFolderIndexes(ctx); err != nil {
 		return fmt.Errorf("failed to ensure folder indexes: %w", err)
 	}
+
+	// Setup session storage
+	sessionStorage := storage.NewSessionStorage(db)
+	if err := sessionStorage.CreateSessionsIndexes(ctx); err != nil {
+		return fmt.Errorf("failed to create session indexes: %w", err)
+	}
 	logger.Info("indexes created")
 
 	// Setup HTTP server
@@ -82,6 +89,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	httpRouter.Use(mw.Logging(logger))
 	httpRouter.Use(mw.CORS(cfg))
 	httpRouter.Use(middleware.Compress(5))
+
+	// Create MCP server
+	mcpServer := CreateMCPServer(store, logger)
+	mcpHTTPServer := server.NewStreamableHTTPServer(mcpServer)
 
 	// Routes
 	httpRouter.Get("/health", handler.Health)
@@ -102,6 +113,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Post("/upload", handler.Upload)
 	})
 
+	// MCP endpoint (outside /api for simplicity)
+	httpRouter.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		logger.Info("mcp http request", slog.String("method", r.Method), slog.String("path", r.URL.Path))
+		mcpHTTPServer.ServeHTTP(w, r)
+	})
+
 	fileServer := http.FileServer(http.Dir(cfg.UploadsDir))
 	httpRouter.Handle("/uploads/*", http.StripPrefix("/uploads/", fileServer))
 
@@ -114,7 +131,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Setup WebSocket server
-	manager := claude.GetSessionManager(logger)
+	manager := claude.GetSessionManager(logger, sessionStorage, cfg.MongoDBURI, cfg.MongoDBDatabase)
 	timeout := time.Duration(cfg.SessionTimeout) * time.Second
 	manager.MonitorInactiveSessions(timeout, 1*time.Minute)
 

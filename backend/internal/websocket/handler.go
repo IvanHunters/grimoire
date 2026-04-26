@@ -1,7 +1,6 @@
 package websocket
 
 import (
-	"bufio"
 	"io"
 	"log/slog"
 	"net/http"
@@ -73,7 +72,7 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		h.logger.Debug("received websocket message",
+		h.logger.Info("received websocket message",
 			slog.String("type", msg.Type),
 			slog.String("session_id", msg.SessionID),
 		)
@@ -84,6 +83,8 @@ func (h *Handler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			h.handleInit(conn, &msg)
 		case "message":
 			h.handleMessage(conn, &msg)
+		case "terminal_input":
+			h.handleTerminalInput(conn, &msg)
 		case "stop":
 			h.handleStop(conn, &msg)
 		case "switch_session":
@@ -130,14 +131,29 @@ func (h *Handler) handleInit(conn *websocket.Conn, msg *WSMessage) {
 		return
 	}
 
-	// Start streaming output from Claude subprocess
-	go h.streamClaudeOutput(session, conn)
-
 	// Send success response
 	conn.WriteJSON(WSResponse{
 		Type:      "session_started",
 		SessionID: msg.SessionID,
 	})
+
+	// Replay terminal output buffer for reconnects
+	buffer := session.GetOutputBuffer()
+	if len(buffer) > 0 {
+		h.logger.Info("replaying terminal output buffer",
+			slog.String("session_id", session.ID),
+			slog.Int("bytes", len(buffer)),
+		)
+		conn.WriteJSON(WSResponse{
+			Type:      "terminal_output",
+			SessionID: session.ID,
+			Content:   string(buffer),
+		})
+	}
+
+	// Start streaming output from Claude subprocess
+	// Only start if not already streaming
+	go h.streamClaudeOutput(session, conn)
 }
 
 // handleMessage sends a message to Claude subprocess
@@ -162,11 +178,31 @@ func (h *Handler) handleMessage(conn *websocket.Conn, msg *WSMessage) {
 		return
 	}
 
+	// Save messages to MongoDB
+	if err := h.manager.SaveSessionMessages(msg.SessionID); err != nil {
+		h.logger.Warn("failed to save session messages", slog.Any("error", err))
+	}
+
 	// Notify frontend that message was sent
 	conn.WriteJSON(WSResponse{
 		Type:      "message_start",
 		SessionID: msg.SessionID,
 	})
+}
+
+// handleTerminalInput sends raw keystrokes to PTY
+func (h *Handler) handleTerminalInput(conn *websocket.Conn, msg *WSMessage) {
+	session, err := h.manager.Get(msg.SessionID)
+	if err != nil {
+		h.logger.Error("session not found", slog.String("session_id", msg.SessionID))
+		return
+	}
+
+	// Write raw input to PTY
+	_, err = session.PTY.Write([]byte(msg.Content))
+	if err != nil {
+		h.logger.Error("failed to write to PTY", slog.Any("error", err))
+	}
 }
 
 // handleStop sends Ctrl+C to Claude subprocess
@@ -250,85 +286,120 @@ func (h *Handler) handleCloseSession(conn *websocket.Conn, msg *WSMessage) {
 	})
 }
 
-// streamClaudeOutput streams Claude subprocess output to WebSocket
+// streamClaudeOutput streams raw PTY output to WebSocket (for terminal emulator)
 func (h *Handler) streamClaudeOutput(session *claude.ClaudeSession, conn *websocket.Conn) {
-	reader := bufio.NewReader(session.PTY)
-	var currentMessage strings.Builder
+	h.logger.Info("starting PTY output stream", slog.String("session_id", session.ID))
+	buf := make([]byte, 4096)
 
 	for {
-		line, err := reader.ReadString('\n')
+		h.logger.Debug("waiting for PTY read", slog.String("session_id", session.ID))
+		n, err := session.PTY.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				h.logger.Error("error reading from PTY", slog.Any("error", err))
+			} else {
+				h.logger.Info("PTY EOF reached", slog.String("session_id", session.ID))
 			}
 			break
 		}
 
-		// Strip ANSI codes
-		line = claude.StripANSI(line)
-		line = strings.TrimSpace(line)
+		h.logger.Info("PTY read data", slog.String("session_id", session.ID), slog.Int("bytes", n))
 
-		if line == "" {
-			continue
-		}
+		if n > 0 {
+			// Save output to session buffer for replay on reconnect
+			session.AppendOutput(buf[:n])
 
-		h.logger.Debug("claude output", slog.String("line", line))
-
-		// Check for tool use
-		if toolUse := claude.ParseToolUse(line); toolUse != nil {
-			conn.WriteJSON(WSResponse{
-				Type:      "tool_use",
+			// Send raw bytes to WebSocket
+			err := conn.WriteJSON(WSResponse{
+				Type:      "terminal_output",
 				SessionID: session.ID,
-				ToolName:  toolUse.Name,
-				ToolArgs:  toolUse.Args,
+				Content:   string(buf[:n]),
 			})
-			continue
-		}
-
-		// Check for interruption
-		if claude.DetectInterrupted(line) {
-			conn.WriteJSON(WSResponse{
-				Type:      "stopped",
-				SessionID: session.ID,
-			})
-
-			// Add accumulated message to history
-			if currentMessage.Len() > 0 {
-				session.AddAssistantMessage(currentMessage.String())
-				currentMessage.Reset()
+			if err != nil {
+				h.logger.Error("failed to send terminal output to WebSocket", slog.Any("error", err))
+				break
 			}
-			continue
-		}
 
-		// Check for message completion
-		if claude.IsMessageComplete(line) {
-			conn.WriteJSON(WSResponse{
-				Type:      "message_complete",
-				SessionID: session.ID,
-			})
-
-			// Add accumulated message to history
-			if currentMessage.Len() > 0 {
-				session.AddAssistantMessage(currentMessage.String())
-				currentMessage.Reset()
+			preview := string(buf[:n])
+			if len(preview) > 20 {
+				preview = preview[:20] + "..."
 			}
-			continue
+			h.logger.Info("sent terminal output",
+				slog.String("session_id", session.ID),
+				slog.Int("bytes", n),
+				slog.String("preview", preview),
+			)
+
+			session.UpdateActivity()
 		}
-
-		// Regular content - stream it
-		conn.WriteJSON(WSResponse{
-			Type:      "content_delta",
-			SessionID: session.ID,
-			Content:   line,
-		})
-
-		// Accumulate message content
-		currentMessage.WriteString(line)
-		currentMessage.WriteString("\n")
-
-		// Update activity
-		session.UpdateActivity()
 	}
+
+	h.logger.Info("PTY output stream ended", slog.String("session_id", session.ID))
+}
+
+// isTUIGarbage checks if a line is TUI garbage that should be filtered
+func (h *Handler) isTUIGarbage(line string) bool {
+	// Empty or whitespace only
+	if len(line) == 0 {
+		return true
+	}
+
+	// UI borders and decorations
+	if strings.ContainsAny(line, "│╭╰─┤├┬┴┼╔╗╚╝║═╠╣╦╩╬") {
+		return true
+	}
+
+	// Prompt indicators
+	if strings.HasPrefix(line, "❯") || strings.HasPrefix(line, "⏵") {
+		return true
+	}
+
+	// Remove all spaces for matching (ANSI stripping causes words to merge)
+	noSpaces := strings.ReplaceAll(strings.ToLower(line), " ", "")
+
+	// Status messages (without spaces to catch merged words)
+	filters := []string{
+		"updateavailable",
+		"brewupgrade",
+		"claude-code",
+		"ctrl+gtoedit",
+		"ctrl+g",
+		"pressctrl-c",
+		"bypasspermissions",
+		"shift+tab",
+		"claudecode",
+		"welcomeback",
+		"tipsfor",
+		"askclaude",
+		"recentactivity",
+		"norecentactivity",
+		"sonnet4",
+		"claudeteam",
+		"sessions/",
+		".claude/",
+	}
+
+	for _, filter := range filters {
+		if strings.Contains(noSpaces, filter) {
+			return true
+		}
+	}
+
+	// Also check original line with spaces
+	lowerLine := strings.ToLower(line)
+	spacedFilters := []string{
+		"update available",
+		"brew upgrade",
+		"press ctrl-c",
+	}
+
+	for _, filter := range spacedFilters {
+		if strings.Contains(lowerLine, filter) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // SetCheckOrigin sets the origin checker for WebSocket upgrader

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { ChevronLeft, ChevronRight, Folder, FileText, MessageSquare, ChevronDown, ChevronUp, ArrowRight, Trash2, Star } from 'lucide-react'
 import { useNotes } from '../../contexts/NotesContext'
+import type { FolderNode } from '../../types/folder'
 import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
 import NewNoteModal from '../modals/NewNoteModal'
 import RenameModal from '../modals/RenameModal'
@@ -12,11 +13,148 @@ interface SidebarProps {
   currentChatNoteId?: string | null
 }
 
-function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
-  const { notes, folders, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(
-    new Set((folders || []).filter((f) => f.isCollapsed).map((f) => f.path))
+// Recursive folder tree node component
+interface FolderTreeNodeProps {
+  folder: FolderNode
+  level: number
+  notes: any[]
+  currentNote: any
+  collapsedFolders: Set<string>
+  dragOverFolder: string | null
+  onToggleFolder: (path: string) => void
+  onNoteClick: (note: any) => void
+  onFolderContextMenu: (e: React.MouseEvent, path: string) => void
+  onNoteContextMenu: (e: React.MouseEvent, note: any) => void
+  onFolderDragStart: (e: React.DragEvent, folder: FolderNode) => void
+  onFolderDragEnd: (e: React.DragEvent) => void
+  onFolderDragOver: (e: React.DragEvent, path: string) => void
+  onFolderDragLeave: (e: React.DragEvent) => void
+  onFolderDrop: (e: React.DragEvent, path: string) => void
+  onNoteDragStart: (e: React.DragEvent, note: any) => void
+  onNoteDragEnd: (e: React.DragEvent) => void
+}
+
+function FolderTreeNode({
+  folder,
+  level,
+  notes,
+  currentNote,
+  collapsedFolders,
+  dragOverFolder,
+  onToggleFolder,
+  onNoteClick,
+  onFolderContextMenu,
+  onNoteContextMenu,
+  onFolderDragStart,
+  onFolderDragEnd,
+  onFolderDragOver,
+  onFolderDragLeave,
+  onFolderDrop,
+  onNoteDragStart,
+  onNoteDragEnd,
+}: FolderTreeNodeProps) {
+  const isCollapsed = collapsedFolders.has(folder.path)
+  const folderNotes = notes.filter((note) => note.folder === folder.path)
+
+  return (
+    <div>
+      {/* Folder item */}
+      <button
+        draggable
+        onClick={() => onToggleFolder(folder.path)}
+        onContextMenu={(e) => onFolderContextMenu(e, folder.path)}
+        onDragStart={(e) => onFolderDragStart(e, folder)}
+        onDragEnd={onFolderDragEnd}
+        onDragOver={(e) => onFolderDragOver(e, folder.path)}
+        onDragLeave={onFolderDragLeave}
+        onDrop={(e) => onFolderDrop(e, folder.path)}
+        className={`w-full flex items-center gap-2 py-1.5 hover:bg-gray-100 rounded text-left transition ${
+          dragOverFolder === folder.path ? 'drag-over' : ''
+        }`}
+        style={{ paddingLeft: `${level * 12 + 8}px` }}
+      >
+        {isCollapsed ? (
+          <ChevronRight className="w-4 h-4 text-gray-500" />
+        ) : (
+          <ChevronDown className="w-4 h-4 text-gray-500" />
+        )}
+        <Folder className="w-4 h-4 text-gray-600" />
+        <span className="text-sm text-gray-900">{folder.name}</span>
+        <span className="ml-auto text-xs text-gray-500">
+          {folderNotes.length}
+        </span>
+      </button>
+
+      {/* Notes in this folder (if not collapsed) */}
+      {!isCollapsed && folderNotes.length > 0 && (
+        <div className="mt-1 space-y-1">
+          {folderNotes.map((note) => (
+            <button
+              key={note.id}
+              draggable
+              onClick={() => onNoteClick(note)}
+              onContextMenu={(e) => onNoteContextMenu(e, note)}
+              onDragStart={(e) => onNoteDragStart(e, note)}
+              onDragEnd={onNoteDragEnd}
+              className={`w-full flex items-center gap-2 py-1.5 rounded text-left transition ${
+                currentNote?.id === note.id
+                  ? 'bg-purple-100 text-purple-900'
+                  : 'hover:bg-gray-100 text-gray-700'
+              }`}
+              style={{ paddingLeft: `${(level + 1) * 12 + 8}px` }}
+            >
+              <FileText className="w-4 h-4 text-gray-500" />
+              <span className="text-sm truncate">{note.title}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Child folders (recursive) */}
+      {!isCollapsed && folder.children && folder.children.length > 0 && (
+        <div className="mt-1">
+          {folder.children.map((child) => (
+            <FolderTreeNode
+              key={child.path}
+              folder={child}
+              level={level + 1}
+              notes={notes}
+              currentNote={currentNote}
+              collapsedFolders={collapsedFolders}
+              dragOverFolder={dragOverFolder}
+              onToggleFolder={onToggleFolder}
+              onNoteClick={onNoteClick}
+              onFolderContextMenu={onFolderContextMenu}
+              onNoteContextMenu={onNoteContextMenu}
+              onFolderDragStart={onFolderDragStart}
+              onFolderDragEnd={onFolderDragEnd}
+              onFolderDragOver={onFolderDragOver}
+              onFolderDragLeave={onFolderDragLeave}
+              onFolderDrop={onFolderDrop}
+              onNoteDragStart={onNoteDragStart}
+              onNoteDragEnd={onNoteDragEnd}
+            />
+          ))}
+        </div>
+      )}
+    </div>
   )
+}
+
+function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
+  const { notes, folderTree, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set<string>())
+
+  // Flatten folder tree for legacy components (modals)
+  const flattenedFolders = (folderNode: FolderNode): FolderNode[] => {
+    const result: FolderNode[] = []
+    const traverse = (node: FolderNode) => {
+      if (node.path) result.push(node)
+      if (node.children) node.children.forEach(traverse)
+    }
+    traverse(folderNode)
+    return result
+  }
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [toggleVisible, setToggleVisible] = useState(false)
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(false)
@@ -41,7 +179,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
   // Drag and drop state
   const [draggedItem, setDraggedItem] = useState<{
     type: 'note' | 'folder'
-    data: typeof notes[0] | typeof folders[0]
+    data: typeof notes[0] | FolderNode
   } | null>(null)
   const [dragOverFolder, setDragOverFolder] = useState<string | null>(null)
 
@@ -98,11 +236,23 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     }, 100)
   }
 
+  // Helper to find folder by path in tree
+  const findFolderByPath = (tree: FolderNode, path: string): FolderNode | null => {
+    if (tree.path === path) return tree
+    if (tree.children) {
+      for (const child of tree.children) {
+        const found = findFolderByPath(child, path)
+        if (found) return found
+      }
+    }
+    return null
+  }
+
   const handleFolderContextMenu = (e: React.MouseEvent, folderPath: string) => {
     e.preventDefault()
     e.stopPropagation()
 
-    const folder = (folders || []).find((f) => f.path === folderPath)
+    const folder = findFolderByPath(folderTree, folderPath)
 
     const items: ContextMenuItem[] = [
       {
@@ -316,7 +466,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     setDragOverFolder(null)
   }
 
-  const handleFolderDragStart = (e: React.DragEvent, folder: typeof folders[0]) => {
+  const handleFolderDragStart = (e: React.DragEvent, folder: FolderNode) => {
     setDraggedItem({ type: 'folder', data: folder })
     e.currentTarget.classList.add('dragging')
   }
@@ -334,7 +484,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
 
     // Don't allow dropping folder into itself or its children
     if (draggedItem.type === 'folder') {
-      const draggedFolder = draggedItem.data as typeof folders[0]
+      const draggedFolder = draggedItem.data as FolderNode
       if (folderPath === draggedFolder.path || folderPath.startsWith(draggedFolder.path + '/')) {
         return
       }
@@ -384,7 +534,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         await fetchNotes()
         console.log('Notes refreshed')
       } else if (draggedItem.type === 'folder') {
-        const folder = draggedItem.data as typeof folders[0]
+        const folder = draggedItem.data as FolderNode
 
         // Don't allow dropping folder into itself
         if (folder.path === targetFolderPath || targetFolderPath.startsWith(folder.path + '/')) {
@@ -475,7 +625,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         await fetchNotes()
         console.log('Notes refreshed')
       } else if (draggedItem.type === 'folder') {
-        const folder = draggedItem.data as typeof folders[0]
+        const folder = draggedItem.data as FolderNode
 
         // Check if already in root
         if (!folder.path.includes('/')) {
@@ -559,6 +709,30 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
       {/* Folder tree */}
       <div className="flex-1 overflow-y-auto p-2">
         <div className="space-y-1">
+          {/* Recursive folder tree */}
+          {folderTree.children && folderTree.children.map((folder) => (
+            <FolderTreeNode
+              key={folder.path}
+              folder={folder}
+              level={0}
+              notes={notes || []}
+              currentNote={currentNote}
+              collapsedFolders={collapsedFolders}
+              dragOverFolder={dragOverFolder}
+              onToggleFolder={toggleFolder}
+              onNoteClick={handleNoteClick}
+              onFolderContextMenu={handleFolderContextMenu}
+              onNoteContextMenu={handleNoteContextMenu}
+              onFolderDragStart={handleFolderDragStart}
+              onFolderDragEnd={handleFolderDragEnd}
+              onFolderDragOver={handleFolderDragOver}
+              onFolderDragLeave={handleFolderDragLeave}
+              onFolderDrop={handleFolderDrop}
+              onNoteDragStart={handleNoteDragStart}
+              onNoteDragEnd={handleNoteDragEnd}
+            />
+          ))}
+
           {/* Root notes (notes without folder) */}
           {(notes || [])
             .filter((note) => !note.folder || note.folder === '')
@@ -580,66 +754,29 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
                 <span className="text-sm truncate">{note.title}</span>
               </button>
             ))}
+        </div>
 
-          {/* Folders and their notes */}
-          {(folders || []).map((folder) => {
-            const isCollapsed = collapsedFolders.has(folder.path)
-            const folderNotes = (notes || []).filter((note) => note.folder === folder.path)
+        {/* Invisible drop zone for root */}
+        <div
+          className={`h-16 mt-2 rounded transition-colors ${
+            dragOverFolder === 'root' ? 'bg-purple-50 border-2 border-dashed border-purple-300' : ''
+          }`}
+          onDragOver={handleRootDragOver}
+          onDragLeave={handleRootDragLeave}
+          onDrop={handleRootDrop}
+        >
+          {dragOverFolder === 'root' && (
+            <div className="flex items-center justify-center h-full text-xs text-purple-600 font-medium">
+              📁 Drop here for root
+            </div>
+          )}
+        </div>
+      </div>
 
-            return (
-              <div key={folder.path}>
-                {/* Folder item */}
-                <button
-                  draggable
-                  onClick={() => toggleFolder(folder.path)}
-                  onContextMenu={(e) => handleFolderContextMenu(e, folder.path)}
-                  onDragStart={(e) => handleFolderDragStart(e, folder)}
-                  onDragEnd={handleFolderDragEnd}
-                  onDragOver={(e) => handleFolderDragOver(e, folder.path)}
-                  onDragLeave={handleFolderDragLeave}
-                  onDrop={(e) => handleFolderDrop(e, folder.path)}
-                  className={`w-full flex items-center gap-2 px-2 py-1.5 hover:bg-gray-100 rounded text-left transition ${
-                    dragOverFolder === folder.path ? 'drag-over' : ''
-                  }`}
-                >
-                  {isCollapsed ? (
-                    <ChevronRight className="w-4 h-4 text-gray-500" />
-                  ) : (
-                    <ChevronLeft className="w-4 h-4 text-gray-500" />
-                  )}
-                  <Folder className="w-4 h-4 text-gray-600" />
-                  <span className="text-sm text-gray-900">{folder.name}</span>
-                  <span className="ml-auto text-xs text-gray-500">
-                    {folderNotes.length}
-                  </span>
-                </button>
-
-                {/* Notes in folder (if not collapsed) */}
-                {!isCollapsed && (
-                  <div className="ml-6 mt-1 space-y-1">
-                    {folderNotes.map((note) => (
-                      <button
-                        key={note.id}
-                        draggable
-                        onClick={() => handleNoteClick(note)}
-                        onContextMenu={(e) => handleNoteContextMenu(e, note)}
-                        onDragStart={(e) => handleNoteDragStart(e, note)}
-                        onDragEnd={handleNoteDragEnd}
-                        className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left transition ${
-                          currentNote?.id === note.id
-                            ? 'bg-purple-100 text-purple-900'
-                            : 'hover:bg-gray-100 text-gray-700'
-                        }`}
-                      >
-                        <FileText className="w-4 h-4 text-gray-500" />
-                        <span className="text-sm truncate">{note.title}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )
-          })}
+      {/* Sidebar footer */}
+      <div className="border-t border-gray-200 p-2">
+        <div className="text-xs px-2 text-gray-500">
+          {(notes || []).length} notes
         </div>
       </div>
 
@@ -745,25 +882,6 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
           </div>
         )}
       </div>
-
-      {/* Sidebar footer - drop zone for root */}
-      <div
-        className={`border-t border-gray-200 p-2 transition-colors ${
-          dragOverFolder === 'root' ? 'drag-over bg-purple-50' : ''
-        }`}
-        onDragOver={handleRootDragOver}
-        onDragLeave={handleRootDragLeave}
-        onDrop={handleRootDrop}
-      >
-        <div className="text-xs px-2">
-          <span className="text-gray-500">{(notes || []).length} notes</span>
-          {dragOverFolder === 'root' && (
-            <span className="ml-2 text-purple-600 font-medium">
-              📁 Drop here for root
-            </span>
-          )}
-        </div>
-      </div>
     </aside>
 
       {/* Sidebar toggle button */}
@@ -795,7 +913,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
       <NewNoteModal
         visible={newNoteModal.visible}
         onClose={() => setNewNoteModal({ visible: false, defaultFolder: '' })}
-        folders={folders}
+        folders={flattenedFolders(folderTree)}
         defaultFolder={newNoteModal.defaultFolder}
         onCreate={handleCreateNote}
       />

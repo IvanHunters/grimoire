@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,9 +16,9 @@ import (
 )
 
 // startClaudeSubprocess starts a new Claude subprocess using PTY
-func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, logger *slog.Logger) (*ClaudeSession, error) {
+func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger) (*ClaudeSession, error) {
 	// Setup MCP configuration automatically
-	mcpConfigPath, err := setupMCPConfig(workingDir, logger)
+	mcpConfigPath, err := setupMCPConfig(workingDir, mongoURI, mongoDatabase, logger)
 	if err != nil {
 		logger.Warn("failed to setup MCP config, continuing without it", slog.Any("error", err))
 	}
@@ -34,11 +35,20 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 
 	// Set environment variables
 	env := os.Environ()
+
+	// Remove CLAUDECODE env to allow nested Claude sessions
+	filteredEnv := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
+			filteredEnv = append(filteredEnv, e)
+		}
+	}
+
 	if mcpConfigPath != "" {
 		// Claude CLI will read MCP config from .claude directory in working dir
 		logger.Info("mcp config created", slog.String("path", mcpConfigPath))
 	}
-	cmd.Env = env
+	cmd.Env = filteredEnv
 
 	// Start with PTY
 	ptmx, err := pty.Start(cmd)
@@ -47,14 +57,19 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 	}
 
 	// Create session
+	now := time.Now()
 	session := &ClaudeSession{
 		ID:            sessionID,
+		Name:          "Terminal Session", // Default name, can be updated later
 		Cmd:           cmd,
 		PTY:           ptmx,
 		DangerousMode: dangerousMode,
 		WorkingDir:    workingDir,
-		LastActivity:  time.Now(),
+		MCPConfigPath: mcpConfigPath,
+		CreatedAt:     now,
+		LastActivity:  now,
 		Messages:      make([]models.ClaudeMessage, 0),
+		OutputBuffer:  make([]byte, 0, 1024), // Initialize with small capacity
 	}
 
 	// Start background goroutine to wait for process exit
@@ -129,7 +144,7 @@ func shutdownSession(session *ClaudeSession, logger *slog.Logger) error {
 }
 
 // setupMCPConfig creates MCP configuration for Claude CLI
-func setupMCPConfig(workingDir string, logger *slog.Logger) (string, error) {
+func setupMCPConfig(workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger) (string, error) { //nolint:unparam // logger may be used for debugging
 	// Get absolute path to markdown-editor binary
 	execPath, err := os.Executable()
 	if err != nil {
@@ -150,13 +165,13 @@ func setupMCPConfig(workingDir string, logger *slog.Logger) (string, error) {
 	}
 
 	// Create MCP config
-	mcpConfig := map[string]interface{}{
-		"markdown-editor": map[string]interface{}{
+	mcpConfig := map[string]any{
+		"markdown-editor": map[string]any{
 			"command": mcpBinary,
 			"args":    []string{"mcp"},
 			"env": map[string]string{
-				"MONGODB_URI":      os.Getenv("MONGODB_URI"),
-				"MONGODB_DATABASE": os.Getenv("MONGODB_DATABASE"),
+				"MONGODB_URI":      mongoURI,
+				"MONGODB_DATABASE": mongoDatabase,
 			},
 		},
 	}

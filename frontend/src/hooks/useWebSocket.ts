@@ -148,9 +148,11 @@ export function useWebSocket({
   }, [])
 
   useEffect(() => {
+    // Only connect once on mount
     connect()
 
     return () => {
+      // Cleanup only on unmount
       shouldReconnectRef.current = false
       if (reconnectTimeoutRef.current) {
         window.clearTimeout(reconnectTimeoutRef.current)
@@ -159,7 +161,8 @@ export function useWebSocket({
         wsRef.current.close()
       }
     }
-  }, [connect])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []) // Empty deps - only run on mount/unmount
 
   return {
     connectionStatus,

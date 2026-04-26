@@ -16,6 +16,7 @@ export interface ClaudeSession {
   messages: Message[]
   isActive: boolean
   lastActivity: Date
+  initialized: boolean // Whether backend session is initialized
 }
 
 export type WSMessageType =

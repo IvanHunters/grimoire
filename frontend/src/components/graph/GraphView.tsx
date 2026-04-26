@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useNotes } from '../../contexts/NotesContext'
 import { X, RefreshCw } from 'lucide-react'
 import { buildGraphConnections, getConnectedNotes } from '../../utils/wikilinks'
@@ -31,7 +32,8 @@ interface GraphLink {
  * - Interactive navigation
  */
 function GraphView({ visible, onClose }: GraphViewProps) {
-  const { currentNote, notes, setCurrentNote } = useNotes()
+  const { currentNote, notes } = useNotes()
+  const navigate = useNavigate()
   const svgRef = useRef<SVGSVGElement>(null)
   const containerRef = useRef<SVGGElement>(null)
   const [showAll, setShowAll] = useState(false)
@@ -184,7 +186,7 @@ function GraphView({ visible, onClose }: GraphViewProps) {
       circle.addEventListener('click', () => {
         const noteToOpen = notes.find(n => n.id === node.id)
         if (noteToOpen) {
-          setCurrentNote(noteToOpen)
+          navigate(`/notes/${noteToOpen.id}`)
           onClose()
         }
       })

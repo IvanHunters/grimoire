@@ -80,7 +80,7 @@ export function hasWikilinks(content: string): boolean {
  * Tries:
  * 1. Exact path match (e.g., "projects/web-app")
  * 2. Exact title match (case-insensitive)
- * 3. Partial title match (case-insensitive)
+ * 3. Path contains target (for partial paths like "Aenix/Overview")
  */
 export function resolveWikilinkTarget(
   target: string,
@@ -95,15 +95,18 @@ export function resolveWikilinkTarget(
   })
   if (pathMatch) return pathMatch.id
 
-  // 2. Exact title match
+  // 2. Exact title match (case-insensitive)
   const titleMatch = notes.find(note => note.title.toLowerCase() === targetLower)
   if (titleMatch) return titleMatch.id
 
-  // 3. Partial title match (contains)
-  const partialMatch = notes.find(note =>
-    note.title.toLowerCase().includes(targetLower)
-  )
-  if (partialMatch) return partialMatch.id
+  // 3. Path ends with target (for partial paths like "Overview" matching "Projects/Aenix/Overview")
+  const pathEndsMatch = notes.find(note => {
+    const pathWithoutExt = note.path.replace(/\.md$/, '')
+    const pathParts = pathWithoutExt.split('/')
+    const lastPart = pathParts[pathParts.length - 1]
+    return lastPart.toLowerCase() === targetLower
+  })
+  if (pathEndsMatch) return pathEndsMatch.id
 
   return null
 }

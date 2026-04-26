@@ -104,7 +104,22 @@ func IsMessageComplete(line string) bool {
 
 // StripANSI removes ANSI escape codes from a string
 func StripANSI(s string) string {
-	// ANSI escape code pattern
-	ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-	return ansiRegex.ReplaceAllString(s, "")
+	// Comprehensive ANSI escape code patterns
+	// \x1b = ESC character
+	patterns := []string{
+		`\x1b\[[0-9;?]*[a-zA-Z]`,      // CSI sequences: ESC[...letter
+		`\x1b\][^\x07]*\x07`,           // OSC sequences: ESC]...BEL
+		`\x1b\][^\x1b]*\x1b\\`,         // OSC sequences: ESC]...ESC\
+		`\x1b[>=<]`,                    // Other ESC sequences
+		`\x1b[()][AB012]`,              // Character set sequences
+		`\r`,                           // Carriage return
+	}
+
+	result := s
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		result = re.ReplaceAllString(result, "")
+	}
+
+	return result
 }

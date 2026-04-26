@@ -32,6 +32,30 @@ var mcpCmd = &cobra.Command{
 	RunE:  runMCP,
 }
 
+// CreateMCPServer создаёт и настраивает MCP сервер
+func CreateMCPServer(store *storage.MongoStorage, logger *slog.Logger) *server.MCPServer {
+	mcpCtx := &MCPContext{
+		store:    store,
+		logger:   logger,
+		eventBus: events.GetEventBus(),
+	}
+
+	// Create MCP server
+	s := server.NewMCPServer(
+		"Markdown Editor",
+		"1.0.0",
+		server.WithLogging(),
+	)
+
+	// Register tools
+	registerNoteTools(s, mcpCtx)
+	registerGraphTools(s, mcpCtx)
+	registerFolderTools(s, mcpCtx)
+	registerNoteManagementTools(s, mcpCtx)
+
+	return s
+}
+
 func runMCP(cmd *cobra.Command, args []string) error {
 	// Load configuration
 	cfg, err := config.Load()
@@ -58,24 +82,7 @@ func runMCP(cmd *cobra.Command, args []string) error {
 	db := client.Database(cfg.MongoDBDatabase)
 	store := storage.NewMongoStorage(db)
 
-	mcpCtx := &MCPContext{
-		store:    store,
-		logger:   logger,
-		eventBus: events.GetEventBus(),
-	}
-
-	// Create MCP server
-	s := server.NewMCPServer(
-		"Markdown Editor",
-		"1.0.0",
-		server.WithLogging(),
-	)
-
-	// Register tools
-	registerNoteTools(s, mcpCtx)
-	registerGraphTools(s, mcpCtx)
-	registerFolderTools(s, mcpCtx)
-	registerNoteManagementTools(s, mcpCtx)
+	s := CreateMCPServer(store, logger)
 
 	logger.Info("mcp server starting")
 
@@ -187,6 +194,20 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 				path = folder + "/" + fileName
 			}
 
+			timeoutCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
+			defer cancel()
+
+			// Auto-create intermediate folders if they don't exist
+			if folder != "" {
+				if err := ensureFoldersExist(timeoutCtx, ctx.store, folder); err != nil {
+					return &mcp.CallToolResult{
+						Content: []mcp.Content{
+							mcp.NewTextContent(fmt.Sprintf("Error creating folders: %v", err)),
+						},
+					}, nil
+				}
+			}
+
 			note := &models.Note{
 				ID:      uuid.New().String(),
 				Path:    path,
@@ -194,9 +215,6 @@ func registerNoteTools(s *server.MCPServer, ctx *MCPContext) {
 				Folder:  folder,
 				Content: content,
 			}
-
-			timeoutCtx, cancel := context.WithTimeout(reqCtx, 5*time.Second)
-			defer cancel()
 
 			if err := ctx.store.CreateNote(timeoutCtx, note); err != nil {
 				return &mcp.CallToolResult{
@@ -690,4 +708,72 @@ func trim(s string) string {
 		end--
 	}
 	return s[start:end]
+}
+
+// ensureFoldersExist creates all intermediate folders if they don't exist
+// For example: "Projects/Aenix/Cozystack/Architecture" will create:
+// - Projects
+// - Projects/Aenix
+// - Projects/Aenix/Cozystack
+// - Projects/Aenix/Cozystack/Architecture
+func ensureFoldersExist(ctx context.Context, store *storage.MongoStorage, folderPath string) error {
+	if folderPath == "" {
+		return nil
+	}
+
+	parts := splitPath(folderPath)
+	currentPath := ""
+
+	for i, part := range parts {
+		if i > 0 {
+			currentPath += "/"
+		}
+		currentPath += part
+
+		// Check if folder exists
+		folders, err := store.ListFolders(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list folders: %w", err)
+		}
+
+		exists := false
+		for _, f := range folders {
+			if f.Path == currentPath {
+				exists = true
+				break
+			}
+		}
+
+		// Create folder if it doesn't exist
+		if !exists {
+			folder := &models.Folder{Path: currentPath}
+			if err := store.CreateFolder(ctx, folder); err != nil {
+				// Ignore duplicate key errors (race condition)
+				if !contains(err.Error(), "already exists") {
+					return fmt.Errorf("failed to create folder %s: %w", currentPath, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func splitPath(path string) []string {
+	var parts []string
+	current := ""
+	for _, r := range path {
+		if r == '/' {
+			if current != "" {
+				parts = append(parts, current)
+				current = ""
+			}
+		} else {
+			current += string(r)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
 }

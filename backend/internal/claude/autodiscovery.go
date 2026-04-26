@@ -1,6 +1,8 @@
 package claude
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,15 +11,16 @@ import (
 // CurrentNote represents the note currently open in the editor
 type CurrentNote struct {
 	Name        string `json:"name"`
+	Folder      string `json:"folder"`
 	Content     string `json:"content"`
 	Type        string `json:"type"`
 	ProjectPath string `json:"projectPath"`
 }
 
 // DetermineWorkingDir determines the working directory for Claude subprocess
-// Priority: explicit projectPath → autodiscovery → ~/notes → /tmp/claude-{sessionID} → /tmp
+// Priority: explicit projectPath → /tmp/claude-{hash(folder/name)}
 func DetermineWorkingDir(currentNote *CurrentNote, sessionID string) (string, error) {
-	// Priority 1: Explicit project path
+	// Priority 1: Explicit project path from note metadata
 	if currentNote != nil && currentNote.ProjectPath != "" {
 		expanded := expandPath(currentNote.ProjectPath)
 		if _, err := os.Stat(expanded); err == nil {
@@ -25,36 +28,33 @@ func DetermineWorkingDir(currentNote *CurrentNote, sessionID string) (string, er
 		}
 	}
 
-	// Priority 2: Autodiscovery by note title
-	if currentNote != nil && currentNote.Name != "" {
-		// Extract title without .md extension
-		title := strings.TrimSuffix(currentNote.Name, ".md")
-		projects := findProjectByTitle(title)
-		if len(projects) > 0 {
-			// Use first match
-			return projects[0], nil
-		}
+	// Priority 2: Temp directory with hash of note path
+	hash := hashNotePath(currentNote)
+	tempDir := filepath.Join("/tmp", fmt.Sprintf("claude-%s", hash))
+	if err := os.MkdirAll(tempDir, 0755); err == nil {
+		return tempDir, nil
 	}
 
-	// Priority 3: ~/notes directory
-	homeDir, err := os.UserHomeDir()
-	if err == nil {
-		notesDir := filepath.Join(homeDir, "notes")
-		if _, err := os.Stat(notesDir); err == nil {
-			return notesDir, nil
-		}
-	}
-
-	// Priority 4: Create temp directory for session
-	if homeDir, err := os.UserHomeDir(); err == nil {
-		tempDir := filepath.Join(homeDir, ".claude", "sessions", sessionID)
-		if err := os.MkdirAll(tempDir, 0755); err == nil {
-			return tempDir, nil
-		}
-	}
-
-	// Priority 5: System temp directory
+	// Fallback: system temp directory
 	return os.TempDir(), nil
+}
+
+// hashNotePath creates a hash from note folder and name
+func hashNotePath(note *CurrentNote) string {
+	if note == nil {
+		return "default"
+	}
+
+	// Combine folder and name to create unique path
+	notePath := filepath.Join(note.Folder, note.Name)
+	if notePath == "" || notePath == "." {
+		return "default"
+	}
+
+	// Create SHA256 hash
+	h := sha256.Sum256([]byte(notePath))
+	// Return first 12 characters of hex
+	return fmt.Sprintf("%x", h)[:12]
 }
 
 // findProjectByTitle searches for projects in ~/git/github.com/$USER/

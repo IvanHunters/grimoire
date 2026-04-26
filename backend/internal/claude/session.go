@@ -9,15 +9,21 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 )
 
+const maxOutputBufferSize = 500 * 1024 // 500KB terminal output buffer
+
 // ClaudeSession represents an active Claude subprocess session
 type ClaudeSession struct {
 	ID            string
+	Name          string
 	Cmd           *exec.Cmd
 	PTY           *os.File // Pseudo-terminal for interactive control
 	DangerousMode bool
 	WorkingDir    string
+	MCPConfigPath string
+	CreatedAt     time.Time
 	LastActivity  time.Time
 	Messages      []models.ClaudeMessage // History stored on backend
+	OutputBuffer  []byte                 // Circular buffer for terminal output (last 500KB)
 	mu            sync.Mutex
 }
 
@@ -26,8 +32,16 @@ func (s *ClaudeSession) SendMessage(content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Write message to PTY
-	_, err := s.PTY.Write([]byte(content + "\n"))
+	// Write message to PTY byte by byte (emulate typing)
+	for _, ch := range content {
+		_, err := s.PTY.Write([]byte{byte(ch)})
+		if err != nil {
+			return err
+		}
+	}
+
+	// Send Enter key (CR in terminal)
+	_, err := s.PTY.Write([]byte{'\r'})
 	if err != nil {
 		return err
 	}
@@ -93,4 +107,28 @@ func (s *ClaudeSession) IsInactive(timeout time.Duration) bool {
 	defer s.mu.Unlock()
 
 	return time.Since(s.LastActivity) > timeout
+}
+
+// AppendOutput appends terminal output to buffer (keeps last maxOutputBufferSize bytes)
+func (s *ClaudeSession) AppendOutput(data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.OutputBuffer = append(s.OutputBuffer, data...)
+
+	// If buffer exceeds max size, keep only last maxOutputBufferSize bytes
+	if len(s.OutputBuffer) > maxOutputBufferSize {
+		// Keep last maxOutputBufferSize bytes
+		s.OutputBuffer = s.OutputBuffer[len(s.OutputBuffer)-maxOutputBufferSize:]
+	}
+}
+
+// GetOutputBuffer returns a copy of the output buffer
+func (s *ClaudeSession) GetOutputBuffer() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	buffer := make([]byte, len(s.OutputBuffer))
+	copy(buffer, s.OutputBuffer)
+	return buffer
 }

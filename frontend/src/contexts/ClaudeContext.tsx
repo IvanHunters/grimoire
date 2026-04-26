@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback } from 'react'
+import { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import type {
@@ -41,6 +41,12 @@ interface ClaudeProviderProps {
 export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProps) {
   const [sessions, setSessions] = useState<ClaudeSession[]>([])
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null)
+  const currentSessionIdRef = useRef<string | null>(null)
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId
+  }, [currentSessionId])
 
   const currentSession = sessions.find((s) => s.id === currentSessionId) || null
 
@@ -49,14 +55,23 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'session_started':
         // Session initialized successfully
         console.log('Session started:', message.sessionId)
+        if (message.sessionId) {
+          setSessions((prev) =>
+            (prev || []).map((s) =>
+              s.id === message.sessionId
+                ? { ...s, initialized: true }
+                : s
+            )
+          )
+        }
         break
 
       case 'message_start':
         // Claude started generating response
-        if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) => 
+        if (currentSessionIdRef.current && message.sessionId === currentSessionIdRef.current) {
+          setSessions((prev) =>
             (prev || []).map((s) =>
-              s.id === currentSessionId
+              s.id === currentSessionIdRef.current
                 ? { ...s, isActive: true }
                 : s
             )
@@ -66,10 +81,10 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
 
       case 'content_delta':
         // Streaming content chunk
-        if (currentSessionId && message.sessionId === currentSessionId && message.content) {
-          setSessions((prev) => 
+        if (currentSessionIdRef.current && message.sessionId === currentSessionIdRef.current && message.content) {
+          setSessions((prev) =>
             (prev || []).map((s) => {
-              if (s.id !== currentSessionId) return s
+              if (s.id !== currentSessionIdRef.current) return s
 
               const lastMessage = s.messages[s.messages.length - 1]
               if (lastMessage && lastMessage.role === 'assistant') {
@@ -108,10 +123,10 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
 
       case 'tool_use':
         // Claude is using a tool
-        if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) => 
+        if (currentSessionIdRef.current && message.sessionId === currentSessionIdRef.current) {
+          setSessions((prev) =>
             (prev || []).map((s) => {
-              if (s.id !== currentSessionId) return s
+              if (s.id !== currentSessionIdRef.current) return s
 
               const lastMessage = s.messages[s.messages.length - 1]
               if (lastMessage && lastMessage.role === 'assistant') {
@@ -135,10 +150,10 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
 
       case 'message_complete':
         // Claude finished generating response
-        if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) => 
+        if (currentSessionIdRef.current && message.sessionId === currentSessionIdRef.current) {
+          setSessions((prev) =>
             (prev || []).map((s) =>
-              s.id === currentSessionId
+              s.id === currentSessionIdRef.current
                 ? { ...s, isActive: false, lastActivity: new Date() }
                 : s
             )
@@ -149,10 +164,10 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
       case 'error':
         // Error occurred
         console.error('Claude error:', message.error)
-        if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) => 
+        if (currentSessionIdRef.current && message.sessionId === currentSessionIdRef.current) {
+          setSessions((prev) =>
             (prev || []).map((s) => {
-              if (s.id !== currentSessionId) return s
+              if (s.id !== currentSessionIdRef.current) return s
               return {
                 ...s,
                 messages: [
@@ -173,10 +188,10 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
 
       case 'stopped':
         // Generation stopped by user
-        if (currentSessionId && message.sessionId === currentSessionId) {
-          setSessions((prev) => 
+        if (currentSessionIdRef.current && message.sessionId === currentSessionIdRef.current) {
+          setSessions((prev) =>
             (prev || []).map((s) =>
-              s.id === currentSessionId
+              s.id === currentSessionIdRef.current
                 ? { ...s, isActive: false }
                 : s
             )
@@ -201,7 +216,7 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         }
         break
     }
-  }, [currentSessionId])
+  }, []) // No dependencies - use ref for currentSessionId
 
   const { connectionStatus, sendMessage: wsSendMessage } = useWebSocket({
     url: WS_URL,
@@ -221,6 +236,7 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         messages: [],
         isActive: false,
         lastActivity: new Date(),
+        initialized: false, // Will be set to true when backend responds
       }
 
       setSessions((prev) =>  [...prev, newSession])
@@ -287,6 +303,13 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
     (content: string, currentNote?: { name: string; content: string; type?: string; projectPath?: string }) => {
       if (!currentSessionId) return
 
+      // Check if session is initialized
+      const session = sessions.find(s => s.id === currentSessionId)
+      if (!session?.initialized) {
+        console.warn('Session not initialized yet, waiting...')
+        return
+      }
+
       // Add user message to session
       const userMessage: Message = {
         id: crypto.randomUUID(),
@@ -295,7 +318,7 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         timestamp: new Date(),
       }
 
-      setSessions((prev) => 
+      setSessions((prev) =>
         (prev || []).map((s) =>
           s.id === currentSessionId
             ? { ...s, messages: [...s.messages, userMessage], isActive: true }
@@ -311,7 +334,7 @@ export function ClaudeProvider({ children, onRealtimeEvent }: ClaudeProviderProp
         currentNote,
       })
     },
-    [currentSessionId, wsSendMessage]
+    [currentSessionId, sessions, wsSendMessage]
   )
 
   const stopGeneration = useCallback(() => {

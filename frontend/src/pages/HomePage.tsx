@@ -36,6 +36,23 @@ function HomePage() {
     }
   }, [currentNote])
 
+  // Reset scroll positions when switching notes
+  useEffect(() => {
+    if (currentNote) {
+      // Reset editor scroll
+      if (editorRef.current) {
+        const textarea = editorRef.current.querySelector('textarea')
+        if (textarea) {
+          textarea.scrollTop = 0
+        }
+      }
+      // Reset preview scroll
+      if (previewRef.current) {
+        previewRef.current.scrollTop = 0
+      }
+    }
+  }, [currentNote?.id]) // Only when note ID changes, not content
+
   // Open note from URL parameter
   useEffect(() => {
     if (noteId && notes.length > 0) {
@@ -82,14 +99,12 @@ function HomePage() {
     // Only update if sizes changed significantly (more than 5px)
     setEditorWidth(prev => {
       if (prev === null || Math.abs(prev - newEditorWidth) > 5) {
-        console.log('Editor width updated:', prev, '->', newEditorWidth)
         return newEditorWidth
       }
       return prev
     })
     setPreviewWidth(prev => {
       if (prev === null || Math.abs(prev - newPreviewWidth) > 5) {
-        console.log('Preview width updated:', prev, '->', newPreviewWidth)
         return newPreviewWidth
       }
       return prev
@@ -107,7 +122,6 @@ function HomePage() {
     }
 
     const timeoutId = setTimeout(() => {
-      console.log('Auto-saving note:', currentNote.id)
       updateNote(currentNote.id, editorContent).catch((error) => {
         console.error('Failed to save note:', error)
       })
@@ -192,7 +206,13 @@ function HomePage() {
                 onInsertMarkdown={(type, value) => insertMarkdown?.(type, value)}
                 currentNotePath={currentNote.path}
                 onToggleGraph={() => setShowGraphView(true)}
-                onToggleChat={() => setShowChatPanel(prev => !prev)}
+                onToggleChat={() => {
+                  // When opening chat from toolbar, link it to current note
+                  if (!showChatPanel && currentNote) {
+                    setChatNoteId(currentNote.id)
+                  }
+                  setShowChatPanel(prev => !prev)
+                }}
                 viewMode={viewMode}
                 onViewModeChange={setViewMode}
               />
