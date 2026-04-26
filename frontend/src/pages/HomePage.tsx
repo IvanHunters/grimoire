@@ -43,9 +43,8 @@ function HomePage() {
       if (note && note.id !== currentNote?.id) {
         setCurrentNote(note)
       } else if (!note) {
-        // Note not found - show error and redirect to home
+        // Note not found - silently redirect to home
         console.error('Note not found:', noteId)
-        alert(`Note not found (ID: ${noteId}). Redirecting to home.`)
         navigate('/')
       }
     }
