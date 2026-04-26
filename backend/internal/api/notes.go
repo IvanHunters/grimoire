@@ -170,6 +170,24 @@ func (h *Handler) UpdateNote(w http.ResponseWriter, r *http.Request) {
 		note.ProjectPath = req.ProjectPath
 	}
 
+	// Update folder and recalculate path if folder changed
+	if req.Folder != nil {
+		oldFolder := note.Folder
+		newFolder := *req.Folder
+
+		if oldFolder != newFolder {
+			note.Folder = newFolder
+
+			// Recalculate path based on new folder
+			fileName := slugify(note.Title) + ".md"
+			if newFolder != "" {
+				note.Path = newFolder + "/" + fileName
+			} else {
+				note.Path = fileName
+			}
+		}
+	}
+
 	if err := store.UpdateNote(ctx, note); err != nil {
 		h.logger.Error("failed to update note", "id", id, "error", err)
 		http.Error(w, "Failed to update note", http.StatusInternalServerError)

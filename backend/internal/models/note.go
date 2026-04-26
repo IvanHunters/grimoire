@@ -30,10 +30,11 @@ type CreateNoteRequest struct {
 
 // UpdateNoteRequest represents a request to update an existing note
 type UpdateNoteRequest struct {
-	Title       string `json:"title,omitempty"`
-	Content     string `json:"content,omitempty"`
-	Type        string `json:"type,omitempty"`
-	ProjectPath string `json:"projectPath,omitempty"`
+	Title       string  `json:"title,omitempty"`
+	Content     string  `json:"content,omitempty"`
+	Type        string  `json:"type,omitempty"`
+	ProjectPath string  `json:"projectPath,omitempty"`
+	Folder      *string `json:"folder,omitempty"` // Pointer to distinguish between not set and empty string
 }
 
 // MoveNoteRequest represents a request to move a note
