@@ -49,7 +49,7 @@ export function useSyncScroll({ editorRef, previewRef, enabled }: UseSyncScrollP
 
         // Clear flag after debounce
         clearTimeout(editorScrollTimeoutRef.current)
-        editorScrollTimeoutRef.current = setTimeout(() => {
+        editorScrollTimeoutRef.current = window.setTimeout(() => {
           isScrollingEditor.current = false
         }, 100)
       }
@@ -70,7 +70,7 @@ export function useSyncScroll({ editorRef, previewRef, enabled }: UseSyncScrollP
 
         // Clear flag after debounce
         clearTimeout(previewScrollTimeoutRef.current)
-        previewScrollTimeoutRef.current = setTimeout(() => {
+        previewScrollTimeoutRef.current = window.setTimeout(() => {
           isScrollingPreview.current = false
         }, 100)
       }

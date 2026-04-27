@@ -13,6 +13,19 @@ interface SidebarProps {
   currentChatNoteId?: string | null
 }
 
+// Count all notes in folder and subfolders recursively
+function countNotesInFolder(folder: FolderNode, notes: any[]): number {
+  // Count notes in current folder
+  const currentFolderNotes = notes.filter((note) => note.folder === folder.path).length
+
+  // Count notes in all subfolders recursively
+  const subfolderNotes = folder.children
+    ? folder.children.reduce((sum, child) => sum + countNotesInFolder(child, notes), 0)
+    : 0
+
+  return currentFolderNotes + subfolderNotes
+}
+
 // Recursive folder tree node component
 interface FolderTreeNodeProps {
   folder: FolderNode
@@ -55,6 +68,7 @@ function FolderTreeNode({
 }: FolderTreeNodeProps) {
   const isCollapsed = collapsedFolders.has(folder.path)
   const folderNotes = notes.filter((note) => note.folder === folder.path)
+  const totalNotesCount = countNotesInFolder(folder, notes)
 
   return (
     <div>
@@ -81,7 +95,7 @@ function FolderTreeNode({
         <Folder className="w-4 h-4 text-gray-600" />
         <span className="text-sm text-gray-900">{folder.name}</span>
         <span className="ml-auto text-xs text-gray-500">
-          {folderNotes.length}
+          {totalNotesCount}
         </span>
       </button>
 
@@ -277,7 +291,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
   }
 
   const hideToggle = () => {
-    hoverTimeoutRef.current = setTimeout(() => {
+    hoverTimeoutRef.current = window.setTimeout(() => {
       setToggleVisible(false)
     }, 100)
   }

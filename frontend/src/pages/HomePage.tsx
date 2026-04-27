@@ -195,7 +195,7 @@ function HomePage() {
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <Header onNoteSelect={handleNoteSelect} />
+      <Header onNoteSelect={handleNoteSelect} previewRef={previewRef} />
 
       {/* Main content area */}
       <div className="flex flex-1 overflow-hidden">
