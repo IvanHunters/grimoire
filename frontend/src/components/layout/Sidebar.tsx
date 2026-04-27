@@ -405,6 +405,38 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
     setContextMenu((prev) => ({ ...prev, visible: false }))
   }
 
+  // Handle session deletion
+  const handleDeleteSession = async (sessionId: string) => {
+    try {
+      await sessionsAPI.deleteSession(sessionId)
+      // Remove from local state immediately
+      setClaudeSessions(prev => prev.filter(s => s.id !== sessionId))
+    } catch (error) {
+      console.error('Failed to delete session:', error)
+      alert('Failed to delete session')
+    }
+  }
+
+  // Handle session context menu
+  const handleSessionContextMenu = (e: React.MouseEvent, session: ClaudeSession) => {
+    e.preventDefault()
+    e.stopPropagation()
+
+    setContextMenu({
+      visible: true,
+      x: e.clientX,
+      y: e.clientY,
+      items: [
+        {
+          text: 'Kill Session',
+          icon: 'trash',
+          action: () => handleDeleteSession(session.id),
+          danger: true,
+        },
+      ],
+    })
+  }
+
   // Modal handlers
   const handleCreateNote = async (name: string, folder: string) => {
     console.log('Create note:', name, 'in folder:', folder)
@@ -894,6 +926,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
                           }
                         }
                       }}
+                      onContextMenu={(e) => handleSessionContextMenu(e, session)}
                       className="w-full flex items-start gap-2 px-2 py-1.5 rounded transition hover:bg-gray-100 text-left"
                     >
                       <Terminal className="w-3.5 h-3.5 text-purple-600 flex-shrink-0 mt-0.5" />
