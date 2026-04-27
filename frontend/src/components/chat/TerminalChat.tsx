@@ -79,11 +79,33 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
       sendInput(data)
     })
 
-    // Handle resize
+    // Handle resize with debounce
+    let resizeTimeout: number | undefined
     const handleResize = () => {
-      fitAddon.fit()
+      // Debounce resize to avoid too many fit calls
+      if (resizeTimeout) {
+        clearTimeout(resizeTimeout)
+      }
+      resizeTimeout = window.setTimeout(() => {
+        try {
+          fitAddon.fit()
+        } catch (error) {
+          console.error('Failed to fit terminal:', error)
+        }
+      }, 100)
     }
+
+    // Listen to window resize
     window.addEventListener('resize', handleResize)
+
+    // Watch for container size changes using ResizeObserver
+    const resizeObserver = new ResizeObserver(() => {
+      handleResize()
+    })
+
+    if (terminalRef.current) {
+      resizeObserver.observe(terminalRef.current)
+    }
 
     xtermRef.current = term
     fitAddonRef.current = fitAddon
@@ -91,8 +113,21 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
     // Focus terminal
     term.focus()
 
+    // Initial fit after a short delay to ensure container is rendered
+    window.setTimeout(() => {
+      try {
+        fitAddon.fit()
+      } catch (error) {
+        console.error('Failed initial fit:', error)
+      }
+    }, 100)
+
     return () => {
       window.removeEventListener('resize', handleResize)
+      if (resizeTimeout) {
+        clearTimeout(resizeTimeout)
+      }
+      resizeObserver.disconnect()
       term.dispose()
       xtermRef.current = null
       fitAddonRef.current = null
