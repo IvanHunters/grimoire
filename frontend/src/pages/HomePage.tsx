@@ -255,7 +255,7 @@ function HomePage() {
                 {/* Preview panel */}
                 {(viewMode === 'preview' || viewMode === 'split') && (
                   <div
-                    className={`preview-panel bg-white ${
+                    className={`preview-panel bg-white overflow-hidden ${
                       viewMode === 'preview' ? 'w-full' : viewMode === 'split' && !previewWidth ? 'flex-1' : ''
                     }`}
                   >
