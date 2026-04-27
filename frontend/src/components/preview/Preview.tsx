@@ -38,12 +38,12 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
     let text = content.replace(/^---\n[\s\S]*?\n---\n/, '')
 
     // Process wikilinks: convert [[link]] or [[link|alias]] to custom markdown
-    // [[target]] → [target](wikilink:target)
-    // [[target|alias]] → [alias](wikilink:target)
+    // [[target]] → [target](#wikilink:target)
+    // [[target|alias]] → [alias](#wikilink:target)
     text = text.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, alias) => {
       const displayText = alias?.trim() || target.trim()
       const targetPath = target.trim()
-      return `[${displayText}](wikilink:${targetPath})`
+      return `[${displayText}](#wikilink:${targetPath})`
     })
 
     return text
@@ -94,9 +94,9 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
             // Custom link renderer - handles wikilinks and anchor links
             a: ({ node, href, children, ...props }) => {
-              // Check if this is a wikilink (wikilink: protocol)
-              if (href?.startsWith('wikilink:')) {
-                const target = href.replace('wikilink:', '')
+              // Check if this is a wikilink (#wikilink: format)
+              if (href?.startsWith('#wikilink:')) {
+                const target = href.replace('#wikilink:', '')
                 return (
                   <WikilinkRenderer target={target}>
                     {children}
