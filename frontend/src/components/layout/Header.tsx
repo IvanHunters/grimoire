@@ -108,7 +108,7 @@ function Header({ onNoteSelect, previewRef }: HeaderProps) {
 
   return (
     <>
-      <header className="h-14 border-b border-gray-200 bg-white flex items-center justify-between px-4 shadow-sm">
+      <header className="h-14 border-b border-gray-200 bg-white flex items-center justify-between px-4 shadow-sm relative z-50">
         {/* Left: Logo */}
         <div className="flex items-center gap-3">
           <h1 className="text-xl font-bold bg-gradient-to-r from-purple-600 to-blue-600 bg-clip-text text-transparent">
@@ -158,7 +158,7 @@ function Header({ onNoteSelect, previewRef }: HeaderProps) {
 
             {/* Export Menu */}
             {showExportMenu && (
-              <div className="absolute right-0 mt-1 w-56 bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-50">
+              <div className="absolute right-0 mt-1 w-56 bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-[100]">
                 <button
                   onClick={() => handleExport('md')}
                   className="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition"
