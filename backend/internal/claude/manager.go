@@ -315,3 +315,28 @@ func (m *SessionManager) SaveSessionMessages(sessionID string) error {
 
 	return nil
 }
+
+// ListActiveSessions returns list of all active sessions
+func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	sessions := make([]*models.ClaudeSession, 0, len(m.sessions))
+
+	for _, session := range m.sessions {
+		sessions = append(sessions, &models.ClaudeSession{
+			ID:            session.ID,
+			Name:          session.Name,
+			DangerousMode: session.DangerousMode,
+			WorkingDir:    session.WorkingDir,
+			MCPConfigPath: session.MCPConfigPath,
+			Status:        "active",
+			Messages:      []models.ClaudeMessage{}, // Don't include full messages in list
+			CreatedAt:     session.CreatedAt,
+			UpdatedAt:     time.Now(),
+			LastActivity:  session.LastActivity,
+		})
+	}
+
+	return sessions
+}

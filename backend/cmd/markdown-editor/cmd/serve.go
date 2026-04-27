@@ -111,6 +111,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 		r.Get("/search", handler.Search)
 		r.Post("/upload", handler.Upload)
+
+		r.Get("/sessions", handler.ListSessions)
 	})
 
 	// MCP endpoint (outside /api for simplicity)

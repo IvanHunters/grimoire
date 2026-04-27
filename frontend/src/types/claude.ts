@@ -36,6 +36,8 @@ export type WSMessageType =
   | 'session_history'
   | 'session_not_found'
   | 'session_closed'
+  | 'chat_history'
+  | 'terminal_output'
   // Real-time events from backend
   | 'note_created'
   | 'note_updated'
