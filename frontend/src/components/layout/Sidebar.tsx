@@ -881,7 +881,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
           <div className="flex items-center gap-2">
             <Terminal className="w-4 h-4 text-purple-600" />
             <span className="text-sm font-medium text-gray-900">Claude Sessions</span>
-            {claudeSessions.length > 0 && (
+            {claudeSessions && claudeSessions.length > 0 && (
               <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full">
                 {claudeSessions.length}
               </span>
@@ -899,7 +899,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
         {/* Sessions list */}
         {!chatHistoryCollapsed && (
           <div className="max-h-48 overflow-y-auto p-2">
-            {claudeSessions.length === 0 ? (
+            {!claudeSessions || claudeSessions.length === 0 ? (
               <div className="text-xs text-gray-500 px-2 py-4 text-center">
                 No active sessions
               </div>
