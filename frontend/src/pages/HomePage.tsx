@@ -218,9 +218,10 @@ function HomePage() {
                 currentNotePath={currentNote.path}
                 onToggleGraph={() => setShowGraphView(true)}
                 onToggleChat={() => {
-                  // When opening chat from toolbar, link it to current note
-                  if (!showChatPanel && currentNote) {
-                    setChatNoteId(currentNote.id)
+                  // Open global chat (not linked to note)
+                  // To open note-specific chat, use context menu in sidebar
+                  if (!showChatPanel) {
+                    setChatNoteId(null)
                   }
                   setShowChatPanel(prev => !prev)
                 }}
