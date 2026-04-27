@@ -21,6 +21,8 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
   const handleOutput = useCallback((data: string) => {
     if (xtermRef.current) {
       xtermRef.current.write(data)
+      // Auto-scroll to bottom after writing data
+      xtermRef.current.scrollToBottom()
     }
   }, [])
 
@@ -63,7 +65,9 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
         brightWhite: '#ffffff',
       },
       allowTransparency: false,
-      convertEol: false,
+      convertEol: true,
+      scrollback: 10000,
+      scrollOnUserInput: true,
     })
 
     // Create fit addon
