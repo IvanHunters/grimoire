@@ -12,6 +12,7 @@ import { sessionsAPI } from '../../api/sessions'
 interface SidebarProps {
   onNoteSelect?: (note: any) => void
   onOpenChatWithNote?: (noteId: string) => void
+  onSessionDeleted?: (sessionId: string) => void
 }
 
 // Count all notes in folder and subfolders recursively
@@ -156,7 +157,7 @@ function FolderTreeNode({
   )
 }
 
-function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
+function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: SidebarProps) {
   const { notes, folderTree, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set<string>())
 
@@ -411,6 +412,10 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
       await sessionsAPI.deleteSession(sessionId)
       // Remove from local state immediately
       setClaudeSessions(prev => prev.filter(s => s.id !== sessionId))
+      // Notify parent that session was deleted (to close chat panel if needed)
+      if (onSessionDeleted) {
+        onSessionDeleted(sessionId)
+      }
     } catch (error) {
       console.error('Failed to delete session:', error)
       alert('Failed to delete session')

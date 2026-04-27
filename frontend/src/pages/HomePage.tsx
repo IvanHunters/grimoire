@@ -152,6 +152,26 @@ function HomePage() {
     setShowChatPanel(true)
   }
 
+  // Handle session deletion - close chat panel if deleted session is currently open
+  const handleSessionDeleted = (deletedSessionId: string) => {
+    // Check if the deleted session matches the currently open session
+    if (showChatPanel) {
+      // For note-specific sessions: note-{noteId}
+      // For global sessions: global-{uuid}
+      const currentSessionId = chatNoteId ? `note-${chatNoteId}` : sessionStorage.getItem('claude-global-session')
+
+      if (currentSessionId === deletedSessionId) {
+        // Close the chat panel since the session was deleted
+        setShowChatPanel(false)
+        setChatNoteId(null)
+        // Clear global session from storage if it was deleted
+        if (deletedSessionId.startsWith('global-')) {
+          sessionStorage.removeItem('claude-global-session')
+        }
+      }
+    }
+  }
+
   // Synchronized scroll (only in split view)
   useSyncScroll({
     editorRef,
@@ -203,6 +223,7 @@ function HomePage() {
         <Sidebar
           onNoteSelect={handleNoteSelect}
           onOpenChatWithNote={handleOpenChatWithNote}
+          onSessionDeleted={handleSessionDeleted}
         />
 
         {/* Editor/Preview area */}
