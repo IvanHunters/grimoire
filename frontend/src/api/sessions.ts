@@ -7,4 +7,9 @@ export const sessionsAPI = {
     const response = await apiClient.get<ClaudeSession[]>('/sessions')
     return response.data
   },
+
+  // Delete/kill a Claude session
+  deleteSession: async (sessionId: string): Promise<void> => {
+    await apiClient.delete(`/sessions/${sessionId}`)
+  },
 }

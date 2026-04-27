@@ -136,6 +136,20 @@ func (h *Handler) handleInit(conn *websocket.Conn, msg *WSMessage) {
 		SessionID: msg.SessionID,
 	})
 
+	// Send chat history if exists
+	messages := session.GetMessages()
+	if len(messages) > 0 {
+		h.logger.Info("sending chat history",
+			slog.String("session_id", session.ID),
+			slog.Int("messages", len(messages)),
+		)
+		conn.WriteJSON(WSResponse{
+			Type:      "chat_history",
+			SessionID: session.ID,
+			Messages:  messages,
+		})
+	}
+
 	// Replay terminal output buffer for reconnects
 	buffer := session.GetOutputBuffer()
 	if len(buffer) > 0 {

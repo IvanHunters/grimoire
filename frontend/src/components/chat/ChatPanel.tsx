@@ -76,17 +76,28 @@ function ChatPanel({ visible, onClose, noteId }: ChatPanelProps) {
     setSessionKey(prev => prev + 1)
   }, [])
 
-  // Kill session - close WebSocket and clear from backend
-  const handleKill = useCallback(() => {
-    // Force remount to close WebSocket
-    setSessionKey(prev => prev + 1)
-    // If global session, clear from sessionStorage
-    if (!noteId && sessionId === sessionStorage.getItem('claude-global-session')) {
-      sessionStorage.removeItem('claude-global-session')
-      setSelectedSessionId(null)
+  // Kill session - close WebSocket and terminate backend session
+  const handleKill = useCallback(async () => {
+    try {
+      // Call API to terminate session on backend
+      await sessionsAPI.deleteSession(sessionId)
+
+      // Force remount to close WebSocket
+      setSessionKey(prev => prev + 1)
+
+      // If global session, clear from sessionStorage
+      if (!noteId && sessionId === sessionStorage.getItem('claude-global-session')) {
+        sessionStorage.removeItem('claude-global-session')
+        setSelectedSessionId(null)
+      }
+
+      // Reload sessions list
+      window.setTimeout(loadSessions, 500)
+    } catch (error) {
+      console.error('Failed to kill session:', error)
+      // Still remount to close WebSocket on frontend
+      setSessionKey(prev => prev + 1)
     }
-    // Reload sessions after a delay
-    window.setTimeout(loadSessions, 1000)
   }, [noteId, sessionId, loadSessions])
 
   // Create new session

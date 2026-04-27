@@ -203,7 +203,6 @@ function HomePage() {
         <Sidebar
           onNoteSelect={handleNoteSelect}
           onOpenChatWithNote={handleOpenChatWithNote}
-          currentChatNoteId={chatNoteId}
         />
 
         {/* Editor/Preview area */}

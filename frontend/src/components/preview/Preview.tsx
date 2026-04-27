@@ -38,12 +38,14 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
     let text = content.replace(/^---\n[\s\S]*?\n---\n/, '')
 
     // Process wikilinks: convert [[link]] or [[link|alias]] to custom markdown
-    // [[target]] → [target](#wikilink:target)
-    // [[target|alias]] → [alias](#wikilink:target)
+    // [[target]] → [target](#wikilink:encoded-target)
+    // [[target|alias]] → [alias](#wikilink:encoded-target)
     text = text.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, alias) => {
       const displayText = alias?.trim() || target.trim()
       const targetPath = target.trim()
-      return `[${displayText}](#wikilink:${targetPath})`
+      // URL-encode the target to handle spaces and special characters
+      const encodedTarget = encodeURIComponent(targetPath)
+      return `[${displayText}](#wikilink:${encodedTarget})`
     })
 
     return text
@@ -96,7 +98,9 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
             a: ({ node, href, children, ...props }) => {
               // Check if this is a wikilink (#wikilink: format)
               if (href?.startsWith('#wikilink:')) {
-                const target = href.replace('#wikilink:', '')
+                const encodedTarget = href.replace('#wikilink:', '')
+                // Decode URL-encoded target
+                const target = decodeURIComponent(encodedTarget)
                 return (
                   <WikilinkRenderer target={target}>
                     {children}

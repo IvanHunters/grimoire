@@ -1,16 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
-import { ChevronLeft, ChevronRight, Folder, FileText, MessageSquare, ChevronDown, ChevronUp, ArrowRight, Trash2, Star } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Folder, FileText, Terminal, ChevronDown, ChevronUp } from 'lucide-react'
 import { useNotes } from '../../contexts/NotesContext'
 import type { FolderNode } from '../../types/folder'
+import type { ClaudeSession } from '../../types/claude'
 import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
 import NewNoteModal from '../modals/NewNoteModal'
 import RenameModal from '../modals/RenameModal'
 import DeleteConfirmModal from '../modals/DeleteConfirmModal'
+import { sessionsAPI } from '../../api/sessions'
 
 interface SidebarProps {
   onNoteSelect?: (note: any) => void
   onOpenChatWithNote?: (noteId: string) => void
-  currentChatNoteId?: string | null
 }
 
 // Count all notes in folder and subfolders recursively
@@ -155,7 +156,7 @@ function FolderTreeNode({
   )
 }
 
-function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: SidebarProps) {
+function Sidebar({ onNoteSelect, onOpenChatWithNote }: SidebarProps) {
   const { notes, folderTree, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set<string>())
 
@@ -218,7 +219,7 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [toggleVisible, setToggleVisible] = useState(false)
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(false)
-  const [chatHistory, setChatHistory] = useState<string[]>([]) // Note IDs with chat history
+  const [claudeSessions, setClaudeSessions] = useState<ClaudeSession[]>([]) // Active Claude terminal sessions
   const sidebarRef = useRef<HTMLElement>(null)
   const toggleRef = useRef<HTMLButtonElement>(null)
   const hoverTimeoutRef = useRef<number | null>(null)
@@ -390,11 +391,6 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
   }
 
   const handleOpenChatWithNote = (noteId: string) => {
-    // Add to chat history if not already there
-    if (!chatHistory.includes(noteId)) {
-      setChatHistory(prev => [noteId, ...prev])
-    }
-
     // Switch to note (via URL navigation)
     const note = (notes || []).find(n => n.id === noteId)
     if (note) {
@@ -403,17 +399,6 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
 
     // Open chat panel
     onOpenChatWithNote?.(noteId)
-  }
-
-  const handleRemoveFromHistory = (noteId: string, e: React.MouseEvent) => {
-    e.stopPropagation()
-    setChatHistory(prev => prev.filter(id => id !== noteId))
-  }
-
-  const handleClearHistory = () => {
-    if (confirm('Очистить всю историю чатов?')) {
-      setChatHistory([])
-    }
   }
 
   const closeContextMenu = () => {
@@ -752,6 +737,23 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
     }
   }, [])
 
+  // Load Claude terminal sessions
+  useEffect(() => {
+    const loadSessions = async () => {
+      try {
+        const sessions = await sessionsAPI.listActiveSessions()
+        setClaudeSessions(sessions)
+      } catch (error) {
+        console.error('Failed to load Claude sessions:', error)
+      }
+    }
+
+    loadSessions()
+    // Refresh sessions every 10 seconds
+    const interval = window.setInterval(loadSessions, 10000)
+    return () => clearInterval(interval)
+  }, [])
+
   return (
     <>
       <aside
@@ -840,32 +842,20 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
         </div>
       </div>
 
-      {/* Chat History */}
+      {/* Claude Sessions */}
       <div className="border-t border-gray-200">
-        {/* Chat History header */}
+        {/* Sessions header */}
         <div className="flex items-center justify-between px-4 py-2 bg-gray-50 hover:bg-gray-100 cursor-pointer transition" onClick={() => setChatHistoryCollapsed(!chatHistoryCollapsed)}>
           <div className="flex items-center gap-2">
-            <MessageSquare className="w-4 h-4 text-purple-600" />
-            <span className="text-sm font-medium text-gray-900">Chat History</span>
-            {chatHistory.length > 0 && (
+            <Terminal className="w-4 h-4 text-purple-600" />
+            <span className="text-sm font-medium text-gray-900">Claude Sessions</span>
+            {claudeSessions.length > 0 && (
               <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full">
-                {chatHistory.length}
+                {claudeSessions.length}
               </span>
             )}
           </div>
           <div className="flex items-center gap-1">
-            {chatHistory.length > 0 && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation()
-                  handleClearHistory()
-                }}
-                className="text-xs text-gray-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition"
-                title="Clear all history"
-              >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            )}
             {chatHistoryCollapsed ? (
               <ChevronDown className="w-4 h-4 text-gray-500" />
             ) : (
@@ -874,67 +864,51 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, currentChatNoteId }: Sideba
           </div>
         </div>
 
-        {/* Chat History list */}
+        {/* Sessions list */}
         {!chatHistoryCollapsed && (
           <div className="max-h-48 overflow-y-auto p-2">
-            {chatHistory.length === 0 ? (
+            {claudeSessions.length === 0 ? (
               <div className="text-xs text-gray-500 px-2 py-4 text-center">
-                No chat history yet
+                No active sessions
               </div>
             ) : (
               <div className="space-y-1">
-                {chatHistory.map(noteId => {
-                  const note = (notes || []).find(n => n.id === noteId)
-                  const isActive = currentChatNoteId === noteId
-                  const isOrphaned = !note
+                {claudeSessions.map(session => {
+                  const sessionName = session.name && session.name !== 'Terminal Session'
+                    ? session.name
+                    : session.id.startsWith('note-') ? 'Note Session' : 'Global Session'
 
                   return (
-                    <div
-                      key={noteId}
-                      className={`flex items-center gap-2 px-2 py-1.5 rounded transition group ${
-                        isActive
-                          ? 'bg-purple-100 text-purple-900'
-                          : isOrphaned
-                          ? 'bg-gray-50 text-gray-400'
-                          : 'hover:bg-gray-100 text-gray-700'
-                      }`}
+                    <button
+                      key={session.id}
+                      onClick={() => {
+                        if (onOpenChatWithNote) {
+                          // Open terminal chat with this session
+                          // Extract noteId if it's a note-specific session
+                          const noteId = session.id.startsWith('note-') ? session.id.replace('note-', '') : null
+                          if (noteId) {
+                            onOpenChatWithNote(noteId)
+                          } else {
+                            // Open global chat - trigger chat panel without noteId
+                            onOpenChatWithNote('')
+                          }
+                        }
+                      }}
+                      className="w-full flex items-start gap-2 px-2 py-1.5 rounded transition hover:bg-gray-100 text-left"
                     >
-                      {/* Icon */}
-                      {isActive ? (
-                        <Star className="w-3.5 h-3.5 text-purple-600 fill-purple-600 flex-shrink-0" />
-                      ) : (
-                        <MessageSquare className={`w-3.5 h-3.5 flex-shrink-0 ${isOrphaned ? 'text-gray-300' : 'text-gray-500'}`} />
-                      )}
-
-                      {/* Note name */}
-                      <button
-                        onClick={() => handleOpenChatWithNote(noteId)}
-                        className="flex-1 text-left text-sm truncate"
-                        disabled={isOrphaned}
-                      >
-                        {note ? note.title : '(Deleted note)'}
-                      </button>
-
-                      {/* Action buttons (hidden until hover) */}
-                      <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                        {!isActive && !isOrphaned && (
-                          <button
-                            onClick={() => handleOpenChatWithNote(noteId)}
-                            className="p-1 hover:bg-purple-100 rounded transition"
-                            title="Switch to this chat"
-                          >
-                            <ArrowRight className="w-3 h-3 text-purple-600" />
-                          </button>
-                        )}
-                        <button
-                          onClick={(e) => handleRemoveFromHistory(noteId, e)}
-                          className="p-1 hover:bg-red-100 rounded transition"
-                          title="Remove from history"
-                        >
-                          <Trash2 className="w-3 h-3 text-red-600" />
-                        </button>
+                      <Terminal className="w-3.5 h-3.5 text-purple-600 flex-shrink-0 mt-0.5" />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-gray-900 truncate">
+                          {sessionName}
+                        </div>
+                        <div className="text-xs text-gray-500 truncate">
+                          {session.workingDir}
+                        </div>
+                        <div className="text-xs text-gray-400">
+                          {new Date(session.lastActivity).toLocaleTimeString()}
+                        </div>
                       </div>
-                    </div>
+                    </button>
                   )
                 })}
               </div>

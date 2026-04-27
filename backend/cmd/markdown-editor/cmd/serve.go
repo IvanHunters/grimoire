@@ -113,6 +113,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Post("/upload", handler.Upload)
 
 		r.Get("/sessions", handler.ListSessions)
+		r.Delete("/sessions/{id}", handler.DeleteSession)
 	})
 
 	// MCP endpoint (outside /api for simplicity)
