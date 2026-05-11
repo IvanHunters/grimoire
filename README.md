@@ -1,126 +1,147 @@
-# Markdown Editor with Claude AI Integration
+# grimoire
 
-Полнофункциональный markdown редактор с интеграцией Claude AI через MCP (Model Context Protocol).
+Personal knowledge base with Claude AI integration. Markdown editor, knowledge graph, embedded AI terminal, and task tracker — all in one dark-themed web app.
+
+![Stack](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)
+![Stack](https://img.shields.io/badge/React-18-61DAFB?style=flat&logo=react)
+![Stack](https://img.shields.io/badge/MongoDB-7-47A248?style=flat&logo=mongodb)
 
 ## Features
 
-### Core Features
-- 📝 **Markdown Editor** - CodeMirror 6 с real-time preview
-- 📁 **Folder Organization** - древовидная структура с поддержкой вложенности
-- 🔍 **Search & Replace** - с regex поддержкой (Cmd+F / Cmd+H)
-- 🖼️ **Image Upload** - drag & drop и paste из clipboard
-- 🔗 **Wikilinks** - `[[note-title]]` для связей между заметками
-- 📊 **Graph View** - визуализация связей (Mermaid diagrams)
-- 🎨 **Syntax Highlighting** - 200+ языков (Prism.js)
+### Editor
+- Split-view markdown editor (CodeMirror 6) with live preview
+- Syntax highlighting for 200+ languages via Prism.js
+- GitHub Flavored Markdown + Mermaid diagrams
+- Search & replace with regex (Cmd+F / Cmd+H)
+- Image upload via drag & drop or clipboard paste
+- Wikilinks (`[[note-title]]`) with hover popup preview
 
-### AI Features (Claude Integration)
-- 🤖 **Claude Chat** - полный доступ ко всем заметкам через MCP
-- 💻 **Project Mode** - работа с локальными git репозиториями
-- 🛠️ **MCP Tools** - 19 инструментов для управления заметками
-- ⚡ **Real-time Events** - автообновление UI при изменениях через Claude
-- 🔄 **Multiple Sessions** - независимые чат-сессии с историей
-- ⚠️ **Dangerous Mode** - опциональный режим для деструктивных операций
+### Knowledge Graph
+- Force-directed graph of all wikilink connections
+- Backlinks panel per note
+- In-memory tag index with instant search (microseconds vs MongoDB milliseconds)
 
-## Tech Stack
+### AI Terminal
+- Embedded Claude terminal (PTY subprocess per session)
+- Multiple independent sessions with persistent history
+- Project mode: link a note to a local git repo, Claude runs in that directory
+- Auto-discovery of git repos under `~/git/`
+- 66 MCP tools for reading, editing, and organizing notes
+- Dangerous mode toggle (passes `--dangerously-skip-permissions` to Claude CLI)
 
-### Backend (Go)
-- **Chi** - HTTP router
-- **MongoDB** - database
-- **WebSocket** - real-time communication
-- **PTY** - Claude subprocess management
-- **MCP SDK** - github.com/mark3labs/mcp-go
+### Task Tracker
+- Kanban board with customizable columns
+- Stories (epics) with child tasks and subtasks
+- Link tasks to notes and folders
+- Comments, priority, due dates
 
-### Frontend (React + TypeScript)
-- **Vite** - build tool
-- **CodeMirror 6** - editor
-- **react-markdown** - preview
-- **Tailwind CSS** - styling
-- **WebSocket** - real-time sync
+### Export
+- PDF (smart page breaks, inline code chips, Mermaid diagrams)
+- Word (.docx)
+- HTML preview
+- Markdown
+- ZIP archive of all notes
+
+### Other
+- Mobile-responsive layout
+- Dark theme throughout
+- Folder tree with drag & drop reorganization
+- Full-text search across all notes
 
 ## Quick Start
 
 ### Prerequisites
+
 - Go 1.21+
 - Node.js 18+
-- Docker (для MongoDB)
-- Claude CLI (`claude` в PATH)
+- Docker (for MongoDB)
+- [Claude CLI](https://claude.ai/download) (`claude` in PATH)
 
-### 1. Start MongoDB
+### Start
 
 ```bash
+# 1. Start MongoDB
 docker compose up -d
+
+# 2. Start backend + frontend
+make up
 ```
 
-### 2. Start Backend
+Backend: http://localhost:8080  
+Frontend: http://localhost:5173
+
+Or start separately:
 
 ```bash
+# Backend
 cd backend
 go run cmd/markdown-editor/main.go serve
-```
 
-Backend запустится на:
-- HTTP API: http://localhost:8080
-- WebSocket: ws://localhost:3000
-
-### 3. Start Frontend
-
-```bash
+# Frontend (in another terminal)
 cd frontend
 npm install
 npm run dev
 ```
 
-Frontend откроется на http://localhost:5173
-
 ## Project Structure
 
 ```
-markdown-editor/
+grimoire/
 ├── backend/
-│   ├── cmd/markdown-editor/     # Single binary with subcommands
-│   │   ├── main.go              # Entry point
-│   │   └── cmd/                 # Cobra commands
-│   │       ├── serve.go         # HTTP + WebSocket servers
-│   │       ├── mcp.go          # MCP server
-│   │       ├── *_tools.go      # MCP tool implementations
-│   ├── internal/
-│   │   ├── api/                # HTTP handlers
-│   │   ├── storage/            # MongoDB operations
-│   │   ├── models/             # Data structures
-│   │   ├── claude/             # Subprocess management
-│   │   ├── websocket/          # WebSocket handler
-│   │   ├── events/             # Event bus
-│   │   ├── middleware/         # CORS, logging, etc.
-│   │   └── config/             # Configuration
+│   ├── cmd/markdown-editor/
+│   │   ├── main.go                      # Entry point
+│   │   └── cmd/
+│   │       ├── serve.go                 # HTTP server
+│   │       ├── mcp.go                   # MCP server (66 tools)
+│   │       ├── content_editing_tools.go
+│   │       ├── content_structure_tools.go
+│   │       ├── attachment_tools.go
+│   │       ├── folder_tools.go
+│   │       ├── graph_tools.go
+│   │       └── task_tools.go
+│   └── internal/
+│       ├── api/          # HTTP handlers
+│       ├── claude/       # PTY subprocess management
+│       ├── events/       # Event bus (MCP -> WebSocket -> clients)
+│       ├── index/        # In-memory tag index
+│       ├── middleware/   # CORS, logging, recovery
+│       ├── models/       # Note, Folder, Task, Session
+│       ├── scheduler/    # Session cleanup
+│       ├── storage/      # MongoDB operations
+│       └── websocket/    # Claude terminal WebSocket handler
 │
-├── frontend/
-│   ├── src/
-│   │   ├── components/         # React components
-│   │   ├── contexts/           # NotesContext, ClaudeContext
-│   │   ├── hooks/              # useWebSocket
-│   │   ├── api/                # API client
-│   │   ├── types/              # TypeScript types
-│   │   └── utils/              # Helpers
+├── frontend/src/
+│   ├── components/
+│   │   ├── chat/         # Claude terminal (TerminalChat, ChatPanel)
+│   │   ├── editor/       # CodeMirror editor, toolbar, tag picker
+│   │   ├── graph/        # Force-directed knowledge graph
+│   │   ├── layout/       # Header, Sidebar
+│   │   ├── modals/       # New note, rename, search, upload, ...
+│   │   ├── preview/      # Markdown preview, Mermaid, wikilink popup
+│   │   └── tasks/        # Kanban board, task detail, story card
+│   ├── contexts/         # NotesContext, ClaudeContext, ThemeContext
+│   ├── hooks/            # useWebSocket, useTerminalWebSocket, useEventsWebSocket
+│   ├── pages/            # HomePage, TasksPage
+│   └── utils/            # export, wikilinks, forceLayout
 │
 ├── data/
-│   ├── mongodb/                # MongoDB data (gitignored)
-│   └── uploads/                # Uploaded images
+│   ├── mongodb/          # MongoDB data (gitignored)
+│   └── uploads/          # Uploaded images
 │
-├── docker-compose.yml          # MongoDB container
-├── CLAUDE.md                   # Project instructions
-└── TESTING.md                  # E2E testing guide
+├── docker-compose.yml
+└── Makefile
 ```
 
 ## Architecture
 
-### Two-Server Pattern
+Single Go binary (`./markdown-editor`) with two subcommands:
 
-1. **HTTP Server (:8080)** - REST API для CRUD операций
-2. **WebSocket Server (:3000)** - Claude chat + real-time events
+- **`serve`** — HTTP REST API + WebSocket terminal server on `:8080`
+- **`mcp`** — MCP server (launched automatically by Claude CLI as a subprocess)
 
 ### MCP Integration
 
-Backend автоматически создаёт `.claude/mcp_servers.json` при запуске Claude subprocess:
+When a Claude terminal session starts, the backend writes `.claude/mcp_servers.json` into the working directory:
 
 ```json
 {
@@ -135,163 +156,128 @@ Backend автоматически создаёт `.claude/mcp_servers.json` п�
 }
 ```
 
-Claude CLI автоматически подключает MCP сервер и получает доступ к 19 инструментам.
+Claude CLI picks this up automatically and gets access to all 66 tools.
 
-### Event Bus Pattern
+### Event Bus
 
-Real-time синхронизация между Claude MCP, WebSocket clients и frontend:
+MCP operations (note create/update/delete) publish events that flow to all connected WebSocket clients, keeping the frontend in sync without polling:
 
 ```
-Claude MCP -> Event Bus -> WebSocket Handler -> All Clients
-     |                                                |
-     v                                                v
-MongoDB <----------------------------------------- Frontend
+Claude MCP → Event Bus → WebSocket Handler → Frontend
+     ↓
+  MongoDB
 ```
 
-## API Endpoints
+### WebSocket Endpoints
+
+- `WS /claude-chat` — Claude terminal multiplexer (one endpoint, multiple sessions via session ID)
+- `WS /api/events` — Real-time note/folder change events
+
+## API Reference
 
 ### Notes
-- `GET /api/notes` - list notes
-- `GET /api/notes/:id` - get note
-- `POST /api/notes` - create note
-- `PUT /api/notes/:id` - update note
-- `DELETE /api/notes/:id` - delete note
+```
+GET    /api/notes           list all notes
+GET    /api/notes/:id       get note
+POST   /api/notes           create note
+PUT    /api/notes/:id       update note
+DELETE /api/notes/:id       delete note
+GET    /api/search?q=...    full-text search
+```
 
 ### Folders
-- `GET /api/folders` - folder tree
-- `POST /api/folders` - create folder
-- `DELETE /api/folders?path=X` - delete folder
-- `PUT /api/folders/move` - move note/folder
+```
+GET    /api/folders               folder tree
+POST   /api/folders               create folder
+DELETE /api/folders?path=...      delete folder
+PUT    /api/folders/move          move note or folder
+```
 
-### Search & Upload
-- `GET /api/search?q=query` - full-text search
-- `POST /api/upload` - upload image
+### Tags
+```
+GET /api/tags               all tags with counts
+GET /api/tags/search?tags=  notes matching tags
+```
 
-### WebSocket
-- `WS /claude-chat` - Claude chat + events
+### Tasks
+```
+GET    /api/tasks            list tasks
+POST   /api/tasks            create task
+GET    /api/tasks/:id        get task
+PUT    /api/tasks/:id        update task
+DELETE /api/tasks/:id        delete task
+```
 
-See [TESTING.md](./TESTING.md) for complete E2E testing guide.
+### Sessions
+```
+GET    /api/sessions         list active Claude sessions
+DELETE /api/sessions/:id     terminate session
+```
 
-## MCP Tools
-
-Claude имеет доступ к 19 инструментам:
-
-### Notes Management
-- `list_notes(folder)` - список заметок
-- `read_note(path)` - прочитать заметку
-- `create_note(path, content)` - создать
-- `update_note(id, content)` - обновить
-- `delete_note(id)` - удалить
-- `rename_note(id, newPath)` - переименовать
-- `move_note(id, newFolder)` - переместить
-- `search_notes(query)` - поиск
-
-### Wikilinks
-- `get_note_connections(id)` - связи заметки
-- `add_wikilink(fromId, toId)` - добавить связь
-- `remove_wikilink(fromId, toId)` - удалить связь
-
-### Graph Analysis
-- `get_graph_data()` - полный граф с Mermaid
-- `find_related_notes(id, depth)` - похожие заметки
-
-### Folders
-- `list_folders()` - список папок
-- `create_folder(path)` - создать папку
-- `delete_folder(path)` - удалить папку
-- `rename_folder(path, newPath)` - переименовать
-- `move_folder(from, to)` - переместить
-
-### Special
-- `read_current_note()` - заметка в editor
-- `update_current_note(content)` - обновить текущую
+### Files
+```
+POST /api/upload             upload image
+GET  /uploads/:year/:month/  serve uploaded file
+GET  /health                 health check
+```
 
 ## Configuration
 
-### Backend (.env)
+`backend/.env` (copy from `.env.example`):
 
 ```bash
-PORT=8080
-WS_PORT=3000
+HTTP_PORT=8080
 MONGODB_URI=mongodb://localhost:27017
 MONGODB_DATABASE=markdown_editor
 DATA_DIR=./data
 ALLOWED_ORIGINS=http://localhost:5173
+SESSION_TIMEOUT=300   # seconds; inactive Claude sessions are terminated
+LOG_LEVEL=info
 ```
 
-### Frontend (.env)
+`frontend/.env`:
 
 ```bash
-VITE_API_URL=/api
-VITE_WS_URL=ws://localhost:3000/claude-chat
+VITE_API_URL=http://localhost:8080
 ```
 
-## Development
-
-### Build Backend
+## Build
 
 ```bash
+# Backend binary
 cd backend
 go build -o markdown-editor cmd/markdown-editor/main.go
-```
 
-### Run Tests
-
-```bash
-# Backend
-cd backend
-go test ./...
-
-# Frontend
-cd frontend
-npm test
-```
-
-### Single Binary Commands
-
-```bash
-# Start HTTP + WebSocket servers
+# Run
 ./markdown-editor serve
 
-# Start MCP server (used by Claude)
-./markdown-editor mcp
+# Frontend production build
+cd frontend
+npm run build
+# Serve dist/ with any static server
 ```
 
-## Deployment
+## MCP Tools
 
-### Backend
+Claude has access to 66 tools organized into groups:
 
-1. Build binary:
-   ```bash
-   cd backend
-   go build -o markdown-editor cmd/markdown-editor/main.go
-   ```
+**Notes:** `list_notes`, `list_notes_summary`, `read_note`, `get_note_by_path`, `create_note`, `update_note`, `delete_note`, `rename_note`, `move_note`, `find_recent_notes`, `find_related_notes`, `get_note_metadata`, `get_note_headings`, `get_note_connections`, `get_note_backlinks`, `get_note_wikilinks`, `get_note_tags`, `get_notes_by_tag`, `search_notes`
 
-2. Set environment variables
+**Content editing:** `append_to_note`, `prepend_to_note`, `insert_at_line`, `insert_after_heading`, `append_to_section`, `get_section_content`, `replace_text`, `delete_text`
 
-3. Run:
-   ```bash
-   ./markdown-editor serve
-   ```
+**Tags:** `get_all_tags`, `set_tags`, `add_tags`, `remove_tags`, `search_by_tags`
 
-### Frontend
+**Wikilinks:** `add_wikilink`, `remove_wikilink`
 
-1. Build:
-   ```bash
-   cd frontend
-   npm run build
-   ```
+**Folders:** `list_folders`, `create_folder`, `delete_folder`, `rename_folder`, `move_folder`
 
-2. Serve `dist/` with any static server
+**Attachments:** `upload_image`, `upload_file_from_path`, `list_note_attachments`, `delete_attachment`
 
-## Testing
+**Graph:** `get_graph_data`, `get_note_connections`
 
-See [TESTING.md](./TESTING.md) for comprehensive testing guide including:
-- HTTP API tests
-- WebSocket chat tests
-- Real-time events tests
-- Project integration tests
-- Dangerous mode tests
+**Tasks:** `list_tasks`, `search_tasks`, `get_task`, `create_task`, `update_task`, `delete_task`, `move_task`, `set_task_parent`, `link_note_to_task`, `link_folder_to_task`, `link_tasks`, `add_task_comment`, `get_kanban_columns`, `get_task_board`
+
+**Projects:** `get_current_project`, `set_project_path`, `set_note_type`, `list_projects`, `create_project`, `update_project`, `delete_project`
 
 ## License
 
