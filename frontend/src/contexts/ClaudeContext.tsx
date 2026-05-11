@@ -31,7 +31,8 @@ interface ClaudeContextValue {
 
 const ClaudeContext = createContext<ClaudeContextValue | undefined>(undefined)
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3000/claude-chat'
+const WS_URL = import.meta.env.VITE_WS_URL ||
+  `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/claude-chat`
 
 interface ClaudeProviderProps {
   children: ReactNode

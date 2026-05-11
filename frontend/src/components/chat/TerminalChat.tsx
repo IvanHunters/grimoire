@@ -1,38 +1,102 @@
-import { useRef, useCallback } from 'react'
+import { useRef, useCallback, forwardRef, useImperativeHandle } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
-import { useTerminalWebSocket } from '../../hooks/useTerminalWebSocket'
+import { useTerminalWebSocket, type TaskContextPayload } from '../../hooks/useTerminalWebSocket'
 import { useEffect } from 'react'
 import { useNotes } from '../../contexts/NotesContext'
 
 interface TerminalChatProps {
   sessionId: string
   dangerousMode?: boolean
+  taskContext?: TaskContextPayload | null
 }
 
-export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatProps) {
+export interface TerminalChatHandle {
+  restart: () => void
+  sendKey: (data: string) => void
+  refit: () => void
+}
+
+export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
+  ({ sessionId, dangerousMode = true, taskContext }, ref) => {
   const { currentNote } = useNotes()
   const terminalRef = useRef<HTMLDivElement>(null)
   const xtermRef = useRef<Terminal | null>(null)
   const fitAddonRef = useRef<FitAddon | null>(null)
+  const sendInputRef = useRef<((data: string) => void) | null>(null)
+  const sendResizeRef = useRef<((cols: number, rows: number) => void) | null>(null)
+  const resizeTimeoutRef = useRef<number | undefined>(undefined)
+  const isResizingRef = useRef(false)
 
-  // Handle output from WebSocket
-  const handleOutput = useCallback((data: string) => {
-    if (xtermRef.current) {
-      xtermRef.current.write(data)
-      // Auto-scroll to bottom after writing data
-      xtermRef.current.scrollToBottom()
+  // Handle output from WebSocket — accepts Uint8Array (decoded from base64)
+  const handleOutput = useCallback((data: Uint8Array) => {
+    if (!xtermRef.current) {
+      console.warn('[Terminal] Cannot write - terminal not initialized')
+      return
+    }
+
+    const term = xtermRef.current
+
+    // Check if user is at the bottom before writing (within 2 lines tolerance)
+    const buffer = term.buffer.active
+    const wasAtBottom = buffer.viewportY + term.rows >= buffer.baseY + buffer.cursorY - 2
+
+    term.write(data)
+
+    if (wasAtBottom) {
+      requestAnimationFrame(() => {
+        if (xtermRef.current) {
+          xtermRef.current.scrollToBottom()
+        }
+      })
     }
   }, [])
 
   // Setup WebSocket connection
-  const { sendInput } = useTerminalWebSocket({
+  const { sendInput, sendRestart, sendResize } = useTerminalWebSocket({
     sessionId,
     dangerousMode,
-    currentNote,
+    currentNote: taskContext ? null : currentNote,
+    taskContext: taskContext ?? null,
     onOutput: handleOutput,
   })
+
+  // Keep sendInput and sendResize refs up to date
+  useEffect(() => {
+    sendInputRef.current = sendInput
+  }, [sendInput])
+
+  useEffect(() => {
+    sendResizeRef.current = sendResize
+  }, [sendResize])
+
+  // Expose methods to parent
+  useImperativeHandle(ref, () => ({
+    restart: () => {
+      if (xtermRef.current) xtermRef.current.reset()
+      sendRestart()
+    },
+    sendKey: (data: string) => {
+      sendInputRef.current?.(data)
+      xtermRef.current?.focus()
+    },
+    refit: () => {
+      if (!fitAddonRef.current || !xtermRef.current) return
+      try { fitAddonRef.current.fit() } catch {}
+      const term = xtermRef.current
+      const vp = terminalRef.current?.querySelector('.xterm-viewport') as HTMLElement | null
+      const scrollToEnd = () => {
+        term?.scrollToBottom()
+        if (vp) vp.scrollTop = vp.scrollHeight
+      }
+      requestAnimationFrame(() => {
+        scrollToEnd()
+        setTimeout(scrollToEnd, 80)
+        setTimeout(scrollToEnd, 200)
+      })
+    },
+  }), [sendRestart])
 
   // Initialize terminal
   useEffect(() => {
@@ -41,10 +105,10 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
     // Create terminal
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
-      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      fontSize: window.innerWidth < 768 ? 12 : 13,
+      fontFamily: '"JetBrains Mono", Menlo, Monaco, "Courier New", monospace',
       theme: {
-        background: '#1e1e1e',
+        background: '#06080e',
         foreground: '#d4d4d4',
         cursor: '#ffffff',
         black: '#000000',
@@ -80,21 +144,66 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
 
     // Handle user input - send to WebSocket
     term.onData((data) => {
-      sendInput(data)
+      sendInputRef.current?.(data)
     })
 
-    // Handle resize with debounce
-    let resizeTimeout: number | undefined
-    const handleResize = () => {
-      // Debounce resize to avoid too many fit calls
-      if (resizeTimeout) {
-        clearTimeout(resizeTimeout)
+    // Notify PTY of terminal dimension changes so Claude CLI renders correctly
+    term.onResize(({ cols, rows }) => {
+      sendResizeRef.current?.(cols, rows)
+    })
+
+    // Mobile touch-to-scroll: capture phase so we intercept before xterm's canvas.
+    // Use term.scrollLines() — direct scrollTop manipulation is overridden by xterm.
+    let lastTouchY = 0
+    let scrollAccum = 0
+
+    const onTouchStart = (e: TouchEvent) => {
+      lastTouchY = e.touches[0].clientY
+      scrollAccum = 0
+    }
+
+    const onTouchMove = (e: TouchEvent) => {
+      const currentY = e.touches[0].clientY
+      const delta = lastTouchY - currentY
+      lastTouchY = currentY
+      scrollAccum += delta
+
+      const pixelsPerLine = (term.options.fontSize || 13) * (term.options.lineHeight || 1)
+      const lines = Math.trunc(scrollAccum / pixelsPerLine)
+      if (lines !== 0) {
+        term.scrollLines(lines)
+        scrollAccum -= lines * pixelsPerLine
       }
-      resizeTimeout = window.setTimeout(() => {
+      e.preventDefault()
+    }
+
+    if (terminalRef.current) {
+      terminalRef.current.addEventListener('touchstart', onTouchStart, { passive: true, capture: true })
+      terminalRef.current.addEventListener('touchmove', onTouchMove, { passive: false, capture: true })
+    }
+
+    // Prevent infinite resize loops
+    const handleResize = () => {
+      if (isResizingRef.current) return
+
+      if (resizeTimeoutRef.current) {
+        clearTimeout(resizeTimeoutRef.current)
+      }
+
+      resizeTimeoutRef.current = window.setTimeout(() => {
+        if (!fitAddonRef.current || !xtermRef.current) return
+
+        isResizingRef.current = true
         try {
-          fitAddon.fit()
+          fitAddonRef.current.fit()
+          // fit() triggers term.onResize which sends the new size to PTY
+          xtermRef.current.scrollToBottom()
         } catch (error) {
           console.error('Failed to fit terminal:', error)
+        } finally {
+          setTimeout(() => {
+            isResizingRef.current = false
+          }, 200)
         }
       }, 100)
     }
@@ -117,43 +226,64 @@ export function TerminalChat({ sessionId, dangerousMode = true }: TerminalChatPr
     // Focus terminal
     term.focus()
 
-    // Initial fit after a short delay to ensure container is rendered
-    window.setTimeout(() => {
-      try {
-        fitAddon.fit()
-      } catch (error) {
-        console.error('Failed initial fit:', error)
+    // Single delayed fit after container stabilizes
+    let initialFitTimeout: number | undefined
+    initialFitTimeout = window.setTimeout(() => {
+      if (fitAddonRef.current && xtermRef.current) {
+        try {
+          fitAddonRef.current.fit()
+          xtermRef.current.scrollToBottom()
+        } catch (error) {
+          console.error('Failed initial fit:', error)
+        }
       }
-    }, 100)
+    }, 300)
+
+    const containerEl = terminalRef.current
 
     return () => {
+      if (initialFitTimeout) {
+        clearTimeout(initialFitTimeout)
+      }
+
       window.removeEventListener('resize', handleResize)
-      if (resizeTimeout) {
-        clearTimeout(resizeTimeout)
+      if (resizeTimeoutRef.current) {
+        clearTimeout(resizeTimeoutRef.current)
       }
       resizeObserver.disconnect()
+
+      if (containerEl) {
+        containerEl.removeEventListener('touchstart', onTouchStart, { capture: true })
+        containerEl.removeEventListener('touchmove', onTouchMove, { capture: true })
+      }
+
       term.dispose()
       xtermRef.current = null
       fitAddonRef.current = null
+      isResizingRef.current = false
     }
-  }, [sessionId, sendInput])
+  }, [sessionId])
 
   return (
-    <div className="flex flex-col h-full bg-[#1e1e1e]">
-      <div className="flex-shrink-0 px-4 py-2 bg-gray-900 border-b border-gray-700">
-        <div className="text-xs text-gray-400">
-          <span className="font-mono">Session: {sessionId.slice(0, 8)}...</span>
-          {dangerousMode && (
-            <span className="ml-4 text-yellow-500">⚠️ Dangerous Mode</span>
-          )}
-        </div>
-      </div>
+    <div className="flex flex-col flex-1 min-h-0" style={{ background: '#06080e' }}>
       <div
-        ref={terminalRef}
-        className="flex-1 p-2"
-      />
+        className="flex-shrink-0 px-4 py-2 flex items-center gap-3"
+        style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
+      >
+        <span className="text-[10px] font-mono text-slate-700">
+          Session: {sessionId.slice(0, 8)}...
+        </span>
+        {dangerousMode && (
+          <span className="text-[10px] font-mono text-yellow-600/80 tracking-wide">
+            ⚠ dangerous mode
+          </span>
+        )}
+      </div>
+      <div ref={terminalRef} className="flex-1 min-h-0 overflow-hidden p-2" />
     </div>
   )
-}
+})
+
+TerminalChat.displayName = 'TerminalChat'
 
 export default TerminalChat

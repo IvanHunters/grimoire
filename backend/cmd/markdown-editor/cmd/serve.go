@@ -16,6 +16,7 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	mw "github.com/ivanohotnikov/markdown-editor/internal/middleware"
+	"github.com/ivanohotnikov/markdown-editor/internal/scheduler"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 	"github.com/ivanohotnikov/markdown-editor/internal/websocket"
 	"github.com/mark3labs/mcp-go/server"
@@ -74,21 +75,44 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := store.EnsureFolderIndexes(ctx); err != nil {
 		return fmt.Errorf("failed to ensure folder indexes: %w", err)
 	}
+	if err := store.EnsureTaskIndexes(ctx); err != nil {
+		return fmt.Errorf("failed to ensure task indexes: %w", err)
+	}
+	logger.Info("mongodb indexes created")
+
+	// Build in-memory tags index
+	if err := store.BuildTagsIndex(ctx); err != nil {
+		return fmt.Errorf("failed to build tags index: %w", err)
+	}
 
 	// Setup session storage
 	sessionStorage := storage.NewSessionStorage(db)
 	if err := sessionStorage.CreateSessionsIndexes(ctx); err != nil {
 		return fmt.Errorf("failed to create session indexes: %w", err)
 	}
-	logger.Info("indexes created")
+	logger.Info("session indexes created")
+
+	// Setup SessionManager (needed by both HTTP and WebSocket servers)
+	manager := claude.GetSessionManager(logger, sessionStorage, cfg.MongoDBURI, cfg.MongoDBDatabase)
+	// Automatic session cleanup disabled - user closes sessions manually
+	// timeout := time.Duration(cfg.SessionTimeout) * time.Second
+	// manager.MonitorInactiveSessions(timeout, 1*time.Minute)
+
+	// Setup task scheduler
+	sched := scheduler.New(store, cfg.MongoDBURI, cfg.MongoDBDatabase, logger)
+	schedCtx, schedCancel := context.WithCancel(context.Background())
+	go sched.Start(schedCtx)
 
 	// Setup HTTP server
-	handler := api.NewHandler(cfg, db, logger)
+	handler := api.NewHandler(cfg, db, manager, logger)
+	handler.SetTaskRunner(sched)
+	wsHandler := websocket.NewHandler(cfg, manager, store, logger)
 	httpRouter := chi.NewRouter()
 	httpRouter.Use(mw.Recovery(logger))
 	httpRouter.Use(mw.Logging(logger))
 	httpRouter.Use(mw.CORS(cfg))
-	httpRouter.Use(middleware.Compress(5))
+	// Compress is applied per-route group, NOT globally:
+	// WebSocket upgrade (http.Hijack) breaks if ResponseWriter is wrapped by compress.
 
 	// Create MCP server
 	mcpServer := CreateMCPServer(store, logger, cfg)
@@ -97,6 +121,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Routes
 	httpRouter.Get("/health", handler.Health)
 	httpRouter.Route("/api", func(r chi.Router) {
+		r.Use(middleware.Compress(5))
 		r.Get("/notes", handler.ListNotes)
 		r.Get("/notes/project-suggestions", handler.ProjectSuggestions)
 		r.Get("/notes/{id}", handler.GetNote)
@@ -106,15 +131,47 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 		r.Get("/folders", handler.ListFolders)
 		r.Post("/folders", handler.CreateFolder)
+		r.Put("/folders", handler.UpdateFolder)
 		r.Delete("/folders", handler.DeleteFolder)
 		r.Put("/folders/move", handler.MoveFolder)
 
 		r.Get("/search", handler.Search)
+		r.Get("/search/tags", handler.SearchByTags)
+		r.Get("/tags", handler.GetAllTags)
 		r.Post("/upload", handler.Upload)
 
 		r.Get("/sessions", handler.ListSessions)
 		r.Delete("/sessions/{id}", handler.DeleteSession)
+
+		// Projects
+		r.Get("/projects", handler.ListProjects)
+		r.Post("/projects", handler.CreateProject)
+		r.Put("/projects/{id}", handler.UpdateProject)
+		r.Delete("/projects/{id}", handler.DeleteProject)
+
+		// Tasks
+		r.Get("/task-columns", handler.GetTaskColumns)
+		r.Put("/task-columns", handler.SetTaskColumns)
+		r.Get("/task-project-folders", handler.GetTaskProjectFolders)
+		r.Put("/task-project-folders", handler.SetTaskProjectFolders)
+
+		r.Get("/tasks/search", handler.SearchTasks)
+		r.Get("/tasks", handler.ListTasks)
+		r.Get("/tasks/{id}", handler.GetTask)
+		r.Post("/tasks", handler.CreateTask)
+		r.Put("/tasks/{id}", handler.UpdateTask)
+		r.Delete("/tasks/{id}", handler.DeleteTask)
+		r.Post("/tasks/{id}/run-now", handler.RunTaskNow)
+		r.Post("/tasks/{id}/cancel", handler.CancelTaskNow)
+
+		// Task comments
+		r.Post("/tasks/{id}/comments", handler.AddComment)
+		r.Put("/tasks/{id}/comments/{commentId}", handler.UpdateComment)
+		r.Delete("/tasks/{id}/comments/{commentId}", handler.DeleteComment)
 	})
+
+	// WebSocket endpoint (on same port as HTTP API, no separate server needed)
+	httpRouter.HandleFunc("/claude-chat", wsHandler.HandleWebSocket)
 
 	// MCP endpoint (outside /api for simplicity)
 	httpRouter.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
@@ -126,42 +183,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	httpRouter.Handle("/uploads/*", http.StripPrefix("/uploads/", fileServer))
 
 	httpSrv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
-		Handler:      httpRouter,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:        fmt.Sprintf(":%d", cfg.HTTPPort),
+		Handler:     httpRouter,
+		IdleTimeout: 60 * time.Second,
+		// No ReadTimeout/WriteTimeout: WebSocket connections on /claude-chat are long-lived.
+		// HTTP-level write timeouts kill active WebSocket connections.
 	}
 
-	// Setup WebSocket server
-	manager := claude.GetSessionManager(logger, sessionStorage, cfg.MongoDBURI, cfg.MongoDBDatabase)
-	timeout := time.Duration(cfg.SessionTimeout) * time.Second
-	manager.MonitorInactiveSessions(timeout, 1*time.Minute)
-
-	wsHandler := websocket.NewHandler(cfg, manager, logger)
-	wsMux := http.NewServeMux()
-	wsMux.HandleFunc("/claude-chat", wsHandler.HandleWebSocket)
-
-	wsSrv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.WSPort),
-		Handler:      wsMux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	// Start servers in goroutines
+	// Start server in goroutine
 	go func() {
-		logger.Info("http server listening", slog.Int("port", cfg.HTTPPort))
+		logger.Info("http+websocket server listening", slog.Int("port", cfg.HTTPPort))
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("http server error", slog.Any("error", err))
-		}
-	}()
-
-	go func() {
-		logger.Info("websocket server listening", slog.Int("port", cfg.WSPort))
-		if err := wsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("websocket server error", slog.Any("error", err))
 		}
 	}()
 
@@ -172,6 +205,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	logger.Info("shutting down servers...")
 
+	// Stop scheduler
+	schedCancel()
+
 	// Close all Claude sessions
 	manager.CloseAll()
 
@@ -181,9 +217,6 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http server forced to shutdown", slog.Any("error", err))
-	}
-	if err := wsSrv.Shutdown(shutdownCtx); err != nil {
-		logger.Error("websocket server forced to shutdown", slog.Any("error", err))
 	}
 
 	logger.Info("servers stopped")

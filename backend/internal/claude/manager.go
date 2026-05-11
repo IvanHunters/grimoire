@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ type SessionStorage interface {
 	GetSession(ctx context.Context, sessionID string) (*models.ClaudeSession, error)
 	UpdateSessionStatus(ctx context.Context, sessionID string, status string) error
 	UpdateSessionActivity(ctx context.Context, sessionID string) error
+	UpdateSessionName(ctx context.Context, sessionID string, name string) error
 	UpdateSessionMessages(ctx context.Context, sessionID string, messages []models.ClaudeMessage) error
 	ListActiveSessions(ctx context.Context) ([]*models.ClaudeSession, error)
 }
@@ -48,42 +50,50 @@ func GetSessionManager(logger *slog.Logger, storage SessionStorage, mongoURI str
 	return globalManager
 }
 
-// GetOrCreate gets an existing session or creates a new one
-func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, workingDir string) (*ClaudeSession, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+// GetOrCreate gets an existing session or creates a new one.
+// Lock is held only for map reads/writes; slow operations (subprocess start,
+// MongoDB queries) run outside the lock to prevent blocking ListActiveSessions.
+func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, workingDir string, sessionName string, systemPrompt string) (*ClaudeSession, error) {
 	ctx := context.Background()
 
-	// Check if session exists in memory
-	if session, exists := m.sessions[sessionID]; exists {
-		// Update dangerous mode if it changed
-		if session.DangerousMode != dangerousMode {
-			// Need to restart session with new mode
-			if err := shutdownSession(session, m.logger); err != nil {
-				m.logger.Error("failed to shutdown session for restart", slog.Any("error", err))
-			}
-			delete(m.sessions, sessionID)
+	// Fast path: session already in memory.
+	m.mu.RLock()
+	session, exists := m.sessions[sessionID]
+	m.mu.RUnlock()
 
-			// Update status in DB
-			if m.storage != nil {
-				m.storage.UpdateSessionStatus(ctx, sessionID, "inactive")
-			}
-		} else {
-			// Session exists and mode is the same
+	if exists {
+		if session.DangerousMode == dangerousMode {
 			session.UpdateActivity()
-
-			// Update activity in DB
-			if m.storage != nil {
-				m.storage.UpdateSessionActivity(ctx, sessionID)
-			}
-
+			go func() {
+				if sessionName != "" && session.Name != sessionName {
+					m.mu.Lock()
+					session.Name = sessionName
+					m.mu.Unlock()
+					if m.storage != nil {
+						m.storage.UpdateSessionName(ctx, sessionID, sessionName)
+					}
+				}
+				if m.storage != nil {
+					m.storage.UpdateSessionActivity(ctx, sessionID)
+				}
+			}()
 			return session, nil
+		}
+
+		// Dangerous mode changed — shut down and recreate.
+		m.mu.Lock()
+		delete(m.sessions, sessionID)
+		m.mu.Unlock()
+		if err := shutdownSession(session, m.logger); err != nil {
+			m.logger.Error("failed to shutdown session for restart", slog.Any("error", err))
+		}
+		if m.storage != nil {
+			m.storage.UpdateSessionStatus(ctx, sessionID, "inactive")
 		}
 	}
 
-	// Check if session exists in DB (from previous run)
-	var sessionName string
+	// Slow path: DB lookup + subprocess creation — all outside the lock.
+	var dbSessionName string
 	var mcpConfigPath string
 	var restoredMessages []models.ClaudeMessage
 
@@ -92,68 +102,79 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 		if err != nil {
 			m.logger.Error("failed to get session from DB", slog.Any("error", err))
 		} else if dbSession != nil {
-			sessionName = dbSession.Name
+			dbSessionName = dbSession.Name
 			mcpConfigPath = dbSession.MCPConfigPath
 			restoredMessages = dbSession.Messages
 			m.logger.Info("restoring session metadata from DB",
 				slog.String("session_id", sessionID),
-				slog.String("name", sessionName),
+				slog.String("name", dbSessionName),
 				slog.Int("messages_count", len(restoredMessages)),
 			)
 		}
 	}
 
-	// Create new subprocess
-	session, err := startClaudeSubprocess(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger)
+	newSession, err := startClaudeSubprocess(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger, systemPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start claude subprocess: %w", err)
 	}
 
-	// Set name and MCP path if restored from DB
-	if sessionName != "" {
-		session.Name = sessionName
+	if dbSessionName != "" {
+		newSession.Name = dbSessionName
+	} else if sessionName != "" {
+		newSession.Name = sessionName
 	} else {
-		session.Name = "Terminal Session"
+		newSession.Name = "Terminal Session"
 	}
 
 	if mcpConfigPath != "" {
-		session.MCPConfigPath = mcpConfigPath
+		newSession.MCPConfigPath = mcpConfigPath
 	}
 
-	// Restore messages from DB
 	if len(restoredMessages) > 0 {
-		session.Messages = restoredMessages
+		newSession.Messages = restoredMessages
 		m.logger.Info("restored messages from DB",
 			slog.String("session_id", sessionID),
 			slog.Int("count", len(restoredMessages)),
 		)
 	}
 
-	m.sessions[sessionID] = session
+	// Register in the map (brief lock only for map write).
+	m.mu.Lock()
+	// Double-check: another goroutine may have created it while we were starting the subprocess.
+	if existing, raced := m.sessions[sessionID]; raced {
+		m.mu.Unlock()
+		// Discard the subprocess we just started.
+		go shutdownSession(newSession, m.logger)
+		return existing, nil
+	}
+	m.sessions[sessionID] = newSession
+	m.mu.Unlock()
 
-	// Save to DB
-	if m.storage != nil {
-		dbSession := &models.ClaudeSession{
-			ID:            session.ID,
-			Name:          session.Name,
-			DangerousMode: session.DangerousMode,
-			WorkingDir:    session.WorkingDir,
-			MCPConfigPath: session.MCPConfigPath,
+	// Persist to DB asynchronously — doesn't block the caller.
+	go func() {
+		if m.storage == nil {
+			return
+		}
+		dbRecord := &models.ClaudeSession{
+			ID:            newSession.ID,
+			Name:          newSession.Name,
+			DangerousMode: newSession.DangerousMode,
+			WorkingDir:    newSession.WorkingDir,
+			MCPConfigPath: newSession.MCPConfigPath,
 			Status:        "active",
 			Messages:      []models.ClaudeMessage{},
-			CreatedAt:     session.CreatedAt,
+			CreatedAt:     newSession.CreatedAt,
 			UpdatedAt:     time.Now(),
-			LastActivity:  session.LastActivity,
+			LastActivity:  newSession.LastActivity,
 		}
-
-		if err := m.storage.SaveSession(ctx, dbSession); err != nil {
+		if err := m.storage.SaveSession(ctx, dbRecord); err != nil {
 			m.logger.Error("failed to save session to DB", slog.Any("error", err))
 		} else {
 			m.logger.Info("session saved to DB", slog.String("session_id", sessionID))
 		}
-	}
+	}()
 
-	return session, nil
+	return newSession, nil
 }
 
 // Get retrieves an existing session
@@ -171,12 +192,14 @@ func (m *SessionManager) Get(sessionID string) (*ClaudeSession, error) {
 
 // Close closes a specific session
 func (m *SessionManager) Close(sessionID string) error {
+	// Hold lock only for map operation — release before slow ops.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ctx := context.Background()
-
 	session, exists := m.sessions[sessionID]
+	if exists {
+		delete(m.sessions, sessionID)
+	}
+	m.mu.Unlock()
+
 	if !exists {
 		return fmt.Errorf("session not found: %s", sessionID)
 	}
@@ -185,10 +208,9 @@ func (m *SessionManager) Close(sessionID string) error {
 		return fmt.Errorf("failed to shutdown session: %w", err)
 	}
 
-	delete(m.sessions, sessionID)
-
-	// Update status in DB
 	if m.storage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if err := m.storage.UpdateSessionStatus(ctx, sessionID, "terminated"); err != nil {
 			m.logger.Error("failed to update session status in DB", slog.Any("error", err))
 		}
@@ -199,33 +221,40 @@ func (m *SessionManager) Close(sessionID string) error {
 
 // CloseInactive closes sessions that have been inactive for the given timeout
 func (m *SessionManager) CloseInactive(timeout time.Duration) {
+	// Collect inactive sessions and remove from map under lock — release before slow ops.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	ctx := context.Background()
-
+	type toClose struct {
+		id      string
+		session *ClaudeSession
+	}
+	var inactive []toClose
 	for id, session := range m.sessions {
 		if session.IsInactive(timeout) {
-			m.logger.Info("closing inactive session",
-				slog.String("session_id", id),
-				slog.Duration("inactive_for", time.Since(session.LastActivity)),
-			)
-
-			if err := shutdownSession(session, m.logger); err != nil {
-				m.logger.Error("failed to shutdown inactive session",
-					slog.String("session_id", id),
-					slog.Any("error", err),
-				)
-			}
-
+			inactive = append(inactive, toClose{id, session})
 			delete(m.sessions, id)
+		}
+	}
+	m.mu.Unlock()
 
-			// Update status in DB
-			if m.storage != nil {
-				if err := m.storage.UpdateSessionStatus(ctx, id, "inactive"); err != nil {
-					m.logger.Error("failed to update session status in DB", slog.Any("error", err))
-				}
+	for _, item := range inactive {
+		m.logger.Info("closing inactive session",
+			slog.String("session_id", item.id),
+			slog.Duration("inactive_for", time.Since(item.session.LastActivity)),
+		)
+
+		if err := shutdownSession(item.session, m.logger); err != nil {
+			m.logger.Error("failed to shutdown inactive session",
+				slog.String("session_id", item.id),
+				slog.Any("error", err),
+			)
+		}
+
+		if m.storage != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := m.storage.UpdateSessionStatus(ctx, item.id, "inactive"); err != nil {
+				m.logger.Error("failed to update session status in DB", slog.Any("error", err))
 			}
+			cancel()
 		}
 	}
 }
@@ -233,13 +262,13 @@ func (m *SessionManager) CloseInactive(timeout time.Duration) {
 // CloseAll closes all sessions (for graceful shutdown)
 func (m *SessionManager) CloseAll() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	old := m.sessions
+	m.sessions = make(map[string]*ClaudeSession)
+	m.mu.Unlock()
 
-	m.logger.Info("closing all claude sessions",
-		slog.Int("count", len(m.sessions)),
-	)
+	m.logger.Info("closing all claude sessions", slog.Int("count", len(old)))
 
-	for id, session := range m.sessions {
+	for id, session := range old {
 		if err := shutdownSession(session, m.logger); err != nil {
 			m.logger.Error("failed to shutdown session",
 				slog.String("session_id", id),
@@ -247,8 +276,6 @@ func (m *SessionManager) CloseAll() {
 			)
 		}
 	}
-
-	m.sessions = make(map[string]*ClaudeSession)
 }
 
 // MonitorInactiveSessions starts a background goroutine to cleanup inactive sessions
@@ -337,6 +364,11 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			LastActivity:  session.LastActivity,
 		})
 	}
+
+	// Sort by CreatedAt descending (newest first)
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].CreatedAt.After(sessions[j].CreatedAt)
+	})
 
 	return sessions
 }

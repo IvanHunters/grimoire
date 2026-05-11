@@ -18,8 +18,8 @@ type CurrentNote struct {
 }
 
 // DetermineWorkingDir determines the working directory for Claude subprocess
-// Priority: explicit projectPath → /tmp/claude-{hash(folder/name)}
-func DetermineWorkingDir(currentNote *CurrentNote, sessionID string) (string, error) {
+// Priority: note projectPath → folder projectPath (inherited) → /tmp/claude-{hash}
+func DetermineWorkingDir(currentNote *CurrentNote, folderProjectPath string, sessionID string) (string, error) {
 	// Priority 1: Explicit project path from note metadata
 	if currentNote != nil && currentNote.ProjectPath != "" {
 		expanded := expandPath(currentNote.ProjectPath)
@@ -28,7 +28,15 @@ func DetermineWorkingDir(currentNote *CurrentNote, sessionID string) (string, er
 		}
 	}
 
-	// Priority 2: Temp directory with hash of note path
+	// Priority 2: Inherited project path from folder
+	if folderProjectPath != "" {
+		expanded := expandPath(folderProjectPath)
+		if _, err := os.Stat(expanded); err == nil {
+			return expanded, nil
+		}
+	}
+
+	// Priority 3: Temp directory with hash of note path
 	hash := hashNotePath(currentNote)
 	tempDir := filepath.Join("/tmp", fmt.Sprintf("claude-%s", hash))
 	if err := os.MkdirAll(tempDir, 0755); err == nil {

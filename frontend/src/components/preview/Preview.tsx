@@ -28,7 +28,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
   if (!content) {
     return (
       <div ref={ref} className={`flex items-center justify-center ${className}`}>
-        <p className="text-gray-500">No content to preview</p>
+        <p className="text-gray-500 dark:text-gray-400">No content to preview</p>
       </div>
     )
   }
@@ -53,7 +53,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
   return (
     <div ref={ref} className={`h-full overflow-auto ${className}`}>
-      <div className="markdown-preview p-8 max-w-4xl mx-auto">
+      <div className="markdown-preview p-4 md:p-8 max-w-4xl mx-auto">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
           rehypePlugins={[rehypePrism]}
@@ -177,7 +177,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
               // Regular code block with copy button
               return (
-                <pre tabIndex={0} {...props}>
+                <pre tabIndex={0} {...props} data-language={language || undefined}>
                   {children}
                   {/* Copy button - показывается при hover */}
                   <button

@@ -91,62 +91,62 @@ function MermaidEditorModal({ visible, onClose, onInsert }: MermaidEditorModalPr
       onClick={handleOverlayClick}
     >
       <div
-        className="bg-white rounded-lg shadow-xl"
+        className="bg-white dark:bg-gray-800 rounded-lg shadow-xl"
         style={{ maxWidth: '900px', width: '90%', maxHeight: '85vh' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
-          <h2 className="text-xl font-semibold text-gray-900">Mermaid Diagram Editor</h2>
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Mermaid Diagram Editor</h2>
           <button
             onClick={handleClose}
-            className="p-2 hover:bg-gray-100 rounded transition"
+            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition"
             title="Close"
           >
-            <i className="fas fa-times text-gray-600"></i>
+            <i className="fas fa-times text-gray-600 dark:text-gray-400"></i>
           </button>
         </div>
 
         {/* Body */}
         <div className="flex" style={{ height: '500px' }}>
           {/* Editor side */}
-          <div className="flex-1 flex flex-col border-r border-gray-200">
-            <div className="px-4 py-3 bg-gray-50 border-b border-gray-200">
-              <label className="text-sm font-medium text-gray-700">Mermaid Code</label>
+          <div className="flex-1 flex flex-col border-r border-gray-200 dark:border-gray-700">
+            <div className="px-4 py-3 bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
+              <label className="text-sm font-medium text-gray-700 dark:text-gray-300">Mermaid Code</label>
             </div>
 
             <textarea
               value={code}
               onChange={(e) => setCode(e.target.value)}
-              className="flex-1 p-4 border-0 font-mono text-sm resize-none outline-none"
+              className="flex-1 p-4 border-0 font-mono text-sm resize-none outline-none bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
               style={{ fontFamily: "'Monaco', 'Menlo', 'Courier New', monospace" }}
             />
 
             {/* Quick templates */}
-            <div className="px-4 py-3 bg-gray-50 border-t border-gray-200">
-              <label className="text-sm font-medium text-gray-700 mb-2 block">Quick Templates:</label>
+            <div className="px-4 py-3 bg-gray-50 dark:bg-gray-700 border-t border-gray-200 dark:border-gray-600">
+              <label className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 block">Quick Templates:</label>
               <div className="flex gap-2 flex-wrap">
                 <button
                   onClick={() => handleTemplateSelect('flowchart')}
-                  className="px-3 py-1 text-xs bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+                  className="px-3 py-1 text-xs bg-white dark:bg-gray-600 border border-gray-300 dark:border-gray-500 rounded hover:bg-gray-50 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 transition"
                 >
                   Flowchart
                 </button>
                 <button
                   onClick={() => handleTemplateSelect('sequence')}
-                  className="px-3 py-1 text-xs bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+                  className="px-3 py-1 text-xs bg-white dark:bg-gray-600 border border-gray-300 dark:border-gray-500 rounded hover:bg-gray-50 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 transition"
                 >
                   Sequence
                 </button>
                 <button
                   onClick={() => handleTemplateSelect('gantt')}
-                  className="px-3 py-1 text-xs bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+                  className="px-3 py-1 text-xs bg-white dark:bg-gray-600 border border-gray-300 dark:border-gray-500 rounded hover:bg-gray-50 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 transition"
                 >
                   Gantt
                 </button>
                 <button
                   onClick={() => handleTemplateSelect('pie')}
-                  className="px-3 py-1 text-xs bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+                  className="px-3 py-1 text-xs bg-white dark:bg-gray-600 border border-gray-300 dark:border-gray-500 rounded hover:bg-gray-50 dark:hover:bg-gray-500 text-gray-700 dark:text-gray-200 transition"
                 >
                   Pie Chart
                 </button>
@@ -156,20 +156,20 @@ function MermaidEditorModal({ visible, onClose, onInsert }: MermaidEditorModalPr
 
           {/* Preview side */}
           <div className="flex-1 flex flex-col">
-            <div className="px-4 py-3 bg-gray-50 border-b border-gray-200">
-              <label className="text-sm font-medium text-gray-700">Live Preview</label>
+            <div className="px-4 py-3 bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
+              <label className="text-sm font-medium text-gray-700 dark:text-gray-300">Live Preview</label>
             </div>
-            <div className="flex-1 p-6 overflow-auto flex items-center justify-center bg-white">
+            <div className="flex-1 p-6 overflow-auto flex items-center justify-center bg-white dark:bg-gray-800">
               <MermaidDiagram key={renderKey} code={code} />
             </div>
           </div>
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200">
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 dark:border-gray-700">
           <button
             onClick={handleClose}
-            className="px-4 py-2 text-gray-700 bg-white border border-gray-300 rounded hover:bg-gray-50 transition"
+            className="px-4 py-2 text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-600 transition"
           >
             Cancel
           </button>

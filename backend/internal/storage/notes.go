@@ -3,9 +3,11 @@ package storage
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"time"
 
+	"github.com/ivanohotnikov/markdown-editor/internal/index"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -16,12 +18,30 @@ const notesCollection = "notes"
 
 // MongoStorage implements Storage interface using MongoDB
 type MongoStorage struct {
-	db *mongo.Database
+	db        *mongo.Database
+	tagsIndex *index.TagsIndex
+	logger    *slog.Logger
 }
 
 // NewMongoStorage creates a new MongoDB storage
 func NewMongoStorage(db *mongo.Database) *MongoStorage {
-	return &MongoStorage{db: db}
+	return &MongoStorage{
+		db:        db,
+		tagsIndex: index.NewTagsIndex(),
+		logger:    slog.Default(),
+	}
+}
+
+// BuildTagsIndex builds the in-memory tags index from all notes
+func (s *MongoStorage) BuildTagsIndex(ctx context.Context) error {
+	notes, err := s.ListNotes(ctx, "")
+	if err != nil {
+		return fmt.Errorf("failed to list notes for index: %w", err)
+	}
+
+	s.tagsIndex.Build(notes)
+	s.logger.Info("Tags index built", "notes_count", len(notes), "tags_count", len(s.tagsIndex.GetAllTags()))
+	return nil
 }
 
 // ListNotes retrieves all notes, optionally filtered by folder
@@ -96,6 +116,9 @@ func (s *MongoStorage) CreateNote(ctx context.Context, note *models.Note) error 
 		return fmt.Errorf("failed to create note: %w", err)
 	}
 
+	// Update tags index
+	s.tagsIndex.AddNote(note)
+
 	// Update backlinks for linked notes
 	if err := s.UpdateBacklinks(ctx, note.ID, note.OutgoingLinks); err != nil {
 		return fmt.Errorf("failed to update backlinks: %w", err)
@@ -121,6 +144,7 @@ func (s *MongoStorage) UpdateNote(ctx context.Context, note *models.Note) error 
 			"content":        note.Content,
 			"type":           note.Type,
 			"project_path":   note.ProjectPath,
+			"tags":           note.Tags,
 			"updated_at":     note.UpdatedAt,
 			"outgoing_links": note.OutgoingLinks,
 		},
@@ -133,6 +157,9 @@ func (s *MongoStorage) UpdateNote(ctx context.Context, note *models.Note) error 
 	if result.MatchedCount == 0 {
 		return fmt.Errorf("note not found: %s", note.ID)
 	}
+
+	// Update tags index
+	s.tagsIndex.AddNote(note)
 
 	// Update backlinks for linked notes
 	if err := s.UpdateBacklinks(ctx, note.ID, note.OutgoingLinks); err != nil {
@@ -154,6 +181,9 @@ func (s *MongoStorage) DeleteNote(ctx context.Context, id string) error {
 		return fmt.Errorf("note not found: %s", id)
 	}
 
+	// Remove from tags index
+	s.tagsIndex.RemoveNote(id)
+
 	// Remove this note from backlinks of all notes it linked to
 	if err := s.UpdateBacklinks(ctx, id, []string{}); err != nil {
 		return fmt.Errorf("failed to update backlinks after deletion: %w", err)
@@ -172,19 +202,23 @@ func (s *MongoStorage) DeleteNote(ctx context.Context, id string) error {
 	return nil
 }
 
-// SearchNotes performs full-text search on notes
-func (s *MongoStorage) SearchNotes(ctx context.Context, query string) ([]*models.Note, error) {
+// SearchNotes performs full-text search on notes, ranked by relevance.
+// limit <= 0 defaults to 20. MongoDB text score already boosts title matches.
+func (s *MongoStorage) SearchNotes(ctx context.Context, query string, limit int) ([]*models.Note, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
 	collection := s.db.Collection(notesCollection)
 
 	filter := bson.M{
-		"$text": bson.M{
-			"$search": query,
-		},
+		"$text": bson.M{"$search": query},
 	}
 
-	opts := options.Find().SetProjection(bson.M{
-		"score": bson.M{"$meta": "textScore"},
-	}).SetSort(bson.D{{Key: "score", Value: bson.M{"$meta": "textScore"}}})
+	opts := options.Find().
+		SetProjection(bson.M{"score": bson.M{"$meta": "textScore"}}).
+		SetSort(bson.D{{Key: "score", Value: bson.M{"$meta": "textScore"}}}).
+		SetLimit(int64(limit))
 
 	cursor, err := collection.Find(ctx, filter, opts)
 	if err != nil {
@@ -198,6 +232,16 @@ func (s *MongoStorage) SearchNotes(ctx context.Context, query string) ([]*models
 	}
 
 	return notes, nil
+}
+
+// SearchByTags performs fast in-memory search by tags
+func (s *MongoStorage) SearchByTags(tags []string, limit int) []*models.Note {
+	return s.tagsIndex.SearchByTags(tags, limit)
+}
+
+// GetAllTags returns all unique tags with usage counts
+func (s *MongoStorage) GetAllTags() map[string]int {
+	return s.tagsIndex.GetAllTags()
 }
 
 // UpdateBacklinks updates backlinks for notes that are referenced
@@ -308,6 +352,9 @@ func (s *MongoStorage) EnsureIndexes(ctx context.Context) error {
 		},
 		{
 			Keys: bson.D{{Key: "updated_at", Value: -1}},
+		},
+		{
+			Keys: bson.D{{Key: "tags", Value: 1}}, // multikey index for array
 		},
 		{
 			Keys: bson.D{

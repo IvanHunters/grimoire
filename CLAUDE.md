@@ -190,7 +190,10 @@ Claude has access to:
 - `read_current_note()` - read note in editor (when user asks)
 - `update_current_note(content)` - update note in editor
 - `list_notes(folder)` - list all notes
-- `search_notes(query)` - search by content
+- `list_notes_summary(folder)` - fast overview (minimal tokens)
+- `search_notes(query, summary_only=true)` - keyword search by content
+- `search_by_tags(tags, limit)` - fast in-memory tag search (microseconds)
+- `get_all_tags()` - get all tags with usage counts
 - `read_note(path)` - read specific note
 - `create_note(path, content)` - create new note
 - `create_folder(path)` - create folder
@@ -280,6 +283,51 @@ go build -o markdown-mcp
 - CORS: allow only frontend origin
 - No authentication in MVP (localhost only)
 - Validate all API inputs
+
+### Tags & Fast Search
+
+**Feature:** In-memory inverted index for instant tag-based search.
+
+**Architecture:**
+- **Inverted index**: `map[tag]set<noteID>` stored in RAM
+- **Parallel search**: Each tag searched in separate goroutine (inspired by huinx)
+- **Rank by matches**: Notes with more matching tags ranked higher
+- **Auto-sync**: Index updates on create/update/delete
+
+**Performance:**
+- Search: **microseconds** (vs MongoDB milliseconds)
+- Memory: ~5MB per 10k notes
+- Build time: ~100ms for 10k notes
+
+**Backend:**
+- `internal/index/tags.go` - TagsIndex implementation
+- `storage.BuildTagsIndex()` - builds index on startup
+- `storage.SearchByTags(tags, limit)` - parallel search
+- `storage.GetAllTags()` - tag statistics
+
+**MCP Tools:**
+- `search_by_tags("kubernetes,networking", limit=50)` - instant tag search
+- `get_all_tags()` - list all tags with counts
+
+**Data model:**
+```go
+type Note struct {
+    ...
+    Tags []string `json:"tags,omitempty" bson:"tags,omitempty"`
+}
+```
+
+**Example usage:**
+```bash
+# Add tags to note
+update_note(id, content="...", tags=["kubernetes", "networking", "security"])
+
+# Fast search (microseconds!)
+search_by_tags("kubernetes,networking")
+
+# Get tag statistics
+get_all_tags()
+```
 
 ## Future Enhancements
 

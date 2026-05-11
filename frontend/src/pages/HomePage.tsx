@@ -9,6 +9,8 @@ import Header from '../components/layout/Header'
 import Sidebar from '../components/layout/Sidebar'
 import EditorTextarea from '../components/editor/EditorTextarea'
 import Toolbar from '../components/editor/Toolbar'
+import NoteSettings from '../components/editor/NoteSettings'
+import TagPicker from '../components/editor/TagPicker'
 import Preview from '../components/preview/Preview'
 import GraphView from '../components/graph/GraphView'
 import ChatPanel from '../components/chat/ChatPanel'
@@ -16,7 +18,7 @@ import ChatPanel from '../components/chat/ChatPanel'
 function HomePage() {
   const { noteId } = useParams<{ noteId: string }>()
   const navigate = useNavigate()
-  const { notes, currentNote, setCurrentNote, updateNote } = useNotes()
+  const { notes, currentNote, setCurrentNote, updateNote, fetchNotes } = useNotes()
 
   // Load saved view mode from localStorage, default to 'preview'
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
@@ -26,11 +28,16 @@ function HomePage() {
 
   const [editorWidth, setEditorWidth] = useState<number | null>(null)
   const [previewWidth, setPreviewWidth] = useState<number | null>(null)
+  const [sidebarWidth, setSidebarWidth] = useState<number>(256) // Default 256px (w-64)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [insertMarkdown, setInsertMarkdown] = useState<((type: string, value?: string) => void) | null>(null)
   const [editorContent, setEditorContent] = useState<string>('')
+  const [editorTags, setEditorTags] = useState<string[]>([])
   const [showGraphView, setShowGraphView] = useState(false)
   const [showChatPanel, setShowChatPanel] = useState(false)
   const [chatNoteId, setChatNoteId] = useState<string | null>(null)
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [mobilePanel, setMobilePanel] = useState<'editor' | 'preview'>('editor')
   const containerRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<HTMLDivElement>(null)
   const previewRef = useRef<HTMLDivElement>(null)
@@ -40,12 +47,63 @@ function HomePage() {
     localStorage.setItem('viewMode', viewMode)
   }, [viewMode])
 
-  // Update editor content when note changes
+  // Update editor content and tags when note changes (only when switching notes, not on every update)
   useEffect(() => {
     if (currentNote) {
       setEditorContent(currentNote.content)
+      setEditorTags(currentNote.tags || [])
     }
-  }, [currentNote])
+  }, [currentNote?.id])
+
+  // Sync tags from currentNote when updated externally (e.g., via MCP)
+  // Only update if tags actually changed to avoid re-triggering auto-save
+  useEffect(() => {
+    if (currentNote && currentNote.tags) {
+      const currentTagsStr = JSON.stringify(currentNote.tags.sort())
+      const editorTagsStr = JSON.stringify([...editorTags].sort())
+      if (currentTagsStr !== editorTagsStr) {
+        setEditorTags(currentNote.tags)
+      }
+    }
+  }, [currentNote?.tags])
+
+  // Sync content from currentNote when updated externally (e.g., via MCP)
+  const lastUserEditRef = useRef<number>(Date.now())
+  const lastSyncedContentRef = useRef<string>('')
+
+  useEffect(() => {
+    if (!currentNote) return
+
+    // Skip if this is the same content we already synced
+    if (currentNote.content === lastSyncedContentRef.current) return
+
+    // Skip if content matches what user is editing
+    if (currentNote.content === editorContent) {
+      lastSyncedContentRef.current = currentNote.content
+      return
+    }
+
+    // Check if user was editing recently (within last 2 seconds)
+    const timeSinceLastEdit = Date.now() - lastUserEditRef.current
+
+    if (timeSinceLastEdit > 2000) {
+      // User hasn't edited recently, safe to update
+      console.log('[Sync] Updating editor content from external change (MCP)')
+      setEditorContent(currentNote.content)
+      lastSyncedContentRef.current = currentNote.content
+    } else {
+      // User is actively editing, show warning
+      console.warn('[Sync] Content conflict: user editing while MCP updated note. User changes will be saved.')
+      // User's auto-save will overwrite MCP changes in 1 second
+      // This is expected behavior - user has priority
+    }
+  }, [currentNote?.content])
+
+  // Track user edits
+  const handleContentChangeTracked = useCallback((content: string) => {
+    lastUserEditRef.current = Date.now()
+    setEditorContent(content)
+  }, [])
 
   // Reset scroll positions when switching notes
   useEffect(() => {
@@ -122,24 +180,57 @@ function HomePage() {
     })
   }, [])
 
-  const handleContentChange = (content: string) => {
-    setEditorContent(content)
+  const handleSidebarResize = useCallback((clientX: number) => {
+    // Min width 200px, max width 600px
+    const newWidth = Math.max(200, Math.min(600, clientX))
+    setSidebarWidth(newWidth)
+  }, [])
+
+  const handleTagsChange = (tags: string[]) => {
+    setEditorTags(tags)
   }
 
-  // Auto-save content with debounce
+  const handleProjectPathChange = async (projectPath: string) => {
+    if (!currentNote) return
+
+    try {
+      await fetch(`/api/notes/${currentNote.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath })
+      })
+
+      // Update local note
+      await fetchNotes()
+    } catch (error) {
+      console.error('Failed to update project path:', error)
+      alert('Failed to update project path')
+    }
+  }
+
+  // Auto-save content and tags with debounce
   useEffect(() => {
-    if (!currentNote || editorContent === currentNote.content) {
+    if (!currentNote) return
+
+    const contentChanged = editorContent !== currentNote.content
+    const tagsChanged = JSON.stringify(editorTags) !== JSON.stringify(currentNote.tags || [])
+
+    if (!contentChanged && !tagsChanged) {
       return
     }
 
     const timeoutId = setTimeout(() => {
-      updateNote(currentNote.id, editorContent).catch((error) => {
+      updateNote(
+        currentNote.id,
+        contentChanged ? editorContent : undefined,
+        tagsChanged ? editorTags : undefined
+      ).catch((error) => {
         console.error('Failed to save note:', error)
       })
     }, 1000) // 1 second debounce
 
     return () => clearTimeout(timeoutId)
-  }, [editorContent, currentNote, updateNote])
+  }, [editorContent, editorTags, currentNote, updateNote])
 
   const handleNoteSelect = (note: typeof notes[0]) => {
     // Update URL to reflect selected note
@@ -148,26 +239,28 @@ function HomePage() {
   }
 
   const handleOpenChatWithNote = (noteId: string) => {
-    setChatNoteId(noteId)
-    setShowChatPanel(true)
+    // Try to open the note if it exists
+    const note = notes.find(n => n.id === noteId)
+    if (note) {
+      navigate(`/notes/${note.id}`)
+    }
+
+    // Always open chat panel, even if note doesn't exist (orphaned session)
+    setTimeout(() => {
+      setChatNoteId(noteId)
+      setShowChatPanel(true)
+    }, 100)
   }
 
   // Handle session deletion - close chat panel if deleted session is currently open
   const handleSessionDeleted = (deletedSessionId: string) => {
     // Check if the deleted session matches the currently open session
-    if (showChatPanel) {
-      // For note-specific sessions: note-{noteId}
-      // For global sessions: global-{uuid}
-      const currentSessionId = chatNoteId ? `note-${chatNoteId}` : sessionStorage.getItem('claude-global-session')
-
+    if (showChatPanel && chatNoteId) {
+      const currentSessionId = `note-${chatNoteId}`
       if (currentSessionId === deletedSessionId) {
         // Close the chat panel since the session was deleted
         setShowChatPanel(false)
         setChatNoteId(null)
-        // Clear global session from storage if it was deleted
-        if (deletedSessionId.startsWith('global-')) {
-          sessionStorage.removeItem('claude-global-session')
-        }
       }
     }
   }
@@ -187,6 +280,22 @@ function HomePage() {
       const previewPanel = container.querySelector('.preview-panel') as HTMLElement
 
       if (!editorPanel || !previewPanel) return
+
+      // On mobile: active panel takes full width, no fixed pixel widths
+      if (window.innerWidth < 768) {
+        if (mobilePanel === 'editor') {
+          editorPanel.style.width = '100%'
+          editorPanel.style.flex = '1'
+          previewPanel.style.width = ''
+          previewPanel.style.flex = ''
+        } else {
+          previewPanel.style.width = '100%'
+          previewPanel.style.flex = '1'
+          editorPanel.style.width = ''
+          editorPanel.style.flex = ''
+        }
+        return
+      }
 
       // Initialize to 50/50 if not set
       if (editorWidth === null || previewWidth === null) {
@@ -210,24 +319,60 @@ function HomePage() {
         previewPanel.style.flex = 'none'
       }
     }
-  }, [viewMode, editorWidth, previewWidth, currentNote])
+  }, [viewMode, editorWidth, previewWidth, currentNote, mobilePanel])
 
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
-      <Header onNoteSelect={handleNoteSelect} previewRef={previewRef} />
+      <Header
+        onNoteSelect={handleNoteSelect}
+        previewRef={previewRef}
+        onToggleMobileSidebar={() => setMobileSidebarOpen(p => !p)}
+        mobileSidebarOpen={mobileSidebarOpen}
+      />
 
       {/* Main content area */}
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
         <Sidebar
+          width={sidebarWidth}
+          collapsed={sidebarCollapsed}
+          onToggleCollapse={setSidebarCollapsed}
           onNoteSelect={handleNoteSelect}
           onOpenChatWithNote={handleOpenChatWithNote}
           onSessionDeleted={handleSessionDeleted}
+          activeSessionId={showChatPanel && chatNoteId ? `note-${chatNoteId}` : undefined}
+          mobileOpen={mobileSidebarOpen}
+          onMobileClose={() => setMobileSidebarOpen(false)}
         />
 
+        {/* Sidebar resize handle - hidden when collapsed or on mobile */}
+        {!sidebarCollapsed && (
+          <div
+            className="hidden md:block w-1 bg-gray-200 hover:bg-purple-400 cursor-ew-resize transition-colors flex-shrink-0 dark:bg-gray-700 dark:hover:bg-purple-500"
+            onMouseDown={(e) => {
+            e.preventDefault()
+            const startX = e.clientX
+            const startWidth = sidebarWidth
+
+            const handleMouseMove = (moveEvent: MouseEvent) => {
+              const deltaX = moveEvent.clientX - startX
+              handleSidebarResize(startWidth + deltaX)
+            }
+
+            const handleMouseUp = () => {
+              document.removeEventListener('mousemove', handleMouseMove)
+              document.removeEventListener('mouseup', handleMouseUp)
+            }
+
+            document.addEventListener('mousemove', handleMouseMove)
+            document.addEventListener('mouseup', handleMouseUp)
+          }}
+          />
+        )}
+
         {/* Editor/Preview area */}
-        <div className="flex-1 flex flex-col bg-gray-50">
+        <div className="flex-1 flex flex-col bg-gray-50 dark:bg-gray-900 min-w-0">
           {showWelcome ? (
             <WelcomeScreen />
           ) : (
@@ -238,47 +383,80 @@ function HomePage() {
                 currentNotePath={currentNote.path}
                 onToggleGraph={() => setShowGraphView(true)}
                 onToggleChat={() => {
-                  // Open global chat (not linked to note)
-                  // To open note-specific chat, use context menu in sidebar
                   if (!showChatPanel) {
+                    // Opening chat - set note ID
+                    setChatNoteId(currentNote.id)
+                    setShowChatPanel(true)
+                  } else {
+                    // Closing chat - clear note ID
+                    setShowChatPanel(false)
                     setChatNoteId(null)
                   }
-                  setShowChatPanel(prev => !prev)
                 }}
                 viewMode={viewMode}
                 onViewModeChange={setViewMode}
               />
+
+              {/* Mobile panel toggle for split mode */}
+              {viewMode === 'split' && (
+                <div className="md:hidden flex border-b border-[rgba(6,182,212,0.08)]" style={{ background: '#0a0b10' }}>
+                  <button
+                    onClick={() => setMobilePanel('editor')}
+                    className={`flex-1 min-h-[44px] text-xs font-mono transition-colors ${mobilePanel === 'editor' ? 'text-cyan-400 border-b-2 border-cyan-500' : 'text-slate-600'}`}
+                  >
+                    editor
+                  </button>
+                  <button
+                    onClick={() => setMobilePanel('preview')}
+                    className={`flex-1 min-h-[44px] text-xs font-mono transition-colors ${mobilePanel === 'preview' ? 'text-cyan-400 border-b-2 border-cyan-500' : 'text-slate-600'}`}
+                  >
+                    preview
+                  </button>
+                </div>
+              )}
 
               {/* Editor and Preview panels */}
               <div className="flex-1 flex overflow-hidden" ref={containerRef}>
                 {/* Editor panel */}
                 {(viewMode === 'editor' || viewMode === 'split') && (
                   <div
-                    className={`editor-panel flex flex-col overflow-hidden relative border-r border-gray-200 bg-white ${
+                    className={`editor-panel flex flex-col overflow-hidden relative border-r border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800 ${
                       viewMode === 'editor' ? 'w-full' : viewMode === 'split' && !editorWidth ? 'flex-1' : ''
-                    }`}
+                    } ${viewMode === 'split' && mobilePanel === 'preview' ? 'hidden md:flex' : ''}`}
                   >
+                    <NoteSettings
+                      projectPath={currentNote.projectPath}
+                      onProjectPathChange={handleProjectPathChange}
+                    />
+                    <div className="px-4 py-2 border-b border-gray-200 dark:border-gray-700">
+                      <TagPicker
+                        tags={editorTags}
+                        onChange={handleTagsChange}
+                      />
+                    </div>
                     <EditorTextarea
                       ref={editorRef}
                       className="flex-1"
                       content={editorContent}
-                      onChange={handleContentChange}
+                      onChange={handleContentChangeTracked}
                       onReady={(fn) => setInsertMarkdown(() => fn)}
                     />
                   </div>
                 )}
 
-                {/* Resize handle (only in split view) */}
+                {/* Resize handle (only in split view, desktop only) */}
                 {viewMode === 'split' && (
-                  <ResizeHandle onResize={handleResize} containerRef={containerRef} />
+                  <div className="hidden md:block">
+                    <ResizeHandle onResize={handleResize} containerRef={containerRef} />
+                  </div>
                 )}
 
                 {/* Preview panel */}
                 {(viewMode === 'preview' || viewMode === 'split') && (
                   <div
-                    className={`preview-panel bg-white overflow-hidden ${
+                    className={`preview-panel bg-white overflow-hidden dark:bg-gray-800 ${
                       viewMode === 'preview' ? 'w-full' : viewMode === 'split' && !previewWidth ? 'flex-1' : ''
-                    }`}
+                    } ${viewMode === 'split' && mobilePanel === 'editor' ? 'hidden md:block' : ''}`}
                   >
                     <Preview ref={previewRef} className="h-full" content={editorContent} />
                   </div>
@@ -297,11 +475,16 @@ function HomePage() {
       />
 
       {/* Claude Chat Panel */}
-      <ChatPanel
-        visible={showChatPanel}
-        onClose={() => setShowChatPanel(false)}
-        noteId={chatNoteId}
-      />
+      {chatNoteId && (
+        <ChatPanel
+          visible={showChatPanel}
+          onClose={() => {
+            setShowChatPanel(false)
+            setChatNoteId(null)
+          }}
+          noteId={chatNoteId}
+        />
+      )}
     </div>
   )
 }

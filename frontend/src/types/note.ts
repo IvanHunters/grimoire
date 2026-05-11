@@ -6,6 +6,7 @@ export interface Note {
   content: string
   type?: 'project' | 'regular'
   projectPath?: string // Changed to camelCase to match backend JSON
+  tags?: string[]
   createdAt: string // Changed to camelCase
   updatedAt: string // Changed to camelCase
   outgoingLinks?: string[] // Changed to camelCase
@@ -36,4 +37,5 @@ export interface UpdateNoteRequest {
   content?: string
   type?: 'project' | 'regular'
   projectPath?: string
+  tags?: string[]
 }

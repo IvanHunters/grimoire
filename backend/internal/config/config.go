@@ -53,10 +53,22 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// OriginsContain checks if the given origin is in the allowed origins list
+// OriginsContain checks if the given origin is in the allowed origins list.
+// If any entry is "*", all origins are allowed.
 func (c *Config) OriginsContain(origin string) bool {
 	for _, o := range c.AllowedOrigins {
-		if strings.TrimSpace(o) == origin {
+		o = strings.TrimSpace(o)
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// AllowAllOrigins reports whether the wildcard "*" is in the allowed list.
+func (c *Config) AllowAllOrigins() bool {
+	for _, o := range c.AllowedOrigins {
+		if strings.TrimSpace(o) == "*" {
 			return true
 		}
 	}

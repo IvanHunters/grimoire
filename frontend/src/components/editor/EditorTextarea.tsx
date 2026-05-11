@@ -726,7 +726,7 @@ const EditorTextarea = forwardRef<HTMLDivElement, EditorTextareaProps>(
           <textarea
             id="editor"
             ref={textareaRef}
-            className="absolute inset-0 editor-pane resize-none focus:outline-none overflow-y-auto border-0"
+            className="absolute inset-0 editor-pane resize-none focus:outline-none overflow-y-auto border-0 text-gray-900 dark:text-slate-300"
             style={{ padding: '16px' }}
             placeholder="Start writing..."
             defaultValue={content}

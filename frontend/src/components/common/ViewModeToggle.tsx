@@ -27,15 +27,15 @@ function ViewModeToggle({ viewMode, onChange }: ViewModeToggleProps) {
   ]
 
   return (
-    <div className="flex items-center gap-1 bg-gray-100 p-1 rounded-lg">
+    <div className="flex items-center gap-1 bg-gray-100 dark:bg-gray-700 p-1 rounded-lg">
       {modes.map((mode) => (
         <button
           key={mode.value}
           onClick={() => onChange(mode.value)}
           className={`flex items-center gap-2 px-3 py-1.5 rounded transition ${
             viewMode === mode.value
-              ? 'bg-white shadow text-purple-600'
-              : 'text-gray-600 hover:text-gray-900'
+              ? 'bg-white dark:bg-gray-600 shadow text-purple-600 dark:text-purple-400'
+              : 'text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white'
           }`}
           title={mode.label}
         >

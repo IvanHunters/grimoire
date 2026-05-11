@@ -21,7 +21,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	store := storage.NewMongoStorage(h.db)
-	notes, err := store.SearchNotes(ctx, query)
+	notes, err := store.SearchNotes(ctx, query, 50)
 	if err != nil {
 		h.logger.Error("failed to search notes", "query", query, "error", err)
 		http.Error(w, "Failed to search notes", http.StatusInternalServerError)

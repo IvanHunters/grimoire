@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    host: '0.0.0.0',
     proxy: {
       '/api': {
         target: 'http://localhost:8080',
@@ -16,8 +17,9 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/claude-chat': {
-        target: 'ws://localhost:3000',
+        target: 'ws://localhost:8080',
         ws: true,
+        changeOrigin: true,
       },
     },
   },

@@ -13,7 +13,11 @@ func CORS(cfg *config.Config) func(http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 
 			// Check if origin is allowed
-			if cfg.OriginsContain(origin) {
+			if cfg.AllowAllOrigins() {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			} else if cfg.OriginsContain(origin) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 )
@@ -58,6 +59,13 @@ func (h *Handler) CreateFolder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Publish event for real-time sync
+	eventBus := events.GetEventBus()
+	eventBus.Publish(events.Event{
+		Type:   events.EventFolderCreated,
+		Folder: folder,
+	})
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(folder)
@@ -80,6 +88,13 @@ func (h *Handler) DeleteFolder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to delete folder", http.StatusInternalServerError)
 		return
 	}
+
+	// Publish event for real-time sync
+	eventBus := events.GetEventBus()
+	eventBus.Publish(events.Event{
+		Type: events.EventFolderDeleted,
+		Path: path,
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -110,4 +125,49 @@ func (h *Handler) MoveFolder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// UpdateFolder handles PUT /api/folders
+func (h *Handler) UpdateFolder(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		http.Error(w, "Folder path is required", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		ProjectPath *string `json:"projectPath"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	store := storage.NewMongoStorage(h.db)
+
+	// Get existing folder
+	folder, err := store.GetFolder(ctx, path)
+	if err != nil {
+		h.logger.Error("failed to get folder", "path", path, "error", err)
+		http.Error(w, "Folder not found", http.StatusNotFound)
+		return
+	}
+
+	// Update fields
+	if req.ProjectPath != nil {
+		folder.ProjectPath = *req.ProjectPath
+	}
+
+	// Save to database
+	if err := store.UpdateFolder(ctx, folder); err != nil {
+		h.logger.Error("failed to update folder", "path", path, "error", err)
+		http.Error(w, "Failed to update folder", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(folder)
 }

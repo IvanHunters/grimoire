@@ -1,18 +1,28 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { ChevronLeft, ChevronRight, Folder, FileText, Terminal, ChevronDown, ChevronUp } from 'lucide-react'
 import { useNotes } from '../../contexts/NotesContext'
 import type { FolderNode } from '../../types/folder'
 import type { ClaudeSession } from '../../types/claude'
 import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
+import { SwipeableItem } from '../common/SwipeableItem'
 import NewNoteModal from '../modals/NewNoteModal'
 import RenameModal from '../modals/RenameModal'
 import DeleteConfirmModal from '../modals/DeleteConfirmModal'
+import FolderProjectPathModal from '../modals/FolderProjectPathModal'
 import { sessionsAPI } from '../../api/sessions'
+import { foldersAPI } from '../../api/folders'
+import { exportFolderToZip } from '../../utils/export'
 
 interface SidebarProps {
+  width?: number
+  collapsed?: boolean
+  onToggleCollapse?: (collapsed: boolean) => void
   onNoteSelect?: (note: any) => void
   onOpenChatWithNote?: (noteId: string) => void
   onSessionDeleted?: (sessionId: string) => void
+  activeSessionId?: string
+  mobileOpen?: boolean
+  onMobileClose?: () => void
 }
 
 // Count all notes in folder and subfolders recursively
@@ -84,19 +94,19 @@ function FolderTreeNode({
         onDragOver={(e) => onFolderDragOver(e, folder.path)}
         onDragLeave={onFolderDragLeave}
         onDrop={(e) => onFolderDrop(e, folder.path)}
-        className={`w-full flex items-center gap-2 py-1.5 hover:bg-gray-100 rounded text-left transition ${
+        className={`w-full flex items-center gap-1.5 py-1.5 hover:bg-white/[0.04] rounded text-left transition ${
           dragOverFolder === folder.path ? 'drag-over' : ''
         }`}
         style={{ paddingLeft: `${level * 12 + 8}px` }}
       >
         {isCollapsed ? (
-          <ChevronRight className="w-4 h-4 text-gray-500" />
+          <ChevronRight className="w-3.5 h-3.5 text-slate-600" />
         ) : (
-          <ChevronDown className="w-4 h-4 text-gray-500" />
+          <ChevronDown className="w-3.5 h-3.5 text-slate-600" />
         )}
-        <Folder className="w-4 h-4 text-gray-600" />
-        <span className="text-sm text-gray-900">{folder.name}</span>
-        <span className="ml-auto text-xs text-gray-500">
+        <Folder className="w-3.5 h-3.5 text-cyan-700" />
+        <span className="text-xs font-mono text-slate-400">{folder.name}</span>
+        <span className="ml-auto text-[10px] font-mono text-slate-700 pr-1">
           {totalNotesCount}
         </span>
       </button>
@@ -114,13 +124,13 @@ function FolderTreeNode({
               onDragEnd={onNoteDragEnd}
               className={`w-full flex items-center gap-2 py-1.5 rounded text-left transition ${
                 currentNote?.id === note.id
-                  ? 'bg-purple-100 text-purple-900'
-                  : 'hover:bg-gray-100 text-gray-700'
+                  ? 'bg-cyan-500/10 border-l-2 border-cyan-500/50'
+                  : 'hover:bg-white/[0.04] border-l-2 border-transparent'
               }`}
-              style={{ paddingLeft: `${(level + 1) * 12 + 8}px` }}
+              style={{ paddingLeft: `${(level + 1) * 12 + 6}px` }}
             >
-              <FileText className="w-4 h-4 text-gray-500" />
-              <span className="text-sm truncate">{note.title}</span>
+              <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${currentNote?.id === note.id ? 'text-cyan-500' : 'text-slate-600'}`} />
+              <span className={`text-xs font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
             </button>
           ))}
         </div>
@@ -157,9 +167,31 @@ function FolderTreeNode({
   )
 }
 
-function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: SidebarProps) {
+function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelect, onOpenChatWithNote, onSessionDeleted, activeSessionId, mobileOpen = false, onMobileClose }: SidebarProps) {
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768)
+    window.addEventListener('resize', handler)
+    return () => window.removeEventListener('resize', handler)
+  }, [])
   const { notes, folderTree, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
-  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(new Set<string>())
+
+  // Helper to get all folder paths
+  const getAllFolderPaths = (node: FolderNode | null): string[] => {
+    if (!node) return []
+    const paths: string[] = []
+    const traverse = (n: FolderNode) => {
+      if (n.path) paths.push(n.path)
+      if (n.children) n.children.forEach(traverse)
+    }
+    traverse(node)
+    return paths
+  }
+
+  // Initialize with all folders collapsed
+  const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => {
+    return new Set(getAllFolderPaths(folderTree))
+  })
 
   // Flatten folder tree for legacy components (modals)
   const flattenedFolders = (folderNode: FolderNode): FolderNode[] => {
@@ -172,17 +204,6 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
     return result
   }
 
-  // Get all folder paths from tree
-  const getAllFolderPaths = (node: FolderNode): string[] => {
-    const paths: string[] = []
-    const traverse = (n: FolderNode) => {
-      if (n.path) paths.push(n.path)
-      if (n.children) n.children.forEach(traverse)
-    }
-    traverse(node)
-    return paths
-  }
-
   // Get parent folder paths for a given path
   const getParentPaths = (path: string): string[] => {
     const parts = path.split('/')
@@ -193,13 +214,11 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
     return parents
   }
 
-  // Initialize: collapse all folders (only on first mount)
-  const initializedRef = useRef(false)
+  // Update collapsed folders when folder tree changes
   useEffect(() => {
-    if (folderTree && !initializedRef.current) {
+    if (folderTree) {
       const allPaths = getAllFolderPaths(folderTree)
       setCollapsedFolders(new Set(allPaths))
-      initializedRef.current = true
     }
   }, [folderTree])
 
@@ -217,13 +236,14 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
       })
     }
   }, [currentNote?.id])
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [toggleVisible, setToggleVisible] = useState(false)
   const [chatHistoryCollapsed, setChatHistoryCollapsed] = useState(false)
   const [claudeSessions, setClaudeSessions] = useState<ClaudeSession[]>([]) // Active Claude terminal sessions
+  const [sessionsHeight, setSessionsHeight] = useState<number>(200) // Height of sessions list
   const sidebarRef = useRef<HTMLElement>(null)
   const toggleRef = useRef<HTMLButtonElement>(null)
   const hoverTimeoutRef = useRef<number | null>(null)
+  const sessionsResizeRef = useRef<HTMLDivElement>(null)
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{
@@ -265,6 +285,12 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
     itemPath: string
   }>({ visible: false, type: 'note', itemName: '', itemPath: '' })
 
+  const [folderProjectPathModal, setFolderProjectPathModal] = useState<{
+    visible: boolean
+    folderPath: string
+    currentProjectPath: string
+  }>({ visible: false, folderPath: '', currentProjectPath: '' })
+
   const toggleFolder = (path: string) => {
     setCollapsedFolders((prev) => {
       const next = new Set(prev)
@@ -279,10 +305,11 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
 
   const handleNoteClick = (note: typeof notes[0]) => {
     onNoteSelect?.(note)
+    if (isMobile) onMobileClose?.()
   }
 
   const toggleSidebar = () => {
-    setSidebarCollapsed((prev) => !prev)
+    onToggleCollapse?.(!collapsed)
   }
 
   const showToggle = () => {
@@ -327,6 +354,20 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
         text: 'New Folder',
         action: () => handleCreateFolder(folderPath),
       },
+      {
+        icon: 'fa-cog',
+        text: 'Set Project Path',
+        action: () => setFolderProjectPathModal({
+          visible: true,
+          folderPath: folderPath,
+          currentProjectPath: folder?.projectPath || '',
+        }),
+      },
+      {
+        icon: 'fa-file-archive',
+        text: 'Export as ZIP',
+        action: () => handleExportFolderZip(folderPath),
+      },
       { divider: true, text: '' },
       {
         icon: 'fa-trash',
@@ -347,6 +388,15 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
       y: e.clientY,
       items,
     })
+  }
+
+  const handleExportFolderZip = async (folderPath: string) => {
+    try {
+      await exportFolderToZip(folderPath, notes || [])
+    } catch (error) {
+      console.error('Failed to export folder ZIP:', error)
+      alert(error instanceof Error ? error.message : 'Failed to export folder')
+    }
   }
 
   const handleNoteContextMenu = (e: React.MouseEvent, note: typeof notes[0]) => {
@@ -447,7 +497,9 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
     console.log('Create note:', name, 'in folder:', folder)
 
     try {
-      await createNote(name, folder, '')
+      const newNote = await createNote(name, folder, '')
+      // Open newly created note
+      onNoteSelect?.(newNote)
       // Close modal
       setNewNoteModal({ visible: false, defaultFolder: '' })
     } catch (error) {
@@ -533,6 +585,21 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
     } catch (error) {
       console.error('Failed to delete:', error)
       alert('Failed to delete. See console for details.')
+    }
+  }
+
+  const handleUpdateFolderProjectPath = async (projectPath: string) => {
+    try {
+      await foldersAPI.updateFolder(folderProjectPathModal.folderPath, projectPath)
+
+      // Refresh folders list
+      await fetchFolders()
+
+      // Close modal
+      setFolderProjectPathModal({ visible: false, folderPath: '', currentProjectPath: '' })
+    } catch (error) {
+      console.error('Failed to update folder project path:', error)
+      alert('Failed to update folder project path. See console for details.')
     }
   }
 
@@ -671,6 +738,18 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
     setDragOverFolder(null)
   }
 
+  // Handle sessions resize
+  const handleSessionsResize = useCallback((clientY: number) => {
+    if (!sidebarRef.current || !sessionsResizeRef.current) return
+
+    const sidebarRect = sidebarRef.current.getBoundingClientRect()
+    const newHeight = sidebarRect.bottom - clientY - 10 // 10px offset for better UX
+
+    // Min height 100px, max height 500px
+    const clampedHeight = Math.max(100, Math.min(500, newHeight))
+    setSessionsHeight(clampedHeight)
+  }, [])
+
   const handleRootDrop = async (e: React.DragEvent) => {
     e.preventDefault()
     e.stopPropagation()
@@ -793,20 +872,39 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
 
   return (
     <>
+      {/* Mobile backdrop */}
+      {isMobile && mobileOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/60 backdrop-blur-sm"
+          style={{ top: '56px' }}
+          onClick={onMobileClose}
+        />
+      )}
+
       <aside
         id="sidebar"
         ref={sidebarRef}
-        className={`w-64 bg-white border-r border-gray-200 flex flex-col ${
-          sidebarCollapsed ? 'collapsed' : ''
+        className={`bg-[#0a0b10] border-r border-[rgba(6,182,212,0.08)] flex flex-col flex-shrink-0 overflow-hidden ${
+          isMobile
+            ? `fixed left-0 bottom-0 z-40 w-72 transition-transform duration-200 ease-in-out ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}`
+            : `relative transition-none ${collapsed ? 'collapsed' : ''}`
         }`}
+        style={isMobile ? { top: '56px' } : { width: collapsed ? '0' : `${width}px` }}
       >
         {/* Sidebar header */}
-        <div className="h-14 border-b border-gray-200 flex items-center px-4">
-          <h2 className="font-semibold text-gray-900">Notes</h2>
+        <div className="h-14 border-b border-white/[0.06] flex items-center px-4">
+          <span className="text-[10px] font-mono font-semibold tracking-widest text-slate-600 uppercase">Notes</span>
         </div>
 
       {/* Folder tree */}
-      <div className="flex-1 overflow-y-auto p-2">
+      <div
+        className="overflow-y-auto p-2"
+        style={{
+          height: chatHistoryCollapsed
+            ? 'calc(100vh - 56px - 40px - 40px)' // header - footer - sessions header
+            : `calc(100vh - 56px - 40px - ${sessionsHeight + 40}px)` // ... - sessions list - sessions header
+        }}
+      >
         <div className="space-y-1">
           {/* Recursive folder tree */}
           {folderTree.children && folderTree.children.map((folder) => (
@@ -845,105 +943,135 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
                 onDragEnd={handleNoteDragEnd}
                 className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left transition ${
                   currentNote?.id === note.id
-                    ? 'bg-purple-100 text-purple-900'
-                    : 'hover:bg-gray-100 text-gray-700'
+                    ? 'bg-cyan-500/10 border-l-2 border-cyan-500/50 pl-1.5'
+                    : 'hover:bg-white/[0.04] border-l-2 border-transparent'
                 }`}
               >
-                <FileText className="w-4 h-4 text-gray-500" />
-                <span className="text-sm truncate">{note.title}</span>
+                <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${currentNote?.id === note.id ? 'text-cyan-500' : 'text-slate-600'}`} />
+                <span className={`text-xs font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
               </button>
             ))}
         </div>
 
         {/* Invisible drop zone for root */}
         <div
-          className={`h-16 mt-2 rounded transition-colors ${
-            dragOverFolder === 'root' ? 'bg-purple-50 border-2 border-dashed border-purple-300' : ''
+          className={`h-12 mt-2 rounded transition-colors ${
+            dragOverFolder === 'root' ? 'bg-cyan-500/[0.05] border border-dashed border-cyan-500/30' : ''
           }`}
           onDragOver={handleRootDragOver}
           onDragLeave={handleRootDragLeave}
           onDrop={handleRootDrop}
         >
           {dragOverFolder === 'root' && (
-            <div className="flex items-center justify-center h-full text-xs text-purple-600 font-medium">
-              📁 Drop here for root
+            <div className="flex items-center justify-center h-full text-[10px] font-mono text-cyan-600 tracking-wider uppercase">
+              drop to root
             </div>
           )}
         </div>
       </div>
 
       {/* Sidebar footer */}
-      <div className="border-t border-gray-200 p-2">
-        <div className="text-xs px-2 text-gray-500">
+      <div className="border-t border-white/[0.06] px-4 py-2">
+        <span className="text-[10px] font-mono text-slate-700">
           {(notes || []).length} notes
-        </div>
+        </span>
       </div>
 
+      {/* Resize handle for sessions */}
+      {!chatHistoryCollapsed && (
+        <div
+          ref={sessionsResizeRef}
+          className="h-px bg-white/[0.06] hover:bg-cyan-500/30 cursor-ns-resize transition-colors"
+          onMouseDown={(e) => {
+            e.preventDefault()
+
+            const handleMouseMove = (moveEvent: MouseEvent) => {
+              handleSessionsResize(moveEvent.clientY)
+            }
+
+            const handleMouseUp = () => {
+              document.removeEventListener('mousemove', handleMouseMove)
+              document.removeEventListener('mouseup', handleMouseUp)
+            }
+
+            document.addEventListener('mousemove', handleMouseMove)
+            document.addEventListener('mouseup', handleMouseUp)
+          }}
+        />
+      )}
+
       {/* Claude Sessions */}
-      <div className="border-t border-gray-200">
+      <div className="border-t border-white/[0.06]">
         {/* Sessions header */}
-        <div className="flex items-center justify-between px-4 py-2 bg-gray-50 hover:bg-gray-100 cursor-pointer transition" onClick={() => setChatHistoryCollapsed(!chatHistoryCollapsed)}>
+        <div
+          className="flex items-center justify-between px-4 py-2.5 hover:bg-white/[0.02] cursor-pointer transition"
+          onClick={() => setChatHistoryCollapsed(!chatHistoryCollapsed)}
+        >
           <div className="flex items-center gap-2">
-            <Terminal className="w-4 h-4 text-purple-600" />
-            <span className="text-sm font-medium text-gray-900">Claude Sessions</span>
+            <Terminal className="w-3.5 h-3.5 text-purple-500" />
+            <span className="text-[10px] font-mono font-semibold tracking-widest text-slate-600 uppercase">Claude Sessions</span>
             {claudeSessions && claudeSessions.length > 0 && (
-              <span className="text-xs bg-purple-100 text-purple-700 px-1.5 py-0.5 rounded-full">
+              <span className="text-[10px] font-mono bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded border border-purple-500/20">
                 {claudeSessions.length}
               </span>
             )}
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center">
             {chatHistoryCollapsed ? (
-              <ChevronDown className="w-4 h-4 text-gray-500" />
+              <ChevronDown className="w-3.5 h-3.5 text-slate-600" />
             ) : (
-              <ChevronUp className="w-4 h-4 text-gray-500" />
+              <ChevronUp className="w-3.5 h-3.5 text-slate-600" />
             )}
           </div>
         </div>
 
         {/* Sessions list */}
         {!chatHistoryCollapsed && (
-          <div className="max-h-48 overflow-y-auto p-2">
+          <div className="overflow-y-auto px-2 pb-2" style={{ height: `${sessionsHeight}px` }}>
             {!claudeSessions || claudeSessions.length === 0 ? (
-              <div className="text-xs text-gray-500 px-2 py-4 text-center">
-                No active sessions
+              <div className="text-[10px] font-mono text-slate-700 px-2 py-4 text-center tracking-wider uppercase">
+                no active sessions
               </div>
             ) : (
-              <div className="space-y-1">
+              <div className="space-y-0.5">
                 {claudeSessions.map(session => {
                   const sessionName = session.name && session.name !== 'Terminal Session'
                     ? session.name
                     : session.id.startsWith('note-') ? 'Note Session' : 'Global Session'
+
+                  const isActive = activeSessionId === session.id
 
                   return (
                     <button
                       key={session.id}
                       onClick={() => {
                         if (onOpenChatWithNote) {
-                          // Open terminal chat with this session
-                          // Extract noteId if it's a note-specific session
                           const noteId = session.id.startsWith('note-') ? session.id.replace('note-', '') : null
                           if (noteId) {
                             onOpenChatWithNote(noteId)
                           } else {
-                            // Open global chat - trigger chat panel without noteId
                             onOpenChatWithNote('')
                           }
                         }
                       }}
                       onContextMenu={(e) => handleSessionContextMenu(e, session)}
-                      className="w-full flex items-start gap-2 px-2 py-1.5 rounded transition hover:bg-gray-100 text-left"
+                      className={`w-full flex items-start gap-2 px-2 py-1.5 rounded transition text-left ${
+                        isActive
+                          ? 'bg-purple-500/10 border border-purple-500/20'
+                          : 'hover:bg-white/[0.03] border border-transparent'
+                      }`}
                     >
-                      <Terminal className="w-3.5 h-3.5 text-purple-600 flex-shrink-0 mt-0.5" />
+                      <Terminal className={`w-3 h-3 flex-shrink-0 mt-0.5 ${
+                        isActive ? 'text-purple-400' : 'text-purple-600'
+                      }`} />
                       <div className="flex-1 min-w-0">
-                        <div className="text-sm font-medium text-gray-900 truncate">
+                        <div className={`text-xs font-mono truncate ${
+                          isActive ? 'text-purple-300' : 'text-slate-400'
+                        }`}>
                           {sessionName}
                         </div>
-                        <div className="text-xs text-gray-500 truncate">
+                        <div className="text-[10px] font-mono text-slate-700 truncate">
                           {session.workingDir}
-                        </div>
-                        <div className="text-xs text-gray-400">
-                          {new Date(session.lastActivity).toLocaleTimeString()}
                         </div>
                       </div>
                     </button>
@@ -956,16 +1084,17 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
       </div>
     </aside>
 
-      {/* Sidebar toggle button */}
+      {/* Sidebar toggle button — hidden on mobile via CSS */}
       <button
         ref={toggleRef}
         className={`sidebar-toggle ${toggleVisible ? 'visible' : ''} ${
-          sidebarCollapsed ? 'collapsed' : ''
+          collapsed ? 'collapsed' : ''
         }`}
+        style={{ left: collapsed ? '0' : `${width}px` }}
         onClick={toggleSidebar}
-        title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
+        title={collapsed ? 'Show sidebar' : 'Hide sidebar'}
       >
-        {sidebarCollapsed ? (
+        {collapsed ? (
           <ChevronRight className="w-3 h-3" />
         ) : (
           <ChevronLeft className="w-3 h-3" />
@@ -1004,6 +1133,14 @@ function Sidebar({ onNoteSelect, onOpenChatWithNote, onSessionDeleted }: Sidebar
         type={deleteModal.type}
         itemName={deleteModal.itemName}
         onConfirm={handleDelete}
+      />
+
+      <FolderProjectPathModal
+        visible={folderProjectPathModal.visible}
+        folderPath={folderProjectPathModal.folderPath}
+        currentProjectPath={folderProjectPathModal.currentProjectPath}
+        onClose={() => setFolderProjectPathModal({ visible: false, folderPath: '', currentProjectPath: '' })}
+        onSave={handleUpdateFolderProjectPath}
       />
     </>
   )

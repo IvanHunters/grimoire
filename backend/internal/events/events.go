@@ -10,20 +10,25 @@ import (
 type EventType string
 
 const (
-	EventNoteCreated  EventType = "note_created"
-	EventNoteUpdated  EventType = "note_updated"
-	EventNoteDeleted  EventType = "note_deleted"
+	EventNoteCreated   EventType = "note_created"
+	EventNoteUpdated   EventType = "note_updated"
+	EventNoteDeleted   EventType = "note_deleted"
 	EventFolderCreated EventType = "folder_created"
 	EventFolderDeleted EventType = "folder_deleted"
+	EventTaskCreated   EventType = "task_created"
+	EventTaskUpdated   EventType = "task_updated"
+	EventTaskDeleted   EventType = "task_deleted"
 )
 
 // Event represents a system event
 type Event struct {
-	Type   EventType   `json:"type"`
+	Type   EventType      `json:"type"`
 	Note   *models.Note   `json:"note,omitempty"`
 	Folder *models.Folder `json:"folder,omitempty"`
-	NoteID string      `json:"noteId,omitempty"`
-	Path   string      `json:"path,omitempty"`
+	Task   *models.Task   `json:"task,omitempty"`
+	NoteID string         `json:"noteId,omitempty"`
+	TaskID string         `json:"taskId,omitempty"`
+	Path   string         `json:"path,omitempty"`
 }
 
 // EventBus manages event subscriptions and publishing

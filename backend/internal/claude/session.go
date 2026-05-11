@@ -24,7 +24,8 @@ type ClaudeSession struct {
 	LastActivity  time.Time
 	Messages      []models.ClaudeMessage // History stored on backend
 	OutputBuffer  []byte                 // Circular buffer for terminal output (last 500KB)
-	outputChan    chan []byte            // Channel to broadcast PTY output to all WebSocket clients
+	subscribers   []chan []byte          // Fan-out: each WebSocket connection gets its own channel
+	subMu         sync.Mutex
 	mu            sync.Mutex
 }
 
@@ -33,16 +34,14 @@ func (s *ClaudeSession) SendMessage(content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Write message to PTY byte by byte (emulate typing)
-	for _, ch := range content {
-		_, err := s.PTY.Write([]byte{byte(ch)})
-		if err != nil {
-			return err
-		}
+	// Write entire message to PTY at once (UTF-8 safe)
+	_, err := s.PTY.Write([]byte(content))
+	if err != nil {
+		return err
 	}
 
 	// Send Enter key (CR in terminal)
-	_, err := s.PTY.Write([]byte{'\r'})
+	_, err = s.PTY.Write([]byte{'\r'})
 	if err != nil {
 		return err
 	}
@@ -134,12 +133,48 @@ func (s *ClaudeSession) GetOutputBuffer() []byte {
 	return buffer
 }
 
-// SubscribeToOutput returns a channel that will receive all PTY output
-func (s *ClaudeSession) SubscribeToOutput() <-chan []byte {
-	return s.outputChan
+// SubscribeToOutput creates a dedicated channel for a WebSocket connection.
+// Each subscriber gets all PTY output independently (fan-out).
+func (s *ClaudeSession) SubscribeToOutput() chan []byte {
+	ch := make(chan []byte, 256)
+	s.subMu.Lock()
+	s.subscribers = append(s.subscribers, ch)
+	s.subMu.Unlock()
+	return ch
 }
 
-// GetOutputChan returns the output channel (for internal use)
-func (s *ClaudeSession) GetOutputChan() chan<- []byte {
-	return s.outputChan
+// UnsubscribeFromOutput removes a subscriber channel and closes it.
+func (s *ClaudeSession) UnsubscribeFromOutput(ch chan []byte) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for i, sub := range s.subscribers {
+		if sub == ch {
+			s.subscribers = append(s.subscribers[:i], s.subscribers[i+1:]...)
+			close(ch)
+			return
+		}
+	}
+}
+
+// BroadcastOutput sends PTY data to all active subscriber channels.
+func (s *ClaudeSession) BroadcastOutput(data []byte) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for _, sub := range s.subscribers {
+		select {
+		case sub <- data:
+		default:
+			// Subscriber is too slow; drop this chunk for it rather than stalling the PTY reader.
+		}
+	}
+}
+
+// CloseAllSubscriptions closes every subscriber channel (called when process exits).
+func (s *ClaudeSession) CloseAllSubscriptions() {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for _, sub := range s.subscribers {
+		close(sub)
+	}
+	s.subscribers = nil
 }

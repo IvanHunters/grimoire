@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useNotes } from '../../contexts/NotesContext'
 import { resolveWikilinkTarget } from '../../utils/wikilinks'
@@ -18,16 +18,32 @@ function WikilinkRenderer({ target, children }: WikilinkRendererProps) {
   const { notes } = useNotes()
   const navigate = useNavigate()
   const [showPopup, setShowPopup] = useState(false)
+  const hideTimerRef = useRef<number | null>(null)
 
   // Find linked note using the same resolution logic as graph/other components
   const linkedNoteId = resolveWikilinkTarget(target, notes)
   const linkedNote = linkedNoteId ? notes.find(n => n.id === linkedNoteId) : null
 
+  const cancelHide = () => {
+    if (hideTimerRef.current !== null) {
+      clearTimeout(hideTimerRef.current)
+      hideTimerRef.current = null
+    }
+  }
+
+  const scheduleHide = () => {
+    cancelHide()
+    hideTimerRef.current = window.setTimeout(() => {
+      setShowPopup(false)
+      hideTimerRef.current = null
+    }, 200)
+  }
+
   const handleClick = (e: React.MouseEvent) => {
     e.preventDefault()
-
+    cancelHide()
+    setShowPopup(false)
     if (linkedNote) {
-      // Navigate to note URL - setCurrentNote will be called by useEffect in HomePage
       navigate(`/notes/${linkedNote.id}`)
     } else {
       console.warn(`Wikilink target not found: ${target}`)
@@ -36,11 +52,12 @@ function WikilinkRenderer({ target, children }: WikilinkRendererProps) {
 
   const handleMouseEnter = () => {
     if (!linkedNote) return
+    cancelHide()
     setShowPopup(true)
   }
 
   const handleMouseLeave = () => {
-    setShowPopup(false)
+    scheduleHide()
   }
 
   // If note not found, render as broken link
@@ -74,6 +91,8 @@ function WikilinkRenderer({ target, children }: WikilinkRendererProps) {
         <WikilinkPopup
           note={linkedNote}
           onClose={() => setShowPopup(false)}
+          onMouseEnter={cancelHide}
+          onMouseLeave={scheduleHide}
         />
       )}
     </>

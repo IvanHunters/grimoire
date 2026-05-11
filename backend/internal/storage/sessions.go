@@ -135,6 +135,24 @@ func (s *SessionStorage) UpdateSessionActivity(ctx context.Context, sessionID st
 	return err
 }
 
+// UpdateSessionName updates session name
+func (s *SessionStorage) UpdateSessionName(ctx context.Context, sessionID string, name string) error {
+	collection := s.db.Collection(sessionsCollection)
+
+	_, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": sessionID},
+		bson.M{
+			"$set": bson.M{
+				"name":       name,
+				"updated_at": time.Now(),
+			},
+		},
+	)
+
+	return err
+}
+
 // UpdateSessionMessages updates session messages
 func (s *SessionStorage) UpdateSessionMessages(ctx context.Context, sessionID string, messages []models.ClaudeMessage) error {
 	collection := s.db.Collection(sessionsCollection)

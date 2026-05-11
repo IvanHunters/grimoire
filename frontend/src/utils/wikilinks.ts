@@ -112,14 +112,24 @@ export function resolveWikilinkTarget(
 }
 
 /**
+ * Graph connection with type and metadata
+ */
+export interface GraphConnection {
+  targetId: string
+  type: 'wikilink' | 'tag'
+  sharedTags?: string[] // For type='tag', list of shared tags
+}
+
+/**
  * Build graph connections from notes
  *
- * Returns map: noteId -> array of connected note IDs
+ * Returns map: noteId -> array of connections with type and metadata
+ * Includes both wikilink connections and tag-based connections
  */
 export function buildGraphConnections(
-  notes: Array<{ id: string; title: string; path: string; content: string }>
-): Map<string, string[]> {
-  const connections = new Map<string, string[]>()
+  notes: Array<{ id: string; title: string; path: string; content: string; tags?: string[] }>
+): Map<string, GraphConnection[]> {
+  const connections = new Map<string, GraphConnection[]>()
 
   // Initialize empty arrays for all notes
   notes.forEach(note => {
@@ -129,17 +139,52 @@ export function buildGraphConnections(
   // Parse wikilinks and build connections
   notes.forEach(note => {
     const wikilinks = parseWikilinks(note.content)
-    const targets: string[] = []
+    const targets: GraphConnection[] = []
 
     wikilinks.forEach(link => {
       const targetId = resolveWikilinkTarget(link.target, notes)
       if (targetId && targetId !== note.id) {
-        targets.push(targetId)
+        targets.push({ targetId, type: 'wikilink' })
       }
     })
 
     // Remove duplicates
-    connections.set(note.id, [...new Set(targets)])
+    const uniqueTargets = Array.from(
+      new Map(targets.map(t => [t.targetId, t])).values()
+    )
+    connections.set(note.id, uniqueTargets)
+  })
+
+  // Add tag-based connections (notes with shared tags)
+  notes.forEach(note => {
+    if (!note.tags || note.tags.length === 0) return
+
+    const existingConnections = connections.get(note.id) || []
+    const tagConnections: GraphConnection[] = []
+
+    // Find other notes with at least one shared tag
+    notes.forEach(otherNote => {
+      if (otherNote.id === note.id) return
+      if (!otherNote.tags || otherNote.tags.length === 0) return
+
+      // Find shared tags
+      const sharedTags = note.tags!.filter(tag => otherNote.tags!.includes(tag))
+
+      if (sharedTags.length > 0) {
+        // Check if not already connected via wikilink
+        const alreadyConnected = existingConnections.some(c => c.targetId === otherNote.id)
+        if (!alreadyConnected) {
+          tagConnections.push({
+            targetId: otherNote.id,
+            type: 'tag',
+            sharedTags,
+          })
+        }
+      }
+    })
+
+    // Merge wikilink and tag connections
+    connections.set(note.id, [...existingConnections, ...tagConnections])
   })
 
   return connections
@@ -154,7 +199,7 @@ export function buildGraphConnections(
  */
 export function getConnectedNotes(
   noteId: string,
-  connections: Map<string, string[]>,
+  connections: Map<string, GraphConnection[]>,
   maxDepth: number = 2
 ): Set<string> {
   const connected = new Set<string>()
@@ -173,9 +218,9 @@ export function getConnectedNotes(
 
     if (depth < maxDepth) {
       const targets = connections.get(id) || []
-      targets.forEach(targetId => {
-        if (!visited.has(targetId)) {
-          queue.push({ id: targetId, depth: depth + 1 })
+      targets.forEach(conn => {
+        if (!visited.has(conn.targetId)) {
+          queue.push({ id: conn.targetId, depth: depth + 1 })
         }
       })
     }

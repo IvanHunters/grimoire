@@ -1,6 +1,7 @@
 // Folder from backend (flat structure)
 export interface Folder {
   path: string
+  projectPath?: string
   createdAt: string
 }
 
@@ -8,6 +9,7 @@ export interface Folder {
 export interface FolderNode {
   name: string
   path: string
+  projectPath?: string
   children?: FolderNode[]
   // UI state (not from backend)
   isCollapsed?: boolean

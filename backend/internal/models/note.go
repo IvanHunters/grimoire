@@ -13,6 +13,7 @@ type Note struct {
 	Content        string    `json:"content" bson:"content"`
 	Type           string    `json:"type,omitempty" bson:"type,omitempty"`         // "project" or empty
 	ProjectPath    string    `json:"projectPath,omitempty" bson:"project_path,omitempty"`
+	Tags           []string  `json:"tags,omitempty" bson:"tags,omitempty"`         // tags for fast search
 	CreatedAt      time.Time `json:"createdAt" bson:"created_at"`
 	UpdatedAt      time.Time `json:"updatedAt" bson:"updated_at"`
 	OutgoingLinks  []string  `json:"outgoingLinks,omitempty" bson:"outgoing_links,omitempty"`
@@ -30,11 +31,12 @@ type CreateNoteRequest struct {
 
 // UpdateNoteRequest represents a request to update an existing note
 type UpdateNoteRequest struct {
-	Title       string  `json:"title,omitempty"`
-	Content     string  `json:"content,omitempty"`
-	Type        string  `json:"type,omitempty"`
-	ProjectPath string  `json:"projectPath,omitempty"`
-	Folder      *string `json:"folder,omitempty"` // Pointer to distinguish between not set and empty string
+	Title       string   `json:"title,omitempty"`
+	Content     string   `json:"content,omitempty"`
+	Type        string   `json:"type,omitempty"`
+	ProjectPath *string  `json:"projectPath,omitempty"` // Pointer to distinguish between not set and empty string
+	Folder      *string  `json:"folder,omitempty"`      // Pointer to distinguish between not set and empty string
+	Tags        []string `json:"tags,omitempty"`
 }
 
 // MoveNoteRequest represents a request to move a note

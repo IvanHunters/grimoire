@@ -7,22 +7,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/ivanohotnikov/markdown-editor/internal/claude"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 )
 
-// ListSessions returns list of active Claude sessions from database
+// ListSessions returns list of active Claude sessions from memory (not DB)
+// This ensures only live sessions are shown, preventing issues after backend restart
 func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	sessionStorage := storage.NewSessionStorage(h.db)
-	sessions, err := sessionStorage.ListActiveSessions(ctx)
-	if err != nil {
-		h.logger.Error("failed to list sessions", "error", err)
-		http.Error(w, "Failed to list sessions", http.StatusInternalServerError)
-		return
-	}
+	// Get live sessions from SessionManager instead of DB
+	sessions := h.sessionManager.ListActiveSessions()
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(sessions); err != nil {
@@ -40,17 +32,20 @@ func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	// Close session in manager (stops subprocess)
-	manager := claude.GetSessionManager(h.logger, nil, "", "")
-	if err := manager.Close(sessionID); err != nil {
-		h.logger.Warn("failed to close session in manager", "session_id", sessionID, "error", err)
-		// Continue anyway to update DB status
+	// Close session in manager (stops subprocess) - runs in background
+	if h.sessionManager != nil {
+		go func() {
+			if err := h.sessionManager.Close(sessionID); err != nil {
+				h.logger.Warn("failed to close session in manager", "session_id", sessionID, "error", err)
+			}
+		}()
 	}
 
-	// Update session status in database
+	// Update session status in database with fresh context
+	// (not tied to request context which might be cancelled)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	sessionStorage := storage.NewSessionStorage(h.db)
 	if err := sessionStorage.UpdateSessionStatus(ctx, sessionID, "terminated"); err != nil {
 		h.logger.Error("failed to update session status", "session_id", sessionID, "error", err)

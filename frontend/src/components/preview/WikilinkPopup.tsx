@@ -6,14 +6,11 @@ import type { Note } from '../../types/note'
 interface WikilinkPopupProps {
   note: Note
   onClose: () => void
+  onMouseEnter?: () => void
+  onMouseLeave?: () => void
 }
 
-/**
- * Popup preview for wikilink hover
- * Fixed position: right 20px, vertically centered
- * Exactly like prototype
- */
-function WikilinkPopup({ note, onClose }: WikilinkPopupProps) {
+function WikilinkPopup({ note, onClose, onMouseEnter, onMouseLeave }: WikilinkPopupProps) {
   const popupRef = useRef<HTMLDivElement>(null)
 
   // Remove frontmatter from preview
@@ -39,6 +36,8 @@ function WikilinkPopup({ note, onClose }: WikilinkPopupProps) {
     <div
       ref={popupRef}
       className="preview-popup show"
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
     >
       <h3>{note.title}</h3>
       <div className="preview-popup-content">

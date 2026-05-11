@@ -116,9 +116,10 @@ func BuildFolderTree(folders []*models.Folder) *models.FolderNode {
 		name := parts[len(parts)-1]
 
 		node := &models.FolderNode{
-			Name:     name,
-			Path:     folder.Path,
-			Children: make([]*models.FolderNode, 0),
+			Name:        name,
+			Path:        folder.Path,
+			ProjectPath: folder.ProjectPath,
+			Children:    make([]*models.FolderNode, 0),
 		}
 
 		nodeMap[folder.Path] = node
@@ -242,6 +243,44 @@ func (s *MongoStorage) MoveFolder(ctx context.Context, fromPath, toPath string) 
 		if err != nil {
 			return fmt.Errorf("failed to update subfolder %s: %w", oldPath, err)
 		}
+	}
+
+	return nil
+}
+
+// GetFolder retrieves a folder by path
+func (s *MongoStorage) GetFolder(ctx context.Context, path string) (*models.Folder, error) {
+	collection := s.db.Collection(foldersCollection)
+
+	var folder models.Folder
+	err := collection.FindOne(ctx, bson.M{"path": path}).Decode(&folder)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("folder not found: %s", path)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get folder: %w", err)
+	}
+
+	return &folder, nil
+}
+
+// UpdateFolder updates a folder's metadata
+func (s *MongoStorage) UpdateFolder(ctx context.Context, folder *models.Folder) error {
+	collection := s.db.Collection(foldersCollection)
+
+	update := bson.M{
+		"$set": bson.M{
+			"project_path": folder.ProjectPath,
+		},
+	}
+
+	result, err := collection.UpdateOne(ctx, bson.M{"path": folder.Path}, update)
+	if err != nil {
+		return fmt.Errorf("failed to update folder: %w", err)
+	}
+
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("folder not found: %s", folder.Path)
 	}
 
 	return nil

@@ -25,4 +25,12 @@ export const foldersAPI = {
   moveFolder: async (data: MoveFolderRequest): Promise<void> => {
     await apiClient.put('/folders/move', data)
   },
+
+  // Update folder metadata (projectPath)
+  updateFolder: async (path: string, projectPath: string): Promise<Folder> => {
+    const response = await apiClient.put<Folder>('/folders', { projectPath }, {
+      params: { path },
+    })
+    return response.data
+  },
 }

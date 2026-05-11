@@ -13,7 +13,6 @@ function MermaidDiagram({ code }: MermaidDiagramProps) {
   const [, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    // Initialize mermaid once
     if (!mermaidInitialized) {
       mermaid.initialize({
         startOnLoad: false,
@@ -26,7 +25,6 @@ function MermaidDiagram({ code }: MermaidDiagramProps) {
     if (mermaidRef.current && code) {
       setError(null)
 
-      // Generate unique ID for each render
       const newId = `mermaid-${++diagramCounter}-${Date.now()}`
 
       mermaid
@@ -52,7 +50,11 @@ function MermaidDiagram({ code }: MermaidDiagramProps) {
     }
   }, [code])
 
-  return <div ref={mermaidRef} className="mermaid" />
+  return (
+    <div className="mermaid-wrapper my-4 rounded-lg overflow-auto bg-white p-4 shadow-sm border border-gray-100 dark:border-gray-700">
+      <div ref={mermaidRef} className="mermaid" data-source={code} />
+    </div>
+  )
 }
 
 export default MermaidDiagram

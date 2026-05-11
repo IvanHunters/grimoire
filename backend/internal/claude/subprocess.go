@@ -37,18 +37,12 @@ func startPTYReader(session *ClaudeSession, logger *slog.Logger) {
 			// Save to buffer
 			session.AppendOutput(data)
 
-			// Broadcast to all subscribers (non-blocking)
-			select {
-			case session.outputChan <- data:
-				logger.Debug("broadcast PTY output",
-					slog.String("session_id", session.ID),
-					slog.Int("bytes", n),
-				)
-			default:
-				logger.Warn("output channel full, dropping data",
-					slog.String("session_id", session.ID),
-				)
-			}
+			// Broadcast to all active WebSocket subscribers (fan-out).
+			session.BroadcastOutput(data)
+			logger.Debug("broadcast PTY output",
+				slog.String("session_id", session.ID),
+				slog.Int("bytes", n),
+			)
 
 			session.UpdateActivity()
 		}
@@ -56,7 +50,7 @@ func startPTYReader(session *ClaudeSession, logger *slog.Logger) {
 }
 
 // startClaudeSubprocess starts a new Claude subprocess using PTY
-func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger) (*ClaudeSession, error) {
+func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger, systemPrompt string) (*ClaudeSession, error) {
 	// Setup MCP configuration automatically
 	mcpConfigPath, err := setupMCPConfig(workingDir, mongoURI, mongoDatabase, logger)
 	if err != nil {
@@ -67,6 +61,11 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 	args := []string{}
 	if dangerousMode {
 		args = append(args, "--dangerously-skip-permissions")
+	}
+	if systemPrompt != "" {
+		// Pass context as system prompt — avoids PTY echo of the context text in the terminal.
+		// --append-system-prompt keeps Claude's built-in system prompt intact.
+		args = append(args, "--append-system-prompt", systemPrompt)
 	}
 
 	// Create command
@@ -84,6 +83,10 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 		}
 	}
 
+	// Ensure UTF-8 encoding for proper display of non-ASCII characters
+	filteredEnv = append(filteredEnv, "LANG=en_US.UTF-8")
+	filteredEnv = append(filteredEnv, "LC_ALL=en_US.UTF-8")
+
 	if mcpConfigPath != "" {
 		// Claude CLI will read MCP config from .claude directory in working dir
 		logger.Info("mcp config created", slog.String("path", mcpConfigPath))
@@ -98,7 +101,6 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 
 	// Create session
 	now := time.Now()
-	outputChan := make(chan []byte, 100) // Buffered channel for PTY output broadcast
 
 	session := &ClaudeSession{
 		ID:            sessionID,
@@ -112,7 +114,6 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 		LastActivity:  now,
 		Messages:      make([]models.ClaudeMessage, 0),
 		OutputBuffer:  make([]byte, 0, 1024), // Initialize with small capacity
-		outputChan:    outputChan,
 	}
 
 	// Start PTY reader goroutine (runs once for the session lifetime)
@@ -131,8 +132,8 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 				slog.String("session_id", sessionID),
 			)
 		}
-		// Close output channel when process exits
-		close(outputChan)
+		// Close all subscriber channels when process exits.
+		session.CloseAllSubscriptions()
 	}()
 
 	logger.Info("claude subprocess started",
@@ -189,6 +190,11 @@ func shutdownSession(session *ClaudeSession, logger *slog.Logger) error {
 	)
 
 	return nil
+}
+
+// SetupMCPConfig creates MCP configuration for Claude CLI in the given working directory.
+func SetupMCPConfig(workingDir string, mongoURI string, mongoDatabase string) (string, error) {
+	return setupMCPConfig(workingDir, mongoURI, mongoDatabase, slog.Default())
 }
 
 // setupMCPConfig creates MCP configuration for Claude CLI

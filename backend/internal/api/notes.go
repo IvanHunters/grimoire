@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 )
@@ -129,6 +130,13 @@ func (h *Handler) CreateNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Publish event for real-time sync
+	eventBus := events.GetEventBus()
+	eventBus.Publish(events.Event{
+		Type: events.EventNoteCreated,
+		Note: note,
+	})
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(note)
@@ -171,8 +179,11 @@ func (h *Handler) UpdateNote(w http.ResponseWriter, r *http.Request) {
 	if req.Type != "" {
 		note.Type = req.Type
 	}
-	if req.ProjectPath != "" {
-		note.ProjectPath = req.ProjectPath
+	if req.ProjectPath != nil {
+		note.ProjectPath = *req.ProjectPath
+	}
+	if req.Tags != nil {
+		note.Tags = req.Tags
 	}
 
 	// Update folder and recalculate path if folder changed
@@ -205,6 +216,13 @@ func (h *Handler) UpdateNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Publish event for real-time sync
+	eventBus := events.GetEventBus()
+	eventBus.Publish(events.Event{
+		Type: events.EventNoteUpdated,
+		Note: note,
+	})
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(note)
 }
@@ -226,6 +244,13 @@ func (h *Handler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to delete note", http.StatusInternalServerError)
 		return
 	}
+
+	// Publish event for real-time sync
+	eventBus := events.GetEventBus()
+	eventBus.Publish(events.Event{
+		Type:   events.EventNoteDeleted,
+		NoteID: id,
+	})
 
 	w.WriteHeader(http.StatusNoContent)
 }

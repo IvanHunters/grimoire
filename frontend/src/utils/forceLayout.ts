@@ -15,6 +15,7 @@ export interface ForceNode {
   vx: number // velocity x
   vy: number // velocity y
   fixed?: boolean // don't move this node
+  connectionCount?: number // number of connections (for weighted center force)
 }
 
 export interface ForceLink {
@@ -119,13 +120,20 @@ export function forceLayout(
     })
 
     // Apply center force (pull toward center)
+    // Nodes with more connections are pulled stronger toward center
     nodesCopy.forEach(node => {
       if (!node.fixed) {
         const dx = centerX - node.x
         const dy = centerY - node.y
 
-        node.vx += dx * centerStrength
-        node.vy += dy * centerStrength
+        // Weight center force by connection count
+        // More connections = stronger pull to center (hub nodes)
+        // Fewer connections = weaker pull (peripheral nodes)
+        const connectionWeight = node.connectionCount ? Math.sqrt(node.connectionCount + 1) : 1
+        const weightedCenterStrength = centerStrength * connectionWeight
+
+        node.vx += dx * weightedCenterStrength
+        node.vy += dy * weightedCenterStrength
       }
     })
 
@@ -139,10 +147,8 @@ export function forceLayout(
         node.vx *= damping
         node.vy *= damping
 
-        // Keep nodes within bounds (with padding)
-        const padding = 50
-        node.x = Math.max(padding, Math.min(width - padding, node.x))
-        node.y = Math.max(padding, Math.min(height - padding, node.y))
+        // No bounds checking - graph can extend beyond viewport
+        // User can pan and zoom to view the entire graph
       }
     })
   }

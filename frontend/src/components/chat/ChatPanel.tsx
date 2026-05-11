@@ -1,232 +1,210 @@
-import { useMemo, useState, useCallback, useEffect } from 'react'
-import { X, Bot, RotateCcw, Trash2, Plus, Terminal } from 'lucide-react'
-import { TerminalChat } from './TerminalChat'
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { X, RotateCcw, Trash2 } from 'lucide-react'
+import { TerminalChat, type TerminalChatHandle } from './TerminalChat'
 import { sessionsAPI } from '../../api/sessions'
-import type { ClaudeSession } from '../../types/claude'
+import { useNotes } from '../../contexts/NotesContext'
+import type { TaskContextPayload } from '../../hooks/useTerminalWebSocket'
 
 interface ChatPanelProps {
   visible: boolean
   onClose: () => void
-  noteId?: string | null
+  noteId: string
+  taskContext?: TaskContextPayload | null
 }
 
-/**
- * ChatPanel - Terminal emulator for Claude Code CLI
- *
- * Features:
- * - Full xterm.js terminal emulator
- * - Raw PTY streaming via WebSocket
- * - Complete TUI interaction (like KVM)
- * - Session per note or global session
- * - List of active sessions with ability to switch
- * - Dangerous mode enabled by default
- */
-function ChatPanel({ visible, onClose, noteId }: ChatPanelProps) {
+function ChatPanel({ visible, onClose, noteId, taskContext }: ChatPanelProps) {
+  const { currentNote } = useNotes()
   const [sessionKey, setSessionKey] = useState(0)
-  const [activeSessions, setActiveSessions] = useState<ClaudeSession[]>([])
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [showKeyboard, setShowKeyboard] = useState(() => localStorage.getItem('terminal.showKeyboard') !== 'false')
+  const terminalRef = useRef<TerminalChatHandle>(null)
 
-  // Generate session ID based on context:
-  // - If noteId provided → session per note
-  // - Otherwise → use selected session or create new global session
-  const sessionId = useMemo(() => {
-    if (noteId) {
-      return `note-${noteId}`
-    }
-    if (selectedSessionId) {
-      return selectedSessionId
-    }
-    // Global session - generate UUID once and keep it
-    const globalId = sessionStorage.getItem('claude-global-session')
-    if (globalId) {
-      return globalId
-    }
-    const newId = `global-${crypto.randomUUID()}`
-    sessionStorage.setItem('claude-global-session', newId)
-    return newId
-  }, [noteId, selectedSessionId])
+  const sessionId = `note-${noteId}`
+  const [keyboardOffset, setKeyboardOffset] = useState(0)
 
-  // Load active sessions
-  const loadSessions = useCallback(async () => {
-    try {
-      const sessions = await sessionsAPI.listActiveSessions()
-      setActiveSessions(sessions)
-
-      // If no session selected and we have sessions, select the first one
-      if (!selectedSessionId && sessions.length > 0 && !noteId) {
-        setSelectedSessionId(sessions[0].id)
-      }
-    } catch (error) {
-      console.error('Failed to load sessions:', error)
-    }
-  }, [selectedSessionId, noteId])
-
-  // Load sessions on mount and when panel becomes visible
   useEffect(() => {
-    if (visible) {
-      loadSessions()
-      // Refresh sessions list every 5 seconds
-      const interval = window.setInterval(loadSessions, 5000)
-      return () => clearInterval(interval)
+    const vv = window.visualViewport
+    if (!vv) return
+    let timer: number
+    let lastOffset = 0
+    const update = () => {
+      const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+      if (kb > lastOffset) {
+        // Keyboard opening — react immediately, no animation
+        clearTimeout(timer)
+        lastOffset = kb
+        setKeyboardOffset(kb)
+      } else {
+        // Keyboard closing — debounce to avoid tracking the slide-down animation
+        clearTimeout(timer)
+        timer = window.setTimeout(() => {
+          lastOffset = kb
+          setKeyboardOffset(kb)
+        }, 320)
+      }
     }
-  }, [visible, loadSessions])
-
-  // Restart session - force remount TerminalChat with new key
-  const handleRestart = useCallback(() => {
-    setSessionKey(prev => prev + 1)
+    vv.addEventListener('resize', update)
+    vv.addEventListener('scroll', update)
+    return () => {
+      vv.removeEventListener('resize', update)
+      vv.removeEventListener('scroll', update)
+      clearTimeout(timer)
+    }
   }, [])
 
-  // Kill session - close WebSocket and terminate backend session
+  // Refit + scroll terminal to bottom after keyboard changes panel height
+  useEffect(() => {
+    terminalRef.current?.refit()
+  }, [keyboardOffset])
+
+  // Refit after panel opens so xterm accounts for the keyboard bar height
+  useEffect(() => {
+    if (!visible) return
+    const t = setTimeout(() => terminalRef.current?.refit(), 350)
+    return () => clearTimeout(t)
+  }, [visible])
+
+  const handleRestart = useCallback(() => {
+    terminalRef.current?.restart()
+  }, [])
+
   const handleKill = useCallback(async () => {
     try {
-      // Call API to terminate session on backend
       await sessionsAPI.deleteSession(sessionId)
-
-      // Force remount to close WebSocket
       setSessionKey(prev => prev + 1)
-
-      // If global session, clear from sessionStorage
-      if (!noteId && sessionId === sessionStorage.getItem('claude-global-session')) {
-        sessionStorage.removeItem('claude-global-session')
-        setSelectedSessionId(null)
-      }
-
-      // Reload sessions list
-      window.setTimeout(loadSessions, 500)
-    } catch (error) {
-      console.error('Failed to kill session:', error)
-      // Still remount to close WebSocket on frontend
+    } catch {
       setSessionKey(prev => prev + 1)
     }
-  }, [noteId, sessionId, loadSessions])
+  }, [sessionId])
 
-  // Create new session
-  const handleNewSession = useCallback(() => {
-    const newId = `global-${crypto.randomUUID()}`
-    sessionStorage.setItem('claude-global-session', newId)
-    setSelectedSessionId(newId)
-    setSessionKey(prev => prev + 1)
-    window.setTimeout(loadSessions, 1000)
-  }, [loadSessions])
-
-  // Switch to different session
-  const handleSwitchSession = useCallback((newSessionId: string) => {
-    setSelectedSessionId(newSessionId)
-    setSessionKey(prev => prev + 1)
+  const sendKey = useCallback((data: string) => {
+    terminalRef.current?.sendKey(data)
   }, [])
-
-  // Format session name for display
-  const getSessionDisplayName = (session: ClaudeSession) => {
-    if (session.name && session.name !== 'Terminal Session') {
-      return session.name
-    }
-    return session.id.startsWith('note-') ? 'Note Session' : 'Global Session'
-  }
 
   if (!visible) return null
 
   return (
-    <div className="fixed right-0 top-14 bottom-0 w-[1000px] bg-gray-900 border-l border-gray-700 flex shadow-2xl z-10">
-      {/* Sessions Sidebar */}
-      {!noteId && (
-        <div className="w-64 border-r border-gray-700 flex flex-col bg-gray-800">
-          {/* Sidebar Header */}
-          <div className="h-12 border-b border-gray-700 flex items-center justify-between px-3">
-            <span className="text-sm font-semibold text-gray-300">Sessions</span>
-            <button
-              onClick={handleNewSession}
-              className="p-1 hover:bg-gray-700 rounded text-gray-400 hover:text-gray-200"
-              title="New Session"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
-          </div>
+    <div
+      className="fixed right-0 flex flex-col z-20 top-14 w-full md:w-[680px] terminal-panel"
+      style={{ bottom: `${keyboardOffset}px` }}
+    >
 
-          {/* Sessions List */}
-          <div className="flex-1 overflow-y-auto">
-            {activeSessions.length === 0 ? (
-              <div className="p-4 text-center text-gray-500 text-sm">
-                No active sessions
+      {/* Scanline texture — visual atmosphere only */}
+      <div className="terminal-scanlines" />
+
+      {/* ── Header ─────────────────────────────────────────────── */}
+      <div className="terminal-header relative z-10 flex-shrink-0 px-3 py-2 flex items-center justify-between">
+        <div className="flex items-center gap-2.5 min-w-0 flex-1">
+          <span className="terminal-led" />
+          <div className="min-w-0">
+            <div
+              className="font-mono font-semibold text-cyan-400/80"
+              style={{ fontSize: 10, letterSpacing: '0.18em' }}
+            >
+              CLAUDE / TERMINAL
+            </div>
+            {taskContext ? (
+              <div className="font-mono text-slate-700 truncate mt-0.5" style={{ fontSize: 9 }}>
+                task: {taskContext.title}
               </div>
-            ) : (
-              <div className="py-2">
-                {activeSessions.map((session) => (
-                  <button
-                    key={session.id}
-                    onClick={() => handleSwitchSession(session.id)}
-                    className={`w-full px-3 py-2 text-left hover:bg-gray-700 transition-colors flex items-start gap-2 ${
-                      session.id === sessionId ? 'bg-gray-700' : ''
-                    }`}
-                  >
-                    <Terminal className="w-4 h-4 text-purple-400 flex-shrink-0 mt-0.5" />
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-gray-200 truncate">
-                        {getSessionDisplayName(session)}
-                      </div>
-                      <div className="text-xs text-gray-500 truncate">
-                        {session.workingDir}
-                      </div>
-                      <div className="text-xs text-gray-600 mt-0.5">
-                        {new Date(session.lastActivity).toLocaleTimeString()}
-                      </div>
-                    </div>
-                  </button>
-                ))}
+            ) : currentNote && (
+              <div className="font-mono text-slate-700 truncate mt-0.5" style={{ fontSize: 9 }}>
+                {currentNote.folder ? `${currentNote.folder}/` : ''}{currentNote.title}
               </div>
             )}
           </div>
         </div>
-      )}
 
-      {/* Main Terminal Area */}
-      <div className="flex-1 flex flex-col">
-        {/* Header */}
-        <div className="h-12 border-b border-gray-700 flex items-center justify-between px-4 bg-gray-800">
-          <div className="flex items-center gap-2">
-            <Bot className="w-5 h-5 text-purple-400" />
-            <span className="font-semibold text-gray-100">
-              Claude Terminal
-              {noteId && <span className="text-xs text-gray-500 ml-2">(linked to note)</span>}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            {/* Restart Button */}
-            <button
-              onClick={handleRestart}
-              className="p-1.5 hover:bg-gray-700 rounded text-gray-400 hover:text-gray-200"
-              title="Restart Session (preserves history)"
-            >
-              <RotateCcw className="w-4 h-4" />
-            </button>
-            {/* Kill Button */}
-            <button
-              onClick={handleKill}
-              className="p-1.5 hover:bg-red-900 rounded text-gray-400 hover:text-red-400"
-              title="Kill Session (clears history)"
-            >
-              <Trash2 className="w-4 h-4" />
-            </button>
-            {/* Close Button */}
-            <button
-              onClick={onClose}
-              className="p-1.5 hover:bg-gray-700 rounded text-gray-400 hover:text-gray-200"
-              title="Close Terminal (keeps session alive)"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-
-        {/* Terminal Area */}
-        <div className="flex-1">
-          <TerminalChat
-            key={sessionKey}
-            sessionId={sessionId}
-            dangerousMode={true}
-          />
+        <div className="flex items-center gap-0.5 flex-shrink-0">
+          <button
+            onClick={handleRestart}
+            className="terminal-btn"
+            title="Restart Session"
+          >
+            <RotateCcw className="w-3 h-3" />
+          </button>
+          <button
+            onClick={handleKill}
+            className="terminal-btn terminal-btn-kill"
+            title="Kill Session"
+          >
+            <Trash2 className="w-3 h-3" />
+          </button>
+          <button
+            onClick={() => { setShowKeyboard(v => { const next = !v; localStorage.setItem('terminal.showKeyboard', String(next)); return next }); setTimeout(() => terminalRef.current?.refit(), 50) }}
+            className={`terminal-btn md:hidden ${showKeyboard ? 'opacity-100' : 'opacity-40'}`}
+            title="Toggle keyboard"
+          >
+            <i className="fas fa-keyboard text-[10px]" />
+          </button>
+          <button
+            onClick={onClose}
+            className="terminal-btn"
+            title="Close"
+          >
+            <X className="w-3 h-3" />
+          </button>
         </div>
       </div>
+
+      {/* ── Terminal ────────────────────────────────────────────── */}
+      <div className="flex-1 min-h-0 relative z-10 flex flex-col">
+        <TerminalChat
+          ref={terminalRef}
+          key={sessionKey}
+          sessionId={sessionId}
+          dangerousMode={true}
+          taskContext={taskContext}
+        />
+      </div>
+
+      {/* Gap between terminal output and keyboard bar on mobile */}
+      {showKeyboard && <div className="md:hidden flex-shrink-0 h-2" style={{ background: '#06080e' }} />}
+
+      {/* ── Mobile Virtual Keyboard (hidden on md+) ─────────────── */}
+      {showKeyboard && <div className="md:hidden flex-shrink-0 relative z-10 terminal-keyboard">
+
+        {/* Row 1 — Control characters */}
+        <div className="terminal-key-row">
+          <TermKey variant="danger"  label="ESC"  onPress={() => sendKey('\x1b')}   />
+          <TermKey variant="danger"  label="^C"   onPress={() => sendKey('\x03')}   />
+          <TermKey variant="default" label="^D"   onPress={() => sendKey('\x04')}   />
+          <TermKey variant="default" label="^L"   onPress={() => sendKey('\x0c')}   />
+          <TermKey variant="default" label="^A"   onPress={() => sendKey('\x01')}   />
+          <TermKey variant="default" label="^E"   onPress={() => sendKey('\x05')}   />
+        </div>
+
+        {/* Row 2 — Navigation */}
+        <div className="terminal-key-row">
+          <TermKey variant="nav"   label="↑"    onPress={() => sendKey('\x1b[A')} />
+          <TermKey variant="nav"   label="↓"    onPress={() => sendKey('\x1b[B')} />
+          <TermKey variant="nav"   label="←"    onPress={() => sendKey('\x1b[D')} />
+          <TermKey variant="nav"   label="→"    onPress={() => sendKey('\x1b[C')} />
+          <TermKey variant="default" label="Tab" onPress={() => sendKey('\t')}    />
+          <TermKey variant="enter"  label="↵"   onPress={() => sendKey('\r')}    />
+        </div>
+      </div>}
     </div>
+  )
+}
+
+/* ── Key component ──────────────────────────────────────────────── */
+
+type KeyVariant = 'default' | 'danger' | 'nav' | 'enter'
+
+interface TermKeyProps {
+  label: string
+  onPress: () => void
+  variant: KeyVariant
+}
+
+function TermKey({ label, onPress, variant }: TermKeyProps) {
+  return (
+    <button
+      onPointerDown={(e) => { e.preventDefault(); onPress() }}
+      className={`term-key term-key-${variant}`}
+    >
+      {label}
+    </button>
   )
 }
 

@@ -15,7 +15,10 @@ type Storage interface {
 	CreateNote(ctx context.Context, note *models.Note) error
 	UpdateNote(ctx context.Context, note *models.Note) error
 	DeleteNote(ctx context.Context, id string) error
-	SearchNotes(ctx context.Context, query string) ([]*models.Note, error)
+	SearchNotes(ctx context.Context, query string, limit int) ([]*models.Note, error)
+	SearchByTags(tags []string, limit int) []*models.Note
+	GetAllTags() map[string]int
+	BuildTagsIndex(ctx context.Context) error
 
 	// Folders
 	ListFolders(ctx context.Context) ([]*models.Folder, error)
