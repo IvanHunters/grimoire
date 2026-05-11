@@ -1,21 +1,40 @@
-import { createContext, useContext, useState, useEffect } from 'react'
+import { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react'
 import type { ReactNode } from 'react'
 import type { Note } from '../types/note'
-import type { Folder } from '../types/folder'
+import type { FolderNode } from '../types/folder'
 import { notesAPI } from '../api/notes'
 import { foldersAPI } from '../api/folders'
+import { useSyncWebSocket } from '../hooks/useSyncWebSocket'
+
+// Helper function to flatten folder tree into array
+function flattenFolderTree(node: FolderNode): FolderNode[] {
+  const result: FolderNode[] = []
+
+  function traverse(n: FolderNode) {
+    if (n.path) { // Skip root node
+      result.push(n)
+    }
+    if (n.children) {
+      n.children.forEach(traverse)
+    }
+  }
+
+  traverse(node)
+  return result
+}
 
 interface NotesContextValue {
   notes: Note[]
   currentNote: Note | null
-  folders: Folder[]
+  folderTree: FolderNode
+  folders: FolderNode[] // Flattened array for legacy components
   loading: boolean
   error: string | null
 
   // Notes operations
   fetchNotes: () => Promise<void>
   createNote: (title: string, folder?: string, content?: string) => Promise<Note>
-  updateNote: (id: string, content: string) => Promise<void>
+  updateNote: (id: string, content?: string, tags?: string[]) => Promise<void>
   deleteNote: (id: string) => Promise<void>
   setCurrentNote: (note: Note | null) => void
 
@@ -30,9 +49,12 @@ const NotesContext = createContext<NotesContextValue | undefined>(undefined)
 export function NotesProvider({ children }: { children: ReactNode }) {
   const [notes, setNotes] = useState<Note[]>([])
   const [currentNote, setCurrentNote] = useState<Note | null>(null)
-  const [folders, setFolders] = useState<Folder[]>([])
+  const [folderTree, setFolderTree] = useState<FolderNode>({ name: '', path: '', children: [] })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Flatten folder tree for legacy components
+  const folders = useMemo(() => flattenFolderTree(folderTree), [folderTree])
 
   // Fetch notes on mount
   useEffect(() => {
@@ -59,11 +81,11 @@ export function NotesProvider({ children }: { children: ReactNode }) {
   const fetchFolders = async () => {
     try {
       const data = await foldersAPI.getFolders()
-      setFolders(data)
+      setFolderTree(data)
     } catch (err) {
       console.error('Error fetching folders:', err)
       // Use mock data for development
-      setFolders(getMockFolders())
+      setFolderTree(getMockFolders())
     }
   }
 
@@ -79,7 +101,16 @@ export function NotesProvider({ children }: { children: ReactNode }) {
         folder,
         content,
       })
-      setNotes((prev) => [...prev, newNote])
+      setNotes((prev) => {
+        const list = prev || []
+        return list.some(n => n.id === newNote.id) ? list : [...list, newNote]
+      })
+
+      // Refresh folders list if folder was specified (backend auto-creates it)
+      if (folder) {
+        await fetchFolders()
+      }
+
       return newNote
     } catch (err) {
       setError('Failed to create note')
@@ -88,18 +119,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  const updateNote = async (id: string, content: string) => {
+  const updateNote = async (id: string, content?: string, tags?: string[]) => {
     try {
       setError(null)
-      const updated = await notesAPI.updateNote(id, { content })
+      const updateData: { content?: string; tags?: string[] } = {}
+      if (content !== undefined) updateData.content = content
+      if (tags !== undefined) updateData.tags = tags
+
+      const updated = await notesAPI.updateNote(id, updateData)
 
       setNotes((prev) =>
-        prev.map((note) => (note.id === id ? updated : note))
+        (prev || []).map((note) => (note.id === id ? updated : note))
       )
 
-      if (currentNote?.id === id) {
-        setCurrentNote(updated)
-      }
+      setCurrentNote(prev => prev?.id === id ? updated : prev)
     } catch (err) {
       setError('Failed to update note')
       console.error('Error updating note:', err)
@@ -111,11 +144,9 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     try {
       setError(null)
       await notesAPI.deleteNote(id)
-      setNotes((prev) => prev.filter((note) => note.id !== id))
+      setNotes((prev) => (prev || []).filter((note) => note.id !== id))
 
-      if (currentNote?.id === id) {
-        setCurrentNote(null)
-      }
+      setCurrentNote(prev => prev?.id === id ? null : prev)
     } catch (err) {
       setError('Failed to delete note')
       console.error('Error deleting note:', err)
@@ -147,9 +178,54 @@ export function NotesProvider({ children }: { children: ReactNode }) {
     }
   }
 
+  // WebSocket event handlers for real-time sync
+  const handleNoteCreated = useCallback((note: Note) => {
+    console.log('[Sync] Note created:', note.id)
+    setNotes((prev) => {
+      // Avoid duplicates
+      if (prev.some(n => n.id === note.id)) {
+        return prev
+      }
+      return [...prev, note]
+    })
+  }, [])
+
+  const handleNoteUpdated = useCallback((note: Note) => {
+    console.log('[Sync] Note updated:', note.id)
+    setNotes((prev) => prev.map((n) => (n.id === note.id ? note : n)))
+    setCurrentNote(prev => prev?.id === note.id ? note : prev)
+  }, [])
+
+  const handleNoteDeleted = useCallback((noteId: string) => {
+    console.log('[Sync] Note deleted:', noteId)
+    setNotes((prev) => prev.filter((n) => n.id !== noteId))
+    setCurrentNote(prev => prev?.id === noteId ? null : prev)
+  }, [])
+
+  const handleFolderCreated = useCallback(() => {
+    console.log('[Sync] Folder created, refreshing folders')
+    fetchFolders()
+  }, [])
+
+  const handleFolderDeleted = useCallback(() => {
+    console.log('[Sync] Folder deleted, refreshing folders and notes')
+    fetchFolders()
+    fetchNotes()
+  }, [])
+
+  // Subscribe to WebSocket events
+  useSyncWebSocket({
+    onNoteCreated: handleNoteCreated,
+    onNoteUpdated: handleNoteUpdated,
+    onNoteDeleted: handleNoteDeleted,
+    onFolderCreated: handleFolderCreated,
+    onFolderDeleted: handleFolderDeleted,
+  })
+
   const value: NotesContextValue = {
     notes,
     currentNote,
+    folderTree,
     folders,
     loading,
     error,
@@ -227,9 +303,8 @@ func main() {
 | Preview | ✅     |
 | Claude  | 🚧     |
 `,
-      created_at: '2024-01-15T10:00:00Z',
-      updated_at: '2024-01-15T10:00:00Z',
-      tags: [],
+      createdAt: '2024-01-15T10:00:00Z',
+      updatedAt: '2024-01-15T10:00:00Z',
     },
     {
       id: '2',
@@ -268,9 +343,8 @@ updated_at: 2024-01-15T11:00:00Z
 - [ ] Integration tests
 - [ ] E2E tests
 `,
-      created_at: '2024-01-15T11:00:00Z',
-      updated_at: '2024-01-15T11:00:00Z',
-      tags: ['todo', 'project'],
+      createdAt: '2024-01-15T11:00:00Z',
+      updatedAt: '2024-01-15T11:00:00Z',
     },
     {
       id: '3',
@@ -291,9 +365,8 @@ Random thoughts and ideas.
 
 See also: [[TODO List]] for project tasks.
 `,
-      created_at: '2024-01-15T12:00:00Z',
-      updated_at: '2024-01-15T12:00:00Z',
-      tags: [],
+      createdAt: '2024-01-15T12:00:00Z',
+      updatedAt: '2024-01-15T12:00:00Z',
     },
     {
       id: '4',
@@ -353,32 +426,32 @@ Links to non-existent notes appear differently:
 - [[Getting Started]] - Main introduction
 - [[TODO List]] - What's next
 `,
-      created_at: '2024-01-16T10:00:00Z',
-      updated_at: '2024-01-16T10:00:00Z',
-      tags: ['guide', 'wikilinks'],
+      createdAt: '2024-01-16T10:00:00Z',
+      updatedAt: '2024-01-16T10:00:00Z',
     },
   ]
 }
 
-function getMockFolders(): Folder[] {
-  return [
-    {
-      path: 'projects',
-      name: 'Projects',
-      created_at: '2024-01-15T10:00:00Z',
-      isCollapsed: false,
-    },
-    {
-      path: 'personal',
-      name: 'Personal',
-      created_at: '2024-01-15T12:00:00Z',
-      isCollapsed: true,
-    },
-    {
-      path: 'archive',
-      name: 'Archive',
-      created_at: '2024-01-10T10:00:00Z',
-      isCollapsed: true,
-    },
-  ]
+function getMockFolders(): FolderNode {
+  return {
+    name: '',
+    path: '',
+    children: [
+      {
+        name: 'projects',
+        path: 'projects',
+        isCollapsed: false,
+      },
+      {
+        name: 'personal',
+        path: 'personal',
+        isCollapsed: true,
+      },
+      {
+        name: 'archive',
+        path: 'archive',
+        isCollapsed: true,
+      },
+    ],
+  }
 }

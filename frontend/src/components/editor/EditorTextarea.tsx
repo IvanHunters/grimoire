@@ -2,6 +2,7 @@ import { forwardRef, useRef, useEffect, useCallback, useState } from 'react'
 import { useNotes } from '../../contexts/NotesContext'
 import SearchPanel from './SearchPanel'
 import UploadModal from '../modals/UploadModal'
+import { uploadFile as uploadFileAPI } from '../../api/upload'
 
 interface EditorTextareaProps {
   className?: string
@@ -112,41 +113,44 @@ const EditorTextarea = forwardRef<HTMLDivElement, EditorTextareaProps>(
     }, [])
 
     // Confirm upload and insert markdown
-    const handleUploadConfirm = useCallback((fileName: string) => {
+    const handleUploadConfirm = useCallback(async (fileName: string) => {
       if (!uploadFile || !textareaRef.current) return
 
-      // Get file extension
-      const ext = uploadFile.name.split('.').pop() || 'png'
-      const fullFileName = `${fileName}.${ext}`
+      try {
+        // Upload file to server
+        console.log('Uploading file:', uploadFile.name)
+        const response = await uploadFileAPI(uploadFile)
+        console.log('Upload successful:', response.url)
 
-      // Create markdown for uploaded file
-      let markdown = ''
-      if (uploadFile.type.startsWith('image/')) {
-        // Image: ![alt](url)
-        markdown = `![${fileName}](/uploads/${fullFileName})`
-      } else {
-        // Document: [filename](url)
-        markdown = `[${fileName}](/uploads/${fullFileName})`
+        // Create markdown with actual uploaded URL
+        let markdown = ''
+        if (uploadFile.type.startsWith('image/')) {
+          // Image: ![alt](url)
+          markdown = `![${fileName}](${response.url})`
+        } else {
+          // Document: [filename](url)
+          markdown = `[${fileName}](${response.url})`
+        }
+
+        // Insert at saved cursor position
+        const text = textareaRef.current.value
+        const newText = text.substring(0, uploadCursorPosition) + markdown + text.substring(uploadCursorPosition)
+
+        textareaRef.current.value = newText
+        textareaRef.current.selectionStart = uploadCursorPosition + markdown.length
+        textareaRef.current.selectionEnd = uploadCursorPosition + markdown.length
+
+        // Save state and notify parent
+        saveCurrentState()
+        lastValueRef.current = newText
+        onChange?.(newText)
+
+        // Focus back to editor
+        textareaRef.current.focus()
+      } catch (error) {
+        console.error('Failed to upload file:', error)
+        alert('Failed to upload file. See console for details.')
       }
-
-      // Insert at saved cursor position
-      const text = textareaRef.current.value
-      const newText = text.substring(0, uploadCursorPosition) + markdown + text.substring(uploadCursorPosition)
-
-      textareaRef.current.value = newText
-      textareaRef.current.selectionStart = uploadCursorPosition + markdown.length
-      textareaRef.current.selectionEnd = uploadCursorPosition + markdown.length
-
-      // Save state and notify parent
-      saveCurrentState()
-      lastValueRef.current = newText
-      onChange?.(newText)
-
-      // Focus back to editor
-      textareaRef.current.focus()
-
-      // TODO: Actually upload file to server (for now just insert markdown)
-      console.log('Upload file:', fullFileName, uploadFile)
     }, [uploadFile, uploadCursorPosition, onChange])
 
     // Save current state immediately (for paste, format buttons)
@@ -722,7 +726,7 @@ const EditorTextarea = forwardRef<HTMLDivElement, EditorTextareaProps>(
           <textarea
             id="editor"
             ref={textareaRef}
-            className="absolute inset-0 editor-pane resize-none focus:outline-none overflow-y-auto border-0"
+            className="absolute inset-0 editor-pane resize-none focus:outline-none overflow-y-auto border-0 text-gray-900 dark:text-slate-300"
             style={{ padding: '16px' }}
             placeholder="Start writing..."
             defaultValue={content}

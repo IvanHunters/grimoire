@@ -1,4 +1,4 @@
-import { X, AlertTriangle } from 'lucide-react'
+import { X } from 'lucide-react'
 
 interface DeleteConfirmModalProps {
   visible: boolean
@@ -17,66 +17,61 @@ function DeleteConfirmModal({ visible, onClose, type, itemName, onConfirm }: Del
   }
 
   const handleOverlayClick = (e: React.MouseEvent) => {
-    if (e.target === e.currentTarget) {
-      onClose()
-    }
+    if (e.target === e.currentTarget) onClose()
   }
 
   return (
     <div
-      className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[2000]"
+      className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-[2000]"
       onClick={handleOverlayClick}
     >
       <div
-        className="bg-white rounded-lg shadow-xl max-w-md w-full mx-4"
+        className="bg-[#0a0b10] border border-white/[0.09] rounded-lg shadow-2xl w-full max-w-md mx-4 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        style={{ boxShadow: '0 0 0 1px rgba(239,68,68,0.1), 0 25px 50px rgba(0,0,0,0.6)' }}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-gray-200">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="w-5 h-5 text-red-600" />
-            <h2 className="text-lg font-semibold text-gray-900">
-              Delete {type === 'note' ? 'Note' : 'Folder'}
-            </h2>
-          </div>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
+          <span className="text-[10px] font-mono font-semibold tracking-widest text-red-500 uppercase">
+            ⚠ DELETE {type === 'note' ? 'NOTE' : 'FOLDER'}
+          </span>
           <button
             onClick={onClose}
-            className="p-1 hover:bg-gray-100 rounded transition"
+            className="p-1 text-slate-600 hover:text-slate-400 transition-colors rounded"
             type="button"
           >
-            <X className="w-5 h-5 text-gray-600" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
         {/* Body */}
-        <div className="p-4">
-          <p className="text-gray-700">
-            Are you sure you want to delete{' '}
-            <span className="font-semibold">{itemName}</span>?
+        <div className="px-5 py-5 space-y-3">
+          <p className="text-sm text-slate-300 font-mono">
+            delete <span className="text-slate-100 font-semibold">{itemName}</span>?
           </p>
           {type === 'folder' && (
-            <p className="mt-2 text-sm text-red-600">
-              ⚠️ All notes inside this folder will also be deleted!
+            <p className="text-xs font-mono text-red-400/80 bg-red-500/[0.06] border border-red-500/10 rounded px-3 py-2">
+              all notes inside this folder will also be deleted
             </p>
           )}
-          <p className="mt-2 text-sm text-gray-500">
-            This action cannot be undone.
+          <p className="text-[11px] font-mono text-slate-700">
+            this action cannot be undone
           </p>
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-2 p-4 border-t border-gray-200">
+        <div className="flex items-center justify-end gap-2 px-5 py-3 border-t border-white/[0.06]">
           <button
             onClick={onClose}
-            className="px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition"
+            className="px-4 py-1.5 text-xs font-mono text-slate-500 hover:text-slate-300 hover:bg-white/5 rounded transition-colors"
           >
-            Cancel
+            cancel
           </button>
           <button
             onClick={handleConfirm}
-            className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition"
+            className="px-4 py-1.5 text-xs font-mono bg-red-500/15 text-red-400 border border-red-500/25 rounded hover:bg-red-500/25 hover:border-red-500/40 transition-colors"
           >
-            Delete {type === 'note' ? 'Note' : 'Folder'}
+            delete →
           </button>
         </div>
       </div>

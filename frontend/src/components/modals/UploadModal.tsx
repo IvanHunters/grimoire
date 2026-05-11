@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { X, Upload, File, Image as ImageIcon } from 'lucide-react'
+import { X, Upload, File } from 'lucide-react'
 
 interface UploadModalProps {
   visible: boolean
@@ -76,21 +76,21 @@ function UploadModal({ visible, file, onClose, onConfirm }: UploadModalProps) {
       onClick={handleOverlayClick}
     >
       <div
-        className="bg-white rounded-lg shadow-xl max-w-md w-full mx-4"
+        className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-md w-full mx-4"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
-            <Upload className="w-5 h-5 text-purple-600" />
+        <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2">
+            <Upload className="w-5 h-5 text-purple-600 dark:text-purple-400" />
             Upload File
           </h2>
           <button
             onClick={onClose}
-            className="p-1 hover:bg-gray-100 rounded transition"
+            className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition"
             type="button"
           >
-            <X className="w-5 h-5 text-gray-600" />
+            <X className="w-5 h-5 text-gray-600 dark:text-gray-400" />
           </button>
         </div>
 
@@ -98,7 +98,7 @@ function UploadModal({ visible, file, onClose, onConfirm }: UploadModalProps) {
         <div className="p-4 space-y-4">
           {/* Preview */}
           {isImage && previewUrl ? (
-            <div className="bg-gray-50 rounded-lg p-4 border border-gray-200">
+            <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4 border border-gray-200 dark:border-gray-600">
               <img
                 src={previewUrl}
                 alt="Preview"
@@ -106,15 +106,15 @@ function UploadModal({ visible, file, onClose, onConfirm }: UploadModalProps) {
               />
             </div>
           ) : (
-            <div className="bg-gray-50 rounded-lg p-8 border border-gray-200 flex flex-col items-center justify-center">
-              <File className="w-16 h-16 text-gray-400 mb-2" />
-              <p className="text-sm text-gray-600">{file.type || 'Unknown type'}</p>
+            <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-8 border border-gray-200 dark:border-gray-600 flex flex-col items-center justify-center">
+              <File className="w-16 h-16 text-gray-400 dark:text-gray-500 mb-2" />
+              <p className="text-sm text-gray-600 dark:text-gray-400">{file.type || 'Unknown type'}</p>
             </div>
           )}
 
           {/* File info */}
-          <div className="bg-blue-50 rounded-lg p-3 border border-blue-200">
-            <div className="text-xs text-blue-900 space-y-1">
+          <div className="bg-blue-50 dark:bg-blue-900/20 rounded-lg p-3 border border-blue-200 dark:border-blue-800">
+            <div className="text-xs text-blue-900 dark:text-blue-200 space-y-1">
               <div className="flex items-center justify-between">
                 <span className="font-medium">Original name:</span>
                 <span className="font-mono">{file.name}</span>
@@ -128,7 +128,7 @@ function UploadModal({ visible, file, onClose, onConfirm }: UploadModalProps) {
 
           {/* File name input */}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
               File Name (without extension)
             </label>
             <input
@@ -137,21 +137,21 @@ function UploadModal({ visible, file, onClose, onConfirm }: UploadModalProps) {
               onChange={(e) => setFileName(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="my-file"
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
               autoFocus
             />
-            <p className="mt-1 text-xs text-gray-500">
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
               Press Enter to confirm, Escape to cancel
             </p>
           </div>
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-2 p-4 border-t border-gray-200">
+        <div className="flex items-center justify-end gap-2 p-4 border-t border-gray-200 dark:border-gray-700">
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition"
+            className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition"
           >
             Cancel
           </button>

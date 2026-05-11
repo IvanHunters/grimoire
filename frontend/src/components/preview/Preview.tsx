@@ -28,7 +28,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
   if (!content) {
     return (
       <div ref={ref} className={`flex items-center justify-center ${className}`}>
-        <p className="text-gray-500">No content to preview</p>
+        <p className="text-gray-500 dark:text-gray-400">No content to preview</p>
       </div>
     )
   }
@@ -38,12 +38,14 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
     let text = content.replace(/^---\n[\s\S]*?\n---\n/, '')
 
     // Process wikilinks: convert [[link]] or [[link|alias]] to custom markdown
-    // [[target]] → [target](wikilink:target)
-    // [[target|alias]] → [alias](wikilink:target)
+    // [[target]] → [target](#wikilink:encoded-target)
+    // [[target|alias]] → [alias](#wikilink:encoded-target)
     text = text.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_match, target, alias) => {
       const displayText = alias?.trim() || target.trim()
       const targetPath = target.trim()
-      return `[${displayText}](wikilink:${targetPath})`
+      // URL-encode the target to handle spaces and special characters
+      const encodedTarget = encodeURIComponent(targetPath)
+      return `[${displayText}](#wikilink:${encodedTarget})`
     })
 
     return text
@@ -51,10 +53,14 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
   return (
     <div ref={ref} className={`h-full overflow-auto ${className}`}>
-      <div className="markdown-preview p-8 max-w-4xl mx-auto">
+      <div className="markdown-preview p-4 md:p-8 max-w-4xl mx-auto">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
           rehypePlugins={[rehypePrism]}
+          urlTransform={(url) => {
+            // Preserve wikilink: protocol (ReactMarkdown removes it by default)
+            return url
+          }}
           components={{
             // Custom heading renderers with ID generation
             h1: ({ node, children, ...props }) => {
@@ -90,9 +96,11 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
             // Custom link renderer - handles wikilinks and anchor links
             a: ({ node, href, children, ...props }) => {
-              // Check if this is a wikilink (wikilink: protocol)
-              if (href?.startsWith('wikilink:')) {
-                const target = href.replace('wikilink:', '')
+              // Check if this is a wikilink (#wikilink: format)
+              if (href?.startsWith('#wikilink:')) {
+                const encodedTarget = href.replace('#wikilink:', '')
+                // Decode URL-encoded target
+                const target = decodeURIComponent(encodedTarget)
                 return (
                   <WikilinkRenderer target={target}>
                     {children}
@@ -169,7 +177,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
               // Regular code block with copy button
               return (
-                <pre tabIndex={0} {...props}>
+                <pre tabIndex={0} {...props} data-language={language || undefined}>
                   {children}
                   {/* Copy button - показывается при hover */}
                   <button

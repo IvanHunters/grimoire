@@ -5,13 +5,12 @@ export interface Note {
   folder: string
   content: string
   type?: 'project' | 'regular'
-  project_path?: string
-  created_at: string
-  updated_at: string
+  projectPath?: string // Changed to camelCase to match backend JSON
   tags?: string[]
-  outgoing_links?: string[]
+  createdAt: string // Changed to camelCase
+  updatedAt: string // Changed to camelCase
+  outgoingLinks?: string[] // Changed to camelCase
   backlinks?: string[]
-  metadata?: Record<string, unknown>
 }
 
 export interface Frontmatter {
@@ -34,5 +33,9 @@ export interface CreateNoteRequest {
 }
 
 export interface UpdateNoteRequest {
-  content: string
+  title?: string
+  content?: string
+  type?: 'project' | 'regular'
+  projectPath?: string
+  tags?: string[]
 }

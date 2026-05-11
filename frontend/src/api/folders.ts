@@ -1,10 +1,10 @@
 import apiClient from './client'
-import type { Folder, CreateFolderRequest, MoveFolderRequest } from '../types/folder'
+import type { Folder, FolderNode, CreateFolderRequest, MoveFolderRequest } from '../types/folder'
 
 export const foldersAPI = {
   // Get folder tree structure
-  getFolders: async (): Promise<Folder[]> => {
-    const response = await apiClient.get<Folder[]>('/folders')
+  getFolders: async (): Promise<FolderNode> => {
+    const response = await apiClient.get<FolderNode>('/folders')
     return response.data
   },
 
@@ -24,5 +24,13 @@ export const foldersAPI = {
   // Move note or folder to different location
   moveFolder: async (data: MoveFolderRequest): Promise<void> => {
     await apiClient.put('/folders/move', data)
+  },
+
+  // Update folder metadata (projectPath)
+  updateFolder: async (path: string, projectPath: string): Promise<Folder> => {
+    const response = await apiClient.put<Folder>('/folders', { projectPath }, {
+      params: { path },
+    })
+    return response.data
   },
 }

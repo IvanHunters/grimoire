@@ -1,5 +1,7 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useNotes } from '../../contexts/NotesContext'
+import { resolveWikilinkTarget } from '../../utils/wikilinks'
 import WikilinkPopup from './WikilinkPopup'
 
 interface WikilinkRendererProps {
@@ -13,27 +15,36 @@ interface WikilinkRendererProps {
  * Shows hover popup with note preview
  */
 function WikilinkRenderer({ target, children }: WikilinkRendererProps) {
-  const { notes, setCurrentNote } = useNotes()
+  const { notes } = useNotes()
+  const navigate = useNavigate()
   const [showPopup, setShowPopup] = useState(false)
+  const hideTimerRef = useRef<number | null>(null)
 
-  // Find linked note by title or path
-  const linkedNote = notes.find(
-    (note) =>
-      note.title.toLowerCase() === target.toLowerCase() ||
-      note.path.toLowerCase() === target.toLowerCase() ||
-      note.path.toLowerCase().endsWith(`/${target.toLowerCase()}.md`)
-  )
+  // Find linked note using the same resolution logic as graph/other components
+  const linkedNoteId = resolveWikilinkTarget(target, notes)
+  const linkedNote = linkedNoteId ? notes.find(n => n.id === linkedNoteId) : null
 
-  // Debug logging
-  console.log('Wikilink target:', target)
-  console.log('Available notes:', notes.length)
-  console.log('Linked note found:', linkedNote ? linkedNote.title : 'NOT FOUND')
+  const cancelHide = () => {
+    if (hideTimerRef.current !== null) {
+      clearTimeout(hideTimerRef.current)
+      hideTimerRef.current = null
+    }
+  }
+
+  const scheduleHide = () => {
+    cancelHide()
+    hideTimerRef.current = window.setTimeout(() => {
+      setShowPopup(false)
+      hideTimerRef.current = null
+    }, 200)
+  }
 
   const handleClick = (e: React.MouseEvent) => {
     e.preventDefault()
-
+    cancelHide()
+    setShowPopup(false)
     if (linkedNote) {
-      setCurrentNote(linkedNote)
+      navigate(`/notes/${linkedNote.id}`)
     } else {
       console.warn(`Wikilink target not found: ${target}`)
     }
@@ -41,11 +52,12 @@ function WikilinkRenderer({ target, children }: WikilinkRendererProps) {
 
   const handleMouseEnter = () => {
     if (!linkedNote) return
+    cancelHide()
     setShowPopup(true)
   }
 
   const handleMouseLeave = () => {
-    setShowPopup(false)
+    scheduleHide()
   }
 
   // If note not found, render as broken link
@@ -79,6 +91,8 @@ function WikilinkRenderer({ target, children }: WikilinkRendererProps) {
         <WikilinkPopup
           note={linkedNote}
           onClose={() => setShowPopup(false)}
+          onMouseEnter={cancelHide}
+          onMouseLeave={scheduleHide}
         />
       )}
     </>

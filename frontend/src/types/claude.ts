@@ -16,6 +16,7 @@ export interface ClaudeSession {
   messages: Message[]
   isActive: boolean
   lastActivity: Date
+  initialized: boolean // Whether backend session is initialized
 }
 
 export type WSMessageType =
@@ -23,12 +24,26 @@ export type WSMessageType =
   | 'message'
   | 'stop'
   | 'switch_session'
+  | 'restart_session'
+  | 'close_session'
+  | 'session_started'
   | 'message_start'
   | 'content_delta'
   | 'tool_use'
   | 'message_complete'
   | 'error'
   | 'stopped'
+  | 'session_history'
+  | 'session_not_found'
+  | 'session_closed'
+  | 'chat_history'
+  | 'terminal_output'
+  // Real-time events from backend
+  | 'note_created'
+  | 'note_updated'
+  | 'note_deleted'
+  | 'folder_created'
+  | 'folder_deleted'
 
 export interface WSMessage {
   type: WSMessageType
@@ -38,11 +53,18 @@ export interface WSMessage {
   currentNote?: {
     name: string
     content: string
+    type?: string
     projectPath?: string
   }
   tool_name?: string
   tool_args?: string
   error?: string
+  messages?: Message[]
+  // Real-time event fields
+  note?: any // Note from backend
+  folder?: any // Folder from backend
+  noteId?: string
+  path?: string
 }
 
 export type ConnectionStatus = 'ready' | 'connecting' | 'generating' | 'error' | 'disconnected'
