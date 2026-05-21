@@ -1,24 +1,29 @@
 import { useState, useRef, useEffect } from 'react'
-import { Search, ChevronDown, Menu, X as XIcon, Kanban } from 'lucide-react'
+import { Search, ChevronDown, Menu, X as XIcon, Kanban, SquareTerminal } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useNotes } from '../../contexts/NotesContext'
 import NewNoteModal from '../modals/NewNoteModal'
 import SearchModal from '../modals/SearchModal'
+import ImportDBModal from '../modals/ImportDBModal'
+import GlobalTerminalPanel from '../chat/GlobalTerminalPanel'
 import { exportToPDF, exportToWord, exportAllNotesToZip, exportToHTML } from '../../utils/export'
 
 interface HeaderProps {
   onNoteSelect?: (note: any) => void
   previewRef?: React.RefObject<HTMLDivElement | null>
   onToggleMobileSidebar?: () => void
+  onCloseMobileSidebar?: () => void
   mobileSidebarOpen?: boolean
 }
 
-function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, mobileSidebarOpen }: HeaderProps) {
+function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, onCloseMobileSidebar, mobileSidebarOpen }: HeaderProps) {
   const { folders, createNote, notes, currentNote } = useNotes()
   const navigate = useNavigate()
   const [showNewNoteModal, setShowNewNoteModal] = useState(false)
   const [showSearchModal, setShowSearchModal] = useState(false)
   const [showExportMenu, setShowExportMenu] = useState(false)
+  const [showImportDB, setShowImportDB] = useState(false)
+  const [globalTerminalOpen, setGlobalTerminalOpen] = useState(false)
   const exportMenuRef = useRef<HTMLDivElement>(null)
 
   const handleNewNote = () => setShowNewNoteModal(true)
@@ -80,6 +85,16 @@ function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, mobileSidebar
     }
   }
 
+  const handleExportDB = () => {
+    const link = document.createElement('a')
+    link.href = '/api/export/db'
+    link.download = `markdown-backup-${new Date().toISOString().slice(0, 10)}.zip`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    setShowExportMenu(false)
+  }
+
   const exportMarkdown = () => {
     if (!currentNote) return
     const filename = `${currentNote.title.replace(/[^a-z0-9]/gi, '-').toLowerCase()}.md`
@@ -139,6 +154,15 @@ function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, mobileSidebar
 
         {/* Right: Actions */}
         <div className="flex items-center gap-1">
+          {/* Quick terminal */}
+          <button
+            onClick={() => setGlobalTerminalOpen(v => !v)}
+            className={`p-2 rounded transition-colors ${globalTerminalOpen ? 'text-cyan-400 bg-cyan-500/10' : 'text-slate-600 hover:text-cyan-400 hover:bg-white/5'}`}
+            title="Quick Terminal (Claude)"
+          >
+            <SquareTerminal className="w-4 h-4" />
+          </button>
+
           {/* Tasks */}
           <button
             onClick={() => navigate('/tasks')}
@@ -215,6 +239,18 @@ function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, mobileSidebar
                     <span className="text-slate-700 w-4 text-center font-mono text-[10px]">zip</span>
                     <span>All notes as ZIP</span>
                   </button>
+                  <div className="my-1 border-t border-white/[0.05]" />
+                  <div className="px-3 py-1.5">
+                    <span className="text-[9px] font-mono font-semibold tracking-widest text-slate-700 uppercase">Database</span>
+                  </div>
+                  <button onClick={handleExportDB} className={menuItemCls}>
+                    <span className="text-slate-700 w-4 text-center font-mono text-[10px]">db</span>
+                    <span>DB Backup (notes + files)</span>
+                  </button>
+                  <button onClick={() => { setShowExportMenu(false); setShowImportDB(true) }} className={menuItemCls}>
+                    <span className="text-slate-700 w-4 text-center font-mono text-[10px]">↑</span>
+                    <span>Restore from backup</span>
+                  </button>
                 </div>
               </div>
             )}
@@ -233,6 +269,16 @@ function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, mobileSidebar
         visible={showSearchModal}
         onClose={() => setShowSearchModal(false)}
         onNoteSelect={handleSearchNoteSelect}
+      />
+      <ImportDBModal
+        visible={showImportDB}
+        onClose={() => setShowImportDB(false)}
+        onImported={() => window.location.reload()}
+      />
+      <GlobalTerminalPanel
+        visible={globalTerminalOpen}
+        onClose={() => setGlobalTerminalOpen(false)}
+        onMobileSidebarClose={onCloseMobileSidebar}
       />
     </>
   )

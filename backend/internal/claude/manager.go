@@ -65,14 +65,6 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 		if session.DangerousMode == dangerousMode {
 			session.UpdateActivity()
 			go func() {
-				if sessionName != "" && session.Name != sessionName {
-					m.mu.Lock()
-					session.Name = sessionName
-					m.mu.Unlock()
-					if m.storage != nil {
-						m.storage.UpdateSessionName(ctx, sessionID, sessionName)
-					}
-				}
 				if m.storage != nil {
 					m.storage.UpdateSessionActivity(ctx, sessionID)
 				}
@@ -371,4 +363,13 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	})
 
 	return sessions
+}
+
+// RenameSession updates the display name of an in-memory session
+func (m *SessionManager) RenameSession(sessionID string, name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if session, ok := m.sessions[sessionID]; ok {
+		session.Name = name
+	}
 }

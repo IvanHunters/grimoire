@@ -10,50 +10,48 @@ interface ChatPanelProps {
   onClose: () => void
   noteId: string
   taskContext?: TaskContextPayload | null
+  onCloseMobileSidebar?: () => void
 }
 
-function ChatPanel({ visible, onClose, noteId, taskContext }: ChatPanelProps) {
+function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar }: ChatPanelProps) {
   const { currentNote } = useNotes()
   const [sessionKey, setSessionKey] = useState(0)
   const [showKeyboard, setShowKeyboard] = useState(() => localStorage.getItem('terminal.showKeyboard') !== 'false')
+  const [sessionName, setSessionName] = useState<string>('')
   const terminalRef = useRef<TerminalChatHandle>(null)
 
   const sessionId = `note-${noteId}`
+
+  useEffect(() => {
+    let cancelled = false
+    sessionsAPI.listActiveSessions().then(sessions => {
+      if (cancelled) return
+      const s = sessions.find(s => s.id === sessionId)
+      setSessionName(s?.name ?? '')
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [sessionId])
   const [keyboardOffset, setKeyboardOffset] = useState(0)
 
   useEffect(() => {
     const vv = window.visualViewport
     if (!vv) return
-    let timer: number
-    let lastOffset = 0
     const update = () => {
       const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
-      if (kb > lastOffset) {
-        // Keyboard opening — react immediately, no animation
-        clearTimeout(timer)
-        lastOffset = kb
-        setKeyboardOffset(kb)
-      } else {
-        // Keyboard closing — debounce to avoid tracking the slide-down animation
-        clearTimeout(timer)
-        timer = window.setTimeout(() => {
-          lastOffset = kb
-          setKeyboardOffset(kb)
-        }, 320)
-      }
+      setKeyboardOffset(kb)
     }
     vv.addEventListener('resize', update)
     vv.addEventListener('scroll', update)
     return () => {
       vv.removeEventListener('resize', update)
       vv.removeEventListener('scroll', update)
-      clearTimeout(timer)
     }
   }, [])
 
-  // Refit + scroll terminal to bottom after keyboard changes panel height
+  // Refit after panel height settles following keyboard change
   useEffect(() => {
-    terminalRef.current?.refit()
+    const t = setTimeout(() => terminalRef.current?.refit(), 80)
+    return () => clearTimeout(t)
   }, [keyboardOffset])
 
   // Refit after panel opens so xterm accounts for the keyboard bar height
@@ -80,12 +78,14 @@ function ChatPanel({ visible, onClose, noteId, taskContext }: ChatPanelProps) {
     terminalRef.current?.sendKey(data)
   }, [])
 
-  if (!visible) return null
+  const blurTerminal = useCallback(() => {
+    terminalRef.current?.blur()
+  }, [])
 
   return (
     <div
       className="fixed right-0 flex flex-col z-20 top-14 w-full md:w-[680px] terminal-panel"
-      style={{ bottom: `${keyboardOffset}px` }}
+      style={{ bottom: `${keyboardOffset}px`, display: visible ? undefined : 'none' }}
     >
 
       {/* Scanline texture — visual atmosphere only */}
@@ -150,10 +150,12 @@ function ChatPanel({ visible, onClose, noteId, taskContext }: ChatPanelProps) {
       <div className="flex-1 min-h-0 relative z-10 flex flex-col">
         <TerminalChat
           ref={terminalRef}
-          key={sessionKey}
+          key={`${sessionId}-${sessionKey}`}
           sessionId={sessionId}
+          sessionName={sessionName}
           dangerousMode={true}
           taskContext={taskContext}
+          onFocus={onCloseMobileSidebar}
         />
       </div>
 
@@ -181,6 +183,7 @@ function ChatPanel({ visible, onClose, noteId, taskContext }: ChatPanelProps) {
           <TermKey variant="nav"   label="→"    onPress={() => sendKey('\x1b[C')} />
           <TermKey variant="default" label="Tab" onPress={() => sendKey('\t')}    />
           <TermKey variant="enter"  label="↵"   onPress={() => sendKey('\r')}    />
+          <TermKey variant="nav"    label="done" onPress={blurTerminal}           />
         </div>
       </div>}
     </div>

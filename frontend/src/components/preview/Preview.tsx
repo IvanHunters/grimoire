@@ -56,7 +56,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
       <div className="markdown-preview p-4 md:p-8 max-w-4xl mx-auto">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
-          rehypePlugins={[rehypePrism]}
+          rehypePlugins={[[rehypePrism, { ignoreMissing: true, showLineNumbers: true }]]}
           urlTransform={(url) => {
             // Preserve wikilink: protocol (ReactMarkdown removes it by default)
             return url

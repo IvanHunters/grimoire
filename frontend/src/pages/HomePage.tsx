@@ -36,6 +36,7 @@ function HomePage() {
   const [showGraphView, setShowGraphView] = useState(false)
   const [showChatPanel, setShowChatPanel] = useState(false)
   const [chatNoteId, setChatNoteId] = useState<string | null>(null)
+  const [mountedChatNoteIds, setMountedChatNoteIds] = useState<string[]>([])
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [mobilePanel, setMobilePanel] = useState<'editor' | 'preview'>('editor')
   const containerRef = useRef<HTMLDivElement>(null)
@@ -238,27 +239,28 @@ function HomePage() {
     // setCurrentNote will be called by useEffect watching noteId
   }
 
+  const openChat = useCallback((noteId: string) => {
+    setChatNoteId(noteId)
+    setShowChatPanel(true)
+    setMountedChatNoteIds(prev => prev.includes(noteId) ? prev : [...prev, noteId])
+  }, [])
+
   const handleOpenChatWithNote = (noteId: string) => {
-    // Try to open the note if it exists
     const note = notes.find(n => n.id === noteId)
     if (note) {
       navigate(`/notes/${note.id}`)
     }
-
-    // Always open chat panel, even if note doesn't exist (orphaned session)
-    setTimeout(() => {
-      setChatNoteId(noteId)
-      setShowChatPanel(true)
-    }, 100)
+    openChat(noteId)
+    setMobileSidebarOpen(false)
   }
 
   // Handle session deletion - close chat panel if deleted session is currently open
   const handleSessionDeleted = (deletedSessionId: string) => {
-    // Check if the deleted session matches the currently open session
+    const deletedNoteId = deletedSessionId.startsWith('note-') ? deletedSessionId.slice(5) : deletedSessionId
+    setMountedChatNoteIds(prev => prev.filter(id => id !== deletedNoteId))
     if (showChatPanel && chatNoteId) {
       const currentSessionId = `note-${chatNoteId}`
       if (currentSessionId === deletedSessionId) {
-        // Close the chat panel since the session was deleted
         setShowChatPanel(false)
         setChatNoteId(null)
       }
@@ -328,6 +330,7 @@ function HomePage() {
         onNoteSelect={handleNoteSelect}
         previewRef={previewRef}
         onToggleMobileSidebar={() => setMobileSidebarOpen(p => !p)}
+        onCloseMobileSidebar={() => setMobileSidebarOpen(false)}
         mobileSidebarOpen={mobileSidebarOpen}
       />
 
@@ -384,11 +387,8 @@ function HomePage() {
                 onToggleGraph={() => setShowGraphView(true)}
                 onToggleChat={() => {
                   if (!showChatPanel) {
-                    // Opening chat - set note ID
-                    setChatNoteId(currentNote.id)
-                    setShowChatPanel(true)
+                    openChat(currentNote.id)
                   } else {
-                    // Closing chat - clear note ID
                     setShowChatPanel(false)
                     setChatNoteId(null)
                   }
@@ -474,17 +474,19 @@ function HomePage() {
         onClose={() => setShowGraphView(false)}
       />
 
-      {/* Claude Chat Panel */}
-      {chatNoteId && (
+      {/* Claude Chat Panel — all visited sessions stay mounted to preserve terminal state */}
+      {mountedChatNoteIds.map(nId => (
         <ChatPanel
-          visible={showChatPanel}
+          key={nId}
+          visible={showChatPanel && chatNoteId === nId}
           onClose={() => {
             setShowChatPanel(false)
             setChatNoteId(null)
           }}
-          noteId={chatNoteId}
+          noteId={nId}
+          onCloseMobileSidebar={() => setMobileSidebarOpen(false)}
         />
-      )}
+      ))}
     </div>
   )
 }

@@ -103,6 +103,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	schedCtx, schedCancel := context.WithCancel(context.Background())
 	go sched.Start(schedCtx)
 
+
 	// Setup HTTP server
 	handler := api.NewHandler(cfg, db, manager, logger)
 	handler.SetTaskRunner(sched)
@@ -115,7 +116,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// WebSocket upgrade (http.Hijack) breaks if ResponseWriter is wrapped by compress.
 
 	// Create MCP server
-	mcpServer := CreateMCPServer(store, logger, cfg)
+	mcpServer := CreateMCPServer(store, sessionStorage, logger, cfg)
 	mcpHTTPServer := server.NewStreamableHTTPServer(mcpServer)
 
 	// Routes
@@ -140,8 +141,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Get("/tags", handler.GetAllTags)
 		r.Post("/upload", handler.Upload)
 
+		r.Get("/export/db", handler.ExportDB)
+		r.Post("/import/db", handler.ImportDB)
+
 		r.Get("/sessions", handler.ListSessions)
+		r.Get("/sessions/stats", handler.SessionStats)
+		r.Get("/sessions/all", handler.ListAllSessions)
+		r.Post("/sessions/rotate", handler.RotateSessions)
 		r.Delete("/sessions/{id}", handler.DeleteSession)
+		r.Put("/sessions/{id}/name", handler.RenameSession)
+		r.Delete("/sessions/{id}/history", handler.ClearSessionHistory)
 
 		// Projects
 		r.Get("/projects", handler.ListProjects)
@@ -173,9 +182,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// WebSocket endpoint (on same port as HTTP API, no separate server needed)
 	httpRouter.HandleFunc("/claude-chat", wsHandler.HandleWebSocket)
 
-	// MCP endpoint (outside /api for simplicity)
+	// MCP endpoint — injects session_id query param into context so tools can self-identify.
+	// Subprocess Claude is configured to call /mcp?session_id=<id>.
 	httpRouter.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		logger.Info("mcp http request", slog.String("method", r.Method), slog.String("path", r.URL.Path))
+		if sid := r.URL.Query().Get("session_id"); sid != "" {
+			r = r.WithContext(context.WithValue(r.Context(), sessionIDKey{}, sid))
+		}
 		mcpHTTPServer.ServeHTTP(w, r)
 	})
 

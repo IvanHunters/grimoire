@@ -300,8 +300,8 @@ mark {
   margin-bottom: 0.25em;
 }
 
-/* Inline code */
-.markdown-preview code:not([class*="language-"]) {
+/* Inline code — only backtick spans NOT inside a pre block */
+.markdown-preview :not(pre) > code:not([class*="language-"]) {
   background-color: rgba(6,182,212,0.08);
   border: 1px solid rgba(6,182,212,0.15);
   padding: 0.15em 0.45em;
@@ -311,24 +311,48 @@ mark {
   color: #67e8f9;
 }
 
-.dark .markdown-preview code:not([class*="language-"]) {
+.dark .markdown-preview :not(pre) > code:not([class*="language-"]) {
   background-color: rgba(6,182,212,0.08);
   border: 1px solid rgba(6,182,212,0.15);
   color: #67e8f9;
 }
 
-/* Code blocks with Prism */
-.markdown-preview pre[class*="language-"] {
+/* Code blocks — applies to all fenced blocks, with or without language */
+.markdown-preview pre {
   border-radius: 8px;
   position: relative;
   margin: 1.5em 0;
-  background-color: #272822 !important; /* Okaidia dark background */
+  background-color: #272822 !important;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  overflow-x: auto;
 }
 
 .markdown-preview pre code {
-  background-color: transparent;
-  padding: 0;
+  background-color: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  color: #f8f8f2;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.875em;
+}
+
+/* Line numbers via ::before on each line span */
+.markdown-preview .code-line {
+  display: block;
+  line-height: 1.6;
+}
+
+.markdown-preview .code-line.line-number::before {
+  content: attr(line);
+  display: inline-block;
+  min-width: 2em;
+  padding-right: 0.75em;
+  margin-right: 0.75em;
+  text-align: right;
+  color: #75715e;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  user-select: none;
+  font-size: 0.85em;
 }
 
 /* Language label */

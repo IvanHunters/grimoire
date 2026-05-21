@@ -52,7 +52,7 @@ func startPTYReader(session *ClaudeSession, logger *slog.Logger) {
 // startClaudeSubprocess starts a new Claude subprocess using PTY
 func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger, systemPrompt string) (*ClaudeSession, error) {
 	// Setup MCP configuration automatically
-	mcpConfigPath, err := setupMCPConfig(workingDir, mongoURI, mongoDatabase, logger)
+	mcpConfigPath, err := setupMCPConfig(sessionID, workingDir, mongoURI, mongoDatabase, logger)
 	if err != nil {
 		logger.Warn("failed to setup MCP config, continuing without it", slog.Any("error", err))
 	}
@@ -86,6 +86,8 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 	// Ensure UTF-8 encoding for proper display of non-ASCII characters
 	filteredEnv = append(filteredEnv, "LANG=en_US.UTF-8")
 	filteredEnv = append(filteredEnv, "LC_ALL=en_US.UTF-8")
+	// Inject session ID so MCP tools can self-identify
+	filteredEnv = append(filteredEnv, "GRIMOIRE_SESSION_ID="+sessionID)
 
 	if mcpConfigPath != "" {
 		// Claude CLI will read MCP config from .claude directory in working dir
@@ -194,52 +196,43 @@ func shutdownSession(session *ClaudeSession, logger *slog.Logger) error {
 
 // SetupMCPConfig creates MCP configuration for Claude CLI in the given working directory.
 func SetupMCPConfig(workingDir string, mongoURI string, mongoDatabase string) (string, error) {
-	return setupMCPConfig(workingDir, mongoURI, mongoDatabase, slog.Default())
+	return setupMCPConfig("", workingDir, mongoURI, mongoDatabase, slog.Default())
 }
 
-// setupMCPConfig creates MCP configuration for Claude CLI
-func setupMCPConfig(workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger) (string, error) { //nolint:unparam // logger may be used for debugging
-	// Get absolute path to markdown-editor binary
-	execPath, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("failed to get executable path: %w", err)
-	}
-	execDir := filepath.Dir(execPath)
-	mcpBinary := filepath.Join(execDir, "markdown-editor")
-
-	// Verify MCP binary exists
-	if _, err := os.Stat(mcpBinary); os.IsNotExist(err) {
-		return "", fmt.Errorf("mcp binary not found at %s", mcpBinary)
-	}
-
+// setupMCPConfig writes an HTTP MCP config for the subprocess so it calls the backend
+// at /mcp?session_id=<id>. The backend injects the session ID into the request context,
+// making all session-aware MCP tools work without relying on env var inheritance.
+func setupMCPConfig(sessionID string, workingDir string, mongoURI string, mongoDatabase string, logger *slog.Logger) (string, error) { //nolint:unparam // logger may be used for debugging
 	// Create .claude directory in working dir
 	claudeDir := filepath.Join(workingDir, ".claude")
 	if err := os.MkdirAll(claudeDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create .claude directory: %w", err)
 	}
 
-	// Create MCP config
-	mcpConfig := map[string]any{
+	mcpURL := "http://localhost:8080/mcp"
+	if sessionID != "" {
+		mcpURL += "?session_id=" + sessionID
+	}
+
+	// Claude Code reads project-level MCP config from .claude/settings.json under "mcpServers".
+	// Read existing settings first so we don't clobber other keys.
+	configPath := filepath.Join(claudeDir, "settings.json")
+	existing := map[string]any{}
+	if data, err := os.ReadFile(configPath); err == nil {
+		_ = json.Unmarshal(data, &existing)
+	}
+
+	existing["mcpServers"] = map[string]any{
 		"markdown-editor": map[string]any{
-			"command": mcpBinary,
-			"args":    []string{"mcp"},
-			"env": map[string]string{
-				"MONGODB_URI":      mongoURI,
-				"MONGODB_DATABASE": mongoDatabase,
-			},
+			"url": mcpURL,
 		},
 	}
 
-	configPath := filepath.Join(claudeDir, "mcp_servers.json")
-	configFile, err := os.Create(configPath)
+	data, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("failed to create mcp config file: %w", err)
+		return "", fmt.Errorf("failed to marshal mcp config: %w", err)
 	}
-	defer configFile.Close()
-
-	encoder := json.NewEncoder(configFile)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(mcpConfig); err != nil {
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
 		return "", fmt.Errorf("failed to write mcp config: %w", err)
 	}
 

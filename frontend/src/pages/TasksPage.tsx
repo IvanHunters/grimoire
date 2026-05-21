@@ -217,7 +217,7 @@ export default function TasksPage() {
   const navigate = useNavigate()
   const { taskId: taskIdParam } = useParams<{ taskId: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
-  const { folderTree } = useNotes()
+  const { folderTree, notes } = useNotes()
 
   const [columns, setColumns] = useState<KanbanColumn[]>(DEFAULT_COLUMNS)
   const [tasks, setTasks] = useState<Task[]>([])
@@ -823,8 +823,11 @@ export default function TasksPage() {
                     const taskId = session.id.startsWith('note-task-') ? session.id.slice('note-task-'.length) : null
                     const linkedTask = taskId ? tasks.find(t => t.id === taskId) : null
                     const cachedTitle = taskId ? taskTitleCache.current[taskId] : undefined
+                    const noteId = !taskId && session.id.startsWith('note-') ? session.id.slice('note-'.length) : null
+                    const linkedNote = noteId ? (notes || []).find(n => n.id === noteId) : null
                     const label = linkedTask?.title
                       ?? cachedTitle
+                      ?? linkedNote?.title
                       ?? (session.name && session.name !== 'Terminal Session' ? session.name : null)
                       ?? (taskId ? `task:${taskId.slice(0, 8)}` : session.id.slice(0, 12))
                     return (

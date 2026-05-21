@@ -10,6 +10,7 @@ import (
 type Storage interface {
 	// Notes
 	ListNotes(ctx context.Context, folder string) ([]*models.Note, error)
+	ListNotesMeta(ctx context.Context, folder string, recursive bool) ([]*models.Note, error)
 	GetNote(ctx context.Context, id string) (*models.Note, error)
 	GetNoteByPath(ctx context.Context, path string) (*models.Note, error)
 	CreateNote(ctx context.Context, note *models.Note) error

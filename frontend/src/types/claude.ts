@@ -15,7 +15,8 @@ export interface ClaudeSession {
   dangerousMode: boolean
   messages: Message[]
   isActive: boolean
-  lastActivity: Date
+  lastActivity: string
+  createdAt: string
   initialized: boolean // Whether backend session is initialized
 }
 

@@ -8,18 +8,21 @@ import { useNotes } from '../../contexts/NotesContext'
 
 interface TerminalChatProps {
   sessionId: string
+  sessionName?: string
   dangerousMode?: boolean
   taskContext?: TaskContextPayload | null
+  onFocus?: () => void
 }
 
 export interface TerminalChatHandle {
   restart: () => void
   sendKey: (data: string) => void
   refit: () => void
+  blur: () => void
 }
 
 export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
-  ({ sessionId, dangerousMode = true, taskContext }, ref) => {
+  ({ sessionId, sessionName, dangerousMode = true, taskContext, onFocus }, ref) => {
   const { currentNote } = useNotes()
   const terminalRef = useRef<HTMLDivElement>(null)
   const xtermRef = useRef<Terminal | null>(null)
@@ -83,18 +86,25 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     },
     refit: () => {
       if (!fitAddonRef.current || !xtermRef.current) return
-      try { fitAddonRef.current.fit() } catch {}
       const term = xtermRef.current
+      const fit = fitAddonRef.current
       const vp = terminalRef.current?.querySelector('.xterm-viewport') as HTMLElement | null
       const scrollToEnd = () => {
         term?.scrollToBottom()
         if (vp) vp.scrollTop = vp.scrollHeight
       }
+      try { fit.fit() } catch {}
       requestAnimationFrame(() => {
+        try { fit.fit() } catch {}
         scrollToEnd()
-        setTimeout(scrollToEnd, 80)
-        setTimeout(scrollToEnd, 200)
+        setTimeout(() => {
+          try { fit.fit() } catch {}
+          scrollToEnd()
+        }, 80)
       })
+    },
+    blur: () => {
+      xtermRef.current?.blur()
     },
   }), [sendRestart])
 
@@ -192,6 +202,7 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
 
       resizeTimeoutRef.current = window.setTimeout(() => {
         if (!fitAddonRef.current || !xtermRef.current) return
+        if (!terminalRef.current?.offsetHeight) return
 
         isResizingRef.current = true
         try {
@@ -270,8 +281,16 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
         className="flex-shrink-0 px-4 py-2 flex items-center gap-3"
         style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
       >
-        <span className="text-[10px] font-mono text-slate-700">
-          Session: {sessionId.slice(0, 8)}...
+        <span className="text-[10px] font-mono text-slate-700 truncate max-w-[220px]" title={sessionId}>
+          {sessionName
+            ? sessionName
+            : sessionId.startsWith('global-')
+            ? `global ···${sessionId.slice(-6)}`
+            : sessionId.startsWith('note-task-')
+            ? `task ···${sessionId.slice(-6)}`
+            : sessionId.startsWith('note-')
+            ? `note ···${sessionId.slice(-6)}`
+            : `···${sessionId.slice(-6)}`}
         </span>
         {dangerousMode && (
           <span className="text-[10px] font-mono text-yellow-600/80 tracking-wide">
@@ -279,7 +298,7 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
           </span>
         )}
       </div>
-      <div ref={terminalRef} className="flex-1 min-h-0 overflow-hidden p-2" />
+      <div ref={terminalRef} className="flex-1 min-h-0 overflow-hidden p-2" onPointerDown={() => onFocus?.()} />
     </div>
   )
 })

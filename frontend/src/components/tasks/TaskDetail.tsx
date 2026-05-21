@@ -401,7 +401,6 @@ export function TaskDetail({ task, allTasks, columns, onClose, onUpdated, onDele
   const [runningNow, setRunningNow] = useState(false)
 
   const titleRef = useRef<HTMLInputElement>(null)
-  const dateInputRef = useRef<HTMLInputElement>(null)
   const tagInputRef = useRef<HTMLInputElement>(null)
   const statusMenuRef = useRef<HTMLDivElement>(null)
   const priorityMenuRef = useRef<HTMLDivElement>(null)
@@ -689,7 +688,6 @@ export function TaskDetail({ task, allTasks, columns, onClose, onUpdated, onDele
           {/* Due date */}
           <div className="relative">
             <button
-              onClick={() => dateInputRef.current?.click()}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-mono transition-all"
               style={{
                 background: isOverdue ? 'rgba(239,68,68,0.1)' : 'rgba(255,255,255,0.04)',
@@ -705,11 +703,10 @@ export function TaskDetail({ task, allTasks, columns, onClose, onUpdated, onDele
                 : 'Due date'}
             </button>
             <input
-              ref={dateInputRef}
               type="date"
               value={task.dueDate ? task.dueDate.split('T')[0] : ''}
-              onChange={e => e.target.value ? update({ dueDate: e.target.value }) : update({ clearDueDate: true })}
-              className="absolute opacity-0 w-0 h-0 pointer-events-none"
+              onChange={e => e.target.value ? update({ dueDate: e.target.value + 'T00:00:00Z' }) : update({ clearDueDate: true })}
+              className="absolute inset-0 opacity-0 cursor-pointer"
               tabIndex={-1}
             />
           </div>

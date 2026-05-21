@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
@@ -139,7 +140,7 @@ func (s *SessionStorage) UpdateSessionActivity(ctx context.Context, sessionID st
 func (s *SessionStorage) UpdateSessionName(ctx context.Context, sessionID string, name string) error {
 	collection := s.db.Collection(sessionsCollection)
 
-	_, err := collection.UpdateOne(
+	res, err := collection.UpdateOne(
 		ctx,
 		bson.M{"_id": sessionID},
 		bson.M{
@@ -149,8 +150,38 @@ func (s *SessionStorage) UpdateSessionName(ctx context.Context, sessionID string
 			},
 		},
 	)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("session not found in database: %s", sessionID)
+	}
 
-	return err
+	return nil
+}
+
+// UpdateSessionNotes sets the notes field for a session (full overwrite).
+func (s *SessionStorage) UpdateSessionNotes(ctx context.Context, sessionID string, notes string) error {
+	collection := s.db.Collection(sessionsCollection)
+
+	res, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": sessionID},
+		bson.M{
+			"$set": bson.M{
+				"notes":      notes,
+				"updated_at": time.Now(),
+			},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("session not found in database: %s", sessionID)
+	}
+
+	return nil
 }
 
 // UpdateSessionMessages updates session messages
@@ -172,12 +203,136 @@ func (s *SessionStorage) UpdateSessionMessages(ctx context.Context, sessionID st
 	return err
 }
 
+// AppendSessionMessage atomically pushes a single message to the session messages array.
+func (s *SessionStorage) AppendSessionMessage(ctx context.Context, sessionID string, msg models.ClaudeMessage) error {
+	collection := s.db.Collection(sessionsCollection)
+
+	res, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": sessionID},
+		bson.M{
+			"$push": bson.M{"messages": msg},
+			"$set":  bson.M{"last_activity": time.Now(), "updated_at": time.Now()},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("session not found in database: %s (it may exist only in memory)", sessionID)
+	}
+
+	return nil
+}
+
 // DeleteSession removes a session from MongoDB
 func (s *SessionStorage) DeleteSession(ctx context.Context, sessionID string) error {
 	collection := s.db.Collection(sessionsCollection)
 
 	_, err := collection.DeleteOne(ctx, bson.M{"_id": sessionID})
 	return err
+}
+
+// ClearSessionMessages removes all messages from a session
+func (s *SessionStorage) ClearSessionMessages(ctx context.Context, sessionID string) error {
+	collection := s.db.Collection(sessionsCollection)
+
+	_, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": sessionID},
+		bson.M{"$set": bson.M{
+			"messages":   []interface{}{},
+			"updated_at": time.Now(),
+		}},
+	)
+	return err
+}
+
+// RotateOldSessions clears messages and marks inactive for sessions idle longer than inactiveDuration.
+// Returns the number of sessions rotated.
+func (s *SessionStorage) RotateOldSessions(ctx context.Context, inactiveDuration time.Duration) (int, error) {
+	collection := s.db.Collection(sessionsCollection)
+
+	threshold := time.Now().Add(-inactiveDuration)
+
+	result, err := collection.UpdateMany(
+		ctx,
+		bson.M{"last_activity": bson.M{"$lt": threshold}},
+		bson.M{"$set": bson.M{
+			"messages":   []interface{}{},
+			"status":     "inactive",
+			"updated_at": time.Now(),
+		}},
+	)
+	if err != nil {
+		return 0, err
+	}
+	return int(result.ModifiedCount), nil
+}
+
+// SearchSessionMessages finds sessions that contain messages matching query (case-insensitive).
+// Returns sessions sorted by last_activity descending (without full message bodies).
+func (s *SessionStorage) SearchSessionMessages(ctx context.Context, query string, limit int) ([]*models.ClaudeSession, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	collection := s.db.Collection(sessionsCollection)
+
+	filter := bson.M{
+		"messages": bson.M{
+			"$elemMatch": bson.M{
+				"content": bson.M{"$regex": query, "$options": "i"},
+			},
+		},
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "last_activity", Value: -1}}).
+		SetLimit(int64(limit)).
+		SetProjection(bson.M{"messages": 0})
+
+	cursor, err := collection.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var sessions []*models.ClaudeSession
+	if err := cursor.All(ctx, &sessions); err != nil {
+		return nil, err
+	}
+	return sessions, nil
+}
+
+// SearchSessionMessagesWithContent finds sessions matching query and returns them with full message bodies.
+// Used for context-aware search (showing surrounding messages around each match).
+func (s *SessionStorage) SearchSessionMessagesWithContent(ctx context.Context, query string, limit int) ([]*models.ClaudeSession, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	collection := s.db.Collection(sessionsCollection)
+
+	filter := bson.M{
+		"messages": bson.M{
+			"$elemMatch": bson.M{
+				"content": bson.M{"$regex": query, "$options": "i"},
+			},
+		},
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "last_activity", Value: -1}}).
+		SetLimit(int64(limit))
+
+	cursor, err := collection.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var sessions []*models.ClaudeSession
+	if err := cursor.All(ctx, &sessions); err != nil {
+		return nil, err
+	}
+	return sessions, nil
 }
 
 // CleanupInactiveSessions marks sessions as inactive if they haven't been active for the specified duration
@@ -205,6 +360,108 @@ func (s *SessionStorage) CleanupInactiveSessions(ctx context.Context, inactiveDu
 	}
 
 	return int(result.ModifiedCount), nil
+}
+
+// GetSessionsStats returns aggregate statistics for the sessions collection.
+func (s *SessionStorage) GetSessionsStats(ctx context.Context) (*models.SessionStats, error) {
+	collection := s.db.Collection(sessionsCollection)
+
+	pipeline := []bson.M{
+		{
+			"$project": bson.M{
+				"status": 1,
+				"message_count": bson.M{"$size": bson.M{"$ifNull": []interface{}{"$messages", []interface{}{}}}},
+				"content_bytes": bson.M{
+					"$sum": bson.M{
+						"$map": bson.M{
+							"input": bson.M{"$ifNull": []interface{}{"$messages", []interface{}{}}},
+							"as":    "m",
+							"in":    bson.M{"$strLenBytes": "$$m.content"},
+						},
+					},
+				},
+			},
+		},
+		{
+			"$group": bson.M{
+				"_id":            nil,
+				"total_sessions": bson.M{"$sum": 1},
+				"active_sessions": bson.M{"$sum": bson.M{"$cond": bson.M{
+					"if":   bson.M{"$eq": []interface{}{"$status", "active"}},
+					"then": 1,
+					"else": 0,
+				}}},
+				"total_messages": bson.M{"$sum": "$message_count"},
+				"total_bytes":    bson.M{"$sum": "$content_bytes"},
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var raw []struct {
+		TotalSessions  int `bson:"total_sessions"`
+		ActiveSessions int `bson:"active_sessions"`
+		TotalMessages  int `bson:"total_messages"`
+		TotalBytes     int `bson:"total_bytes"`
+	}
+	if err := cursor.All(ctx, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return &models.SessionStats{}, nil
+	}
+	r := raw[0]
+	return &models.SessionStats{
+		TotalSessions:  r.TotalSessions,
+		ActiveSessions: r.ActiveSessions,
+		TotalMessages:  r.TotalMessages,
+		TotalSizeMB:    float64(r.TotalBytes) / 1024 / 1024,
+	}, nil
+}
+
+// ListSessionsMeta returns sessions without message bodies, including per-session message count and size.
+func (s *SessionStorage) ListSessionsMeta(ctx context.Context, limit int) ([]*models.SessionMeta, error) {
+	collection := s.db.Collection(sessionsCollection)
+
+	pipeline := []bson.M{
+		{
+			"$project": bson.M{
+				"name": 1, "status": 1, "working_dir": 1,
+				"last_activity": 1, "created_at": 1,
+				"message_count": bson.M{"$size": bson.M{"$ifNull": []interface{}{"$messages", []interface{}{}}}},
+				"size_bytes": bson.M{
+					"$sum": bson.M{
+						"$map": bson.M{
+							"input": bson.M{"$ifNull": []interface{}{"$messages", []interface{}{}}},
+							"as":    "m",
+							"in":    bson.M{"$strLenBytes": "$$m.content"},
+						},
+					},
+				},
+			},
+		},
+		{"$sort": bson.D{{Key: "last_activity", Value: -1}}},
+	}
+	if limit > 0 {
+		pipeline = append(pipeline, bson.M{"$limit": limit})
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var sessions []*models.SessionMeta
+	if err := cursor.All(ctx, &sessions); err != nil {
+		return nil, err
+	}
+	return sessions, nil
 }
 
 // CreateSessionsIndexes creates indexes for sessions collection

@@ -1,11 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { ChevronLeft, ChevronRight, Folder, FileText, Terminal, ChevronDown, ChevronUp } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Folder, FileText, Terminal, ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
 import { useNotes } from '../../contexts/NotesContext'
 import type { FolderNode } from '../../types/folder'
 import type { ClaudeSession } from '../../types/claude'
 import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
 import { SwipeableItem } from '../common/SwipeableItem'
 import NewNoteModal from '../modals/NewNoteModal'
+import NewFolderModal from '../modals/NewFolderModal'
+import SessionManageModal from '../modals/SessionManageModal'
 import RenameModal from '../modals/RenameModal'
 import DeleteConfirmModal from '../modals/DeleteConfirmModal'
 import FolderProjectPathModal from '../modals/FolderProjectPathModal'
@@ -167,6 +169,18 @@ function FolderTreeNode({
   )
 }
 
+function formatSessionAge(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const m = Math.floor(diff / 60000)
+  if (m < 1) return 'just now'
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h`
+  const d = Math.floor(h / 24)
+  if (d < 30) return `${d}d`
+  return `${Math.floor(d / 30)}mo`
+}
+
 function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelect, onOpenChatWithNote, onSessionDeleted, activeSessionId, mobileOpen = false, onMobileClose }: SidebarProps) {
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
   useEffect(() => {
@@ -192,6 +206,8 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => {
     return new Set(getAllFolderPaths(folderTree))
   })
+  // Track all folder paths we've ever seen to detect genuinely new folders
+  const seenFolderPathsRef = useRef<Set<string>>(new Set())
 
   // Flatten folder tree for legacy components (modals)
   const flattenedFolders = (folderNode: FolderNode): FolderNode[] => {
@@ -214,11 +230,26 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     return parents
   }
 
-  // Update collapsed folders when folder tree changes
+  // Update collapsed folders when folder tree changes — preserve expanded state
   useEffect(() => {
     if (folderTree) {
       const allPaths = getAllFolderPaths(folderTree)
-      setCollapsedFolders(new Set(allPaths))
+      const allPathsSet = new Set(allPaths)
+      setCollapsedFolders(prev => {
+        const next = new Set(prev)
+        // Collapse only genuinely new folders (never seen before)
+        allPaths.forEach(path => {
+          if (!seenFolderPathsRef.current.has(path)) {
+            next.add(path)
+          }
+        })
+        // Remove paths that no longer exist
+        next.forEach(path => {
+          if (!allPathsSet.has(path)) next.delete(path)
+        })
+        return next
+      })
+      seenFolderPathsRef.current = allPathsSet
     }
   }, [folderTree])
 
@@ -270,6 +301,19 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     visible: boolean
     defaultFolder: string
   }>({ visible: false, defaultFolder: '' })
+
+  const [newFolderModal, setNewFolderModal] = useState<{
+    visible: boolean
+    parentPath: string
+  }>({ visible: false, parentPath: '' })
+  const [sessionManageVisible, setSessionManageVisible] = useState(false)
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null)
+  const [renamingSessionValue, setRenamingSessionValue] = useState('')
+  const [sessionOrder, setSessionOrder] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('session-order') ?? '[]') } catch { return [] }
+  })
+  const [dragSessionId, setDragSessionId] = useState<string | null>(null)
+  const [dragOverIdx, setDragOverIdx] = useState<number | null>(null)
 
   const [renameModal, setRenameModal] = useState<{
     visible: boolean
@@ -472,6 +516,18 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     }
   }
 
+  const handleCommitRename = async (sessionId: string, newName: string) => {
+    const trimmed = newName.trim()
+    setRenamingSessionId(null)
+    if (!trimmed) return
+    try {
+      await sessionsAPI.renameSession(sessionId, trimmed)
+      setClaudeSessions(prev => prev.map(s => s.id === sessionId ? { ...s, name: trimmed } : s))
+    } catch {
+      // silently ignore
+    }
+  }
+
   // Handle session context menu
   const handleSessionContextMenu = (e: React.MouseEvent, session: ClaudeSession) => {
     e.preventDefault()
@@ -482,6 +538,14 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
       x: e.clientX,
       y: e.clientY,
       items: [
+        {
+          text: 'Rename',
+          icon: 'edit',
+          action: () => {
+            setRenamingSessionId(session.id)
+            setRenamingSessionValue(session.name || '')
+          },
+        },
         {
           text: 'Kill Session',
           icon: 'trash',
@@ -508,12 +572,13 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     }
   }
 
-  const handleCreateFolder = async (parentPath: string) => {
-    const folderName = prompt('Enter folder name:')
-    if (!folderName) return
+  const handleCreateFolder = (parentPath: string) => {
+    setNewFolderModal({ visible: true, parentPath })
+  }
 
+  const handleCreateFolderConfirm = async (folderName: string) => {
+    const { parentPath } = newFolderModal
     const newPath = parentPath ? `${parentPath}/${folderName}` : folderName
-
     try {
       await createFolder(newPath)
     } catch (error) {
@@ -738,14 +803,9 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     setDragOverFolder(null)
   }
 
-  // Handle sessions resize
-  const handleSessionsResize = useCallback((clientY: number) => {
-    if (!sidebarRef.current || !sessionsResizeRef.current) return
-
-    const sidebarRect = sidebarRef.current.getBoundingClientRect()
-    const newHeight = sidebarRect.bottom - clientY - 10 // 10px offset for better UX
-
-    // Min height 100px, max height 500px
+  // Handle sessions resize (delta-based to avoid cursor jump)
+  const handleSessionsResize = useCallback((startY: number, startHeight: number, currentY: number) => {
+    const newHeight = startHeight + (startY - currentY)
     const clampedHeight = Math.max(100, Math.min(500, newHeight))
     setSessionsHeight(clampedHeight)
   }, [])
@@ -981,12 +1041,14 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
       {!chatHistoryCollapsed && (
         <div
           ref={sessionsResizeRef}
-          className="h-px bg-white/[0.06] hover:bg-cyan-500/30 cursor-ns-resize transition-colors"
+          className="h-3 flex items-center justify-center cursor-ns-resize group"
           onMouseDown={(e) => {
             e.preventDefault()
+            const startY = e.clientY
+            const startHeight = sessionsHeight
 
             const handleMouseMove = (moveEvent: MouseEvent) => {
-              handleSessionsResize(moveEvent.clientY)
+              handleSessionsResize(startY, startHeight, moveEvent.clientY)
             }
 
             const handleMouseUp = () => {
@@ -997,7 +1059,9 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
             document.addEventListener('mousemove', handleMouseMove)
             document.addEventListener('mouseup', handleMouseUp)
           }}
-        />
+        >
+          <div className="w-8 h-px bg-white/[0.08] group-hover:bg-cyan-500/40 transition-colors rounded-full" />
+        </div>
       )}
 
       {/* Claude Sessions */}
@@ -1010,13 +1074,20 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
           <div className="flex items-center gap-2">
             <Terminal className="w-3.5 h-3.5 text-purple-500" />
             <span className="text-[10px] font-mono font-semibold tracking-widest text-slate-600 uppercase">Claude Sessions</span>
-            {claudeSessions && claudeSessions.length > 0 && (
+            {claudeSessions && claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-')).length > 0 && (
               <span className="text-[10px] font-mono bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded border border-purple-500/20">
-                {claudeSessions.length}
+                {claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-')).length}
               </span>
             )}
           </div>
-          <div className="flex items-center">
+          <div className="flex items-center gap-1">
+            <button
+              onClick={e => { e.stopPropagation(); setSessionManageVisible(true) }}
+              title="Manage session history"
+              className="p-1 text-slate-700 hover:text-purple-400 transition-colors rounded"
+            >
+              <Settings2 className="w-3 h-3" />
+            </button>
             {chatHistoryCollapsed ? (
               <ChevronDown className="w-3.5 h-3.5 text-slate-600" />
             ) : (
@@ -1028,57 +1099,128 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
         {/* Sessions list */}
         {!chatHistoryCollapsed && (
           <div className="overflow-y-auto px-2 pb-2" style={{ height: `${sessionsHeight}px` }}>
-            {!claudeSessions || claudeSessions.length === 0 ? (
+            {!claudeSessions || claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-')).length === 0 ? (
               <div className="text-[10px] font-mono text-slate-700 px-2 py-4 text-center tracking-wider uppercase">
                 no active sessions
               </div>
-            ) : (
-              <div className="space-y-0.5">
-                {claudeSessions.map(session => {
-                  const sessionName = session.name && session.name !== 'Terminal Session'
-                    ? session.name
-                    : session.id.startsWith('note-') ? 'Note Session' : 'Global Session'
+            ) : (() => {
+              const visibleSessions = claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-'))
+              const orderedSessions = [
+                ...sessionOrder.map(id => visibleSessions.find(s => s.id === id)).filter(Boolean) as typeof visibleSessions,
+                ...visibleSessions.filter(s => !sessionOrder.includes(s.id)),
+              ]
+              const handleDragStart = (id: string) => setDragSessionId(id)
+              const handleDragOver = (e: React.DragEvent, idx: number) => {
+                e.preventDefault()
+                setDragOverIdx(idx)
+              }
+              const handleDrop = (e: React.DragEvent, targetIdx: number) => {
+                e.preventDefault()
+                if (!dragSessionId) return
+                const ids = orderedSessions.map(s => s.id)
+                const fromIdx = ids.indexOf(dragSessionId)
+                if (fromIdx === -1 || fromIdx === targetIdx) { setDragSessionId(null); setDragOverIdx(null); return }
+                ids.splice(fromIdx, 1)
+                ids.splice(targetIdx, 0, dragSessionId)
+                setSessionOrder(ids)
+                localStorage.setItem('session-order', JSON.stringify(ids))
+                setDragSessionId(null)
+                setDragOverIdx(null)
+              }
+              return (
+              <div className="space-y-0.5" onDragLeave={() => setDragOverIdx(null)}>
+                {orderedSessions.map((session, sessionIdx) => {
+                  let sessionName: string
+                  if (session.name && session.name !== 'Terminal Session') {
+                    sessionName = session.name
+                  } else if (session.id.startsWith('note-task-')) {
+                    sessionName = 'Task Session'
+                  } else if (session.id.startsWith('note-')) {
+                    const noteId = session.id.slice('note-'.length)
+                    sessionName = (notes || []).find(n => n.id === noteId)?.title ?? 'Note Session'
+                  } else {
+                    sessionName = 'Global Session'
+                  }
 
                   const isActive = activeSessionId === session.id
 
+                  const isRenaming = renamingSessionId === session.id
+
                   return (
-                    <button
-                      key={session.id}
-                      onClick={() => {
-                        if (onOpenChatWithNote) {
-                          const noteId = session.id.startsWith('note-') ? session.id.replace('note-', '') : null
-                          if (noteId) {
-                            onOpenChatWithNote(noteId)
-                          } else {
-                            onOpenChatWithNote('')
+                    <div key={session.id}>
+                      {/* Drop indicator above */}
+                      {dragOverIdx === sessionIdx && dragSessionId !== session.id && (
+                        <div className="h-px mx-2 mb-0.5 bg-cyan-500/60 rounded-full" />
+                      )}
+                      <div
+                        draggable={!isRenaming}
+                        onDragStart={() => handleDragStart(session.id)}
+                        onDragEnd={() => { setDragSessionId(null); setDragOverIdx(null) }}
+                        onDragOver={(e) => handleDragOver(e, sessionIdx)}
+                        onDrop={(e) => handleDrop(e, sessionIdx)}
+                        onContextMenu={(e) => handleSessionContextMenu(e, session)}
+                        onClick={() => {
+                          if (isRenaming) return
+                          if (onOpenChatWithNote) {
+                            const noteId = session.id.startsWith('note-') ? session.id.replace('note-', '') : null
+                            if (noteId) onOpenChatWithNote(noteId)
+                            else onOpenChatWithNote('')
                           }
-                        }
-                      }}
-                      onContextMenu={(e) => handleSessionContextMenu(e, session)}
-                      className={`w-full flex items-start gap-2 px-2 py-1.5 rounded transition text-left ${
-                        isActive
-                          ? 'bg-purple-500/10 border border-purple-500/20'
-                          : 'hover:bg-white/[0.03] border border-transparent'
-                      }`}
-                    >
-                      <Terminal className={`w-3 h-3 flex-shrink-0 mt-0.5 ${
-                        isActive ? 'text-purple-400' : 'text-purple-600'
-                      }`} />
-                      <div className="flex-1 min-w-0">
-                        <div className={`text-xs font-mono truncate ${
-                          isActive ? 'text-purple-300' : 'text-slate-400'
-                        }`}>
-                          {sessionName}
-                        </div>
-                        <div className="text-[10px] font-mono text-slate-700 truncate">
-                          {session.workingDir}
+                        }}
+                        className={`w-full flex items-start gap-2 px-2 py-1.5 rounded transition text-left select-none cursor-pointer ${
+                          dragSessionId === session.id ? 'opacity-40' : ''
+                        } ${
+                          isActive
+                            ? 'bg-purple-500/10 border border-purple-500/20'
+                            : 'hover:bg-white/[0.03] border border-transparent'
+                        }`}
+                      >
+                        <Terminal className={`w-3 h-3 flex-shrink-0 mt-0.5 cursor-grab active:cursor-grabbing ${
+                          isActive ? 'text-purple-400' : 'text-purple-600'
+                        }`} />
+                        <div className="flex-1 min-w-0">
+                          {isRenaming ? (
+                            <input
+                              autoFocus
+                              value={renamingSessionValue}
+                              onChange={e => setRenamingSessionValue(e.target.value)}
+                              onBlur={() => handleCommitRename(session.id, renamingSessionValue)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') handleCommitRename(session.id, renamingSessionValue)
+                                if (e.key === 'Escape') setRenamingSessionId(null)
+                                e.stopPropagation()
+                              }}
+                              onClick={e => e.stopPropagation()}
+                              className="w-full text-xs font-mono bg-transparent border-b border-cyan-500/50 text-cyan-300 outline-none pb-px"
+                            />
+                          ) : (
+                            <div className={`text-xs font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
+                              {sessionName}
+                            </div>
+                          )}
+                          <div className="text-[10px] font-mono text-slate-700 truncate">
+                            {session.workingDir}
+                          </div>
+                          <div className="flex items-center gap-1.5 mt-0.5">
+                            {session.createdAt && (
+                              <span className="text-[9px] font-mono text-slate-800" title={`Created: ${new Date(session.createdAt).toLocaleString()}`}>
+                                {'+'}{formatSessionAge(session.createdAt)}
+                              </span>
+                            )}
+                            {session.lastActivity && (
+                              <span className="text-[9px] font-mono text-slate-700" title={`Last active: ${new Date(session.lastActivity).toLocaleString()}`}>
+                                {'·'} {formatSessionAge(session.lastActivity)} ago
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
-                    </button>
+                    </div>
                   )
                 })}
               </div>
-            )}
+              )
+            })()}
           </div>
         )}
       </div>
@@ -1141,6 +1283,17 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
         currentProjectPath={folderProjectPathModal.currentProjectPath}
         onClose={() => setFolderProjectPathModal({ visible: false, folderPath: '', currentProjectPath: '' })}
         onSave={handleUpdateFolderProjectPath}
+      />
+
+      <NewFolderModal
+        visible={newFolderModal.visible}
+        parentPath={newFolderModal.parentPath}
+        onClose={() => setNewFolderModal({ visible: false, parentPath: '' })}
+        onCreate={handleCreateFolderConfirm}
+      />
+      <SessionManageModal
+        visible={sessionManageVisible}
+        onClose={() => setSessionManageVisible(false)}
       />
     </>
   )

@@ -234,6 +234,111 @@ func (s *MongoStorage) SearchNotes(ctx context.Context, query string, limit int)
 	return notes, nil
 }
 
+// ListNotesMeta returns notes without content field — fast for listing/summary.
+// When recursive=true, includes all notes in subfolders.
+func (s *MongoStorage) ListNotesMeta(ctx context.Context, folder string, recursive bool) ([]*models.Note, error) {
+	collection := s.db.Collection(notesCollection)
+
+	filter := bson.M{}
+	if folder != "" {
+		if recursive {
+			pattern := "^" + regexp.QuoteMeta(folder) + "(/|$)"
+			filter["folder"] = bson.M{"$regex": pattern}
+		} else {
+			filter["folder"] = folder
+		}
+	}
+
+	opts := options.Find().
+		SetSort(bson.D{{Key: "updated_at", Value: -1}}).
+		SetProjection(bson.M{"content": 0})
+
+	cursor, err := collection.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list notes meta: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var notes []*models.Note
+	if err := cursor.All(ctx, &notes); err != nil {
+		return nil, fmt.Errorf("failed to decode notes meta: %w", err)
+	}
+
+	return notes, nil
+}
+
+// SearchNotesInFolder performs full-text search scoped to a folder (and optionally subfolders).
+func (s *MongoStorage) SearchNotesInFolder(ctx context.Context, query string, folder string, recursive bool, limit int) ([]*models.Note, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	collection := s.db.Collection(notesCollection)
+
+	filter := bson.M{"$text": bson.M{"$search": query}}
+	if folder != "" {
+		if recursive {
+			pattern := "^" + regexp.QuoteMeta(folder) + "(/|$)"
+			filter["folder"] = bson.M{"$regex": pattern}
+		} else {
+			filter["folder"] = folder
+		}
+	}
+
+	opts := options.Find().
+		SetProjection(bson.M{"score": bson.M{"$meta": "textScore"}}).
+		SetSort(bson.D{{Key: "score", Value: bson.M{"$meta": "textScore"}}}).
+		SetLimit(int64(limit))
+
+	cursor, err := collection.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search notes in folder: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var notes []*models.Note
+	if err := cursor.All(ctx, &notes); err != nil {
+		return nil, fmt.Errorf("failed to decode search results: %w", err)
+	}
+
+	return notes, nil
+}
+
+// BulkUpdateTags adds and/or removes tags from all notes matching the given filter.
+// Returns number of modified notes.
+func (s *MongoStorage) BulkUpdateTags(ctx context.Context, filter bson.M, addTags []string, removeTags []string) (int, error) {
+	collection := s.db.Collection(notesCollection)
+
+	modified := 0
+
+	if len(addTags) > 0 {
+		res, err := collection.UpdateMany(ctx, filter, bson.M{
+			"$addToSet": bson.M{"tags": bson.M{"$each": addTags}},
+		})
+		if err != nil {
+			return modified, fmt.Errorf("failed to add tags: %w", err)
+		}
+		modified += int(res.ModifiedCount)
+	}
+
+	if len(removeTags) > 0 {
+		res, err := collection.UpdateMany(ctx, filter, bson.M{
+			"$pull": bson.M{"tags": bson.M{"$in": removeTags}},
+		})
+		if err != nil {
+			return modified, fmt.Errorf("failed to remove tags: %w", err)
+		}
+		modified += int(res.ModifiedCount)
+	}
+
+	// Rebuild in-memory tags index
+	if err := s.BuildTagsIndex(ctx); err != nil {
+		s.logger.Error("failed to rebuild tags index after bulk update", slog.Any("error", err))
+	}
+
+	return modified, nil
+}
+
 // SearchByTags performs fast in-memory search by tags
 func (s *MongoStorage) SearchByTags(tags []string, limit int) []*models.Note {
 	return s.tagsIndex.SearchByTags(tags, limit)
@@ -345,6 +450,10 @@ func (s *MongoStorage) EnsureIndexes(ctx context.Context) error {
 	indexes := []mongo.IndexModel{
 		{
 			Keys:    bson.D{{Key: "path", Value: 1}},
+			Options: options.Index().SetUnique(true),
+		},
+		{
+			Keys:    bson.D{{Key: "id", Value: 1}},
 			Options: options.Index().SetUnique(true),
 		},
 		{
