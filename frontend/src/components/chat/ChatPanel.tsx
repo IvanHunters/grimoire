@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import { X, RotateCcw, Trash2 } from 'lucide-react'
 import { TerminalChat, type TerminalChatHandle } from './TerminalChat'
 import { sessionsAPI } from '../../api/sessions'
@@ -17,6 +18,7 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
   const { currentNote } = useNotes()
   const [sessionKey, setSessionKey] = useState(0)
   const [showKeyboard, setShowKeyboard] = useState(() => localStorage.getItem('terminal.showKeyboard') !== 'false')
+  const [pasteOpen, setPasteOpen] = useState(false)
   const [sessionName, setSessionName] = useState<string>('')
   const terminalRef = useRef<TerminalChatHandle>(null)
 
@@ -164,28 +166,32 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
 
       {/* ── Mobile Virtual Keyboard (hidden on md+) ─────────────── */}
       {showKeyboard && <div className="md:hidden flex-shrink-0 relative z-10 terminal-keyboard">
-
-        {/* Row 1 — Control characters */}
         <div className="terminal-key-row">
-          <TermKey variant="danger"  label="ESC"  onPress={() => sendKey('\x1b')}   />
-          <TermKey variant="danger"  label="^C"   onPress={() => sendKey('\x03')}   />
-          <TermKey variant="default" label="^D"   onPress={() => sendKey('\x04')}   />
-          <TermKey variant="default" label="^L"   onPress={() => sendKey('\x0c')}   />
-          <TermKey variant="default" label="^A"   onPress={() => sendKey('\x01')}   />
-          <TermKey variant="default" label="^E"   onPress={() => sendKey('\x05')}   />
+          <TermKey variant="nav"    label="↑"    onPress={() => sendKey('\x1b[A')} />
+          <TermKey variant="nav"    label="↓"    onPress={() => sendKey('\x1b[B')} />
+          <TermKey variant="nav"    label="←"    onPress={() => sendKey('\x1b[D')} />
+          <TermKey variant="nav"    label="→"    onPress={() => sendKey('\x1b[C')} />
         </div>
-
-        {/* Row 2 — Navigation */}
         <div className="terminal-key-row">
-          <TermKey variant="nav"   label="↑"    onPress={() => sendKey('\x1b[A')} />
-          <TermKey variant="nav"   label="↓"    onPress={() => sendKey('\x1b[B')} />
-          <TermKey variant="nav"   label="←"    onPress={() => sendKey('\x1b[D')} />
-          <TermKey variant="nav"   label="→"    onPress={() => sendKey('\x1b[C')} />
-          <TermKey variant="default" label="Tab" onPress={() => sendKey('\t')}    />
-          <TermKey variant="enter"  label="↵"   onPress={() => sendKey('\r')}    />
-          <TermKey variant="nav"    label="done" onPress={blurTerminal}           />
+          <TermKey variant="danger" label="^C"    onPress={() => sendKey('\x03')} />
+          <TermKey variant="default" label="Paste" onPress={async () => {
+            try {
+              const t = await navigator.clipboard.readText()
+              if (t) { sendKey(t); return }
+            } catch {}
+            setPasteOpen(true)
+          }} />
+          <TermKey variant="enter"  label="↵"    onPress={() => sendKey('\r')}   />
+          <TermKey variant="nav"    label="done" onPress={blurTerminal}          />
         </div>
       </div>}
+
+      {pasteOpen && (
+        <PasteOverlay
+          onCancel={() => setPasteOpen(false)}
+          onPaste={(text) => { if (text) sendKey(text); setPasteOpen(false) }}
+        />
+      )}
     </div>
   )
 }
@@ -208,6 +214,92 @@ function TermKey({ label, onPress, variant }: TermKeyProps) {
     >
       {label}
     </button>
+  )
+}
+
+function PasteOverlay({ onCancel, onPaste }: { onCancel: () => void; onPaste: (text: string) => void }) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  const [kbOffset, setKbOffset] = useState(0)
+  useEffect(() => {
+    ref.current?.focus()
+    const vv = window.visualViewport
+    if (!vv) return
+    const update = () => setKbOffset(Math.max(0, window.innerHeight - vv.height - vv.offsetTop))
+    update()
+    vv.addEventListener('resize', update)
+    vv.addEventListener('scroll', update)
+    return () => {
+      vv.removeEventListener('resize', update)
+      vv.removeEventListener('scroll', update)
+    }
+  }, [])
+  return createPortal(
+    <div
+      style={{
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: kbOffset,
+        zIndex: 9999,
+        background: 'rgba(0,0,0,0.65)',
+        display: 'flex',
+        alignItems: 'flex-end',
+        boxSizing: 'border-box',
+      }}
+      onClick={onCancel}
+    >
+      <div
+        style={{
+          boxSizing: 'border-box',
+          width: '100%',
+          padding: 12,
+          background: '#1a1d24',
+          borderTop: '1px solid #2a2e38',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 8 }}>
+          Долгий тап в поле → выбери «Вставить»
+        </div>
+        <textarea
+          ref={ref}
+          autoFocus
+          rows={3}
+          onPaste={(e) => {
+            const t = e.clipboardData.getData('text')
+            e.preventDefault()
+            onPaste(t)
+          }}
+          onChange={(e) => {
+            const t = e.target.value
+            if (t) onPaste(t)
+          }}
+          style={{
+            boxSizing: 'border-box',
+            display: 'block',
+            width: '100%',
+            background: '#0a0c12',
+            color: '#fff',
+            border: '1px solid #333',
+            borderRadius: 6,
+            padding: 8,
+            fontFamily: 'monospace',
+            fontSize: 16,
+            resize: 'none',
+          }}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+          <button
+            onClick={onCancel}
+            style={{ color: '#9ca3af', fontSize: 14, padding: '6px 12px', background: 'transparent', border: 'none' }}
+          >
+            Отмена
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
   )
 }
 
