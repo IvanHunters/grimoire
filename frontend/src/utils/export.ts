@@ -1,5 +1,5 @@
 import jsPDF from 'jspdf'
-import html2canvas from 'html2canvas'
+import { toCanvas as htmlToCanvas } from 'html-to-image'
 import mermaid from 'mermaid'
 import JSZip from 'jszip'
 import { Document, Packer, Paragraph, TextRun, HeadingLevel } from 'docx'
@@ -32,18 +32,36 @@ const PDF_CONTAINER_WIDTH = Math.round(PDF_CONTENT_WIDTH * (96 / 25.4)) // mm to
  * Build the same off-screen container used for PDF and return it.
  * Caller is responsible for removing the container from DOM.
  */
+// CSS overrides applied to every PDF-render container. Forces dark-on-light
+// styling regardless of the app's current dark/light theme — bypasses needing
+// to toggle the global `.dark` class (which would briefly flash the visible
+// preview to light mode).
+const PDF_OVERRIDE_CSS = `
+  .markdown-preview { color: #1f2937 !important; background: white !important; }
+  .markdown-preview h1 { color: #111827 !important; border-bottom-color: rgba(8,145,178,0.25) !important; }
+  .markdown-preview h2 { color: #1f2937 !important; border-bottom-color: rgba(8,145,178,0.2) !important; }
+  .markdown-preview h3 { color: #374151 !important; }
+  .markdown-preview h4, .markdown-preview h5, .markdown-preview h6 { color: #4b5563 !important; }
+  .markdown-preview p, .markdown-preview li, .markdown-preview td { color: #1f2937 !important; }
+  .markdown-preview code:not([class*="language-"]) { color: #0e7490 !important; background-color: rgba(14,116,144,0.08) !important; border-color: rgba(14,116,144,0.2) !important; }
+  .markdown-preview blockquote { color: #4b5563 !important; background: rgba(8,145,178,0.04) !important; border-left-color: rgba(8,145,178,0.4) !important; }
+  .markdown-preview table { border-color: #d1d5db !important; }
+  .markdown-preview th, .markdown-preview td { border-color: #e5e7eb !important; }
+  .markdown-preview th { color: #374151 !important; background-color: rgba(8,145,178,0.06) !important; border-bottom-color: rgba(8,145,178,0.2) !important; }
+  .markdown-preview tbody tr:nth-child(even) { background-color: rgba(0,0,0,0.02) !important; }
+  .markdown-preview a { color: #0e7490 !important; }
+  .markdown-preview a:visited { color: #6366f1 !important; }
+`
+
+function appendPdfOverrideStyle(container: HTMLElement): void {
+  const style = document.createElement('style')
+  style.textContent = PDF_OVERRIDE_CSS
+  container.appendChild(style)
+}
+
 async function buildPDFContainer(note: Note, previewElement: HTMLElement): Promise<{ container: HTMLElement; clone: HTMLElement }> {
   const container = document.createElement('div')
-  container.style.cssText = `
-    position: absolute;
-    left: -9999px;
-    top: 0;
-    width: ${PDF_CONTAINER_WIDTH}px;
-    padding: 0;
-    background: white;
-    color: #1f2937;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  `
+  applyContainerStyles(container, PDF_CONTAINER_WIDTH)
 
   const clone = previewElement.cloneNode(true) as HTMLElement
   clone.style.overflow = 'visible'
@@ -51,22 +69,7 @@ async function buildPDFContainer(note: Note, previewElement: HTMLElement): Promi
   clone.style.maxHeight = 'none'
   clone.querySelectorAll('button').forEach(btn => btn.remove())
 
-  const pdfOverride = document.createElement('style')
-  pdfOverride.textContent = `
-    .markdown-preview h1 { color: #111827 !important; border-bottom-color: rgba(8,145,178,0.25) !important; }
-    .markdown-preview h2 { color: #1f2937 !important; border-bottom-color: rgba(8,145,178,0.2) !important; }
-    .markdown-preview h3 { color: #374151 !important; }
-    .markdown-preview h4, .markdown-preview h5, .markdown-preview h6 { color: #4b5563 !important; }
-    .markdown-preview code:not([class*="language-"]) { display: inline-block !important; line-height: 1 !important; vertical-align: 0.3em !important; color: #0e7490 !important; background-color: rgba(14,116,144,0.08) !important; border-color: rgba(14,116,144,0.2) !important; }
-    .markdown-preview blockquote { color: #4b5563 !important; background: rgba(8,145,178,0.04) !important; border-left-color: rgba(8,145,178,0.4) !important; }
-    .markdown-preview table { border-color: #d1d5db !important; }
-    .markdown-preview th, .markdown-preview td { border-color: #e5e7eb !important; }
-    .markdown-preview th { color: #374151 !important; background-color: rgba(8,145,178,0.06) !important; border-bottom-color: rgba(8,145,178,0.2) !important; }
-    .markdown-preview tbody tr:nth-child(even) { background-color: rgba(0,0,0,0.02) !important; }
-    .markdown-preview a { color: #0e7490 !important; }
-    .markdown-preview a:visited { color: #6366f1 !important; }
-  `
-  container.appendChild(pdfOverride)
+  appendPdfOverrideStyle(container)
 
   clone.querySelectorAll('a').forEach(link => {
     const el = link as HTMLElement
@@ -95,62 +98,13 @@ async function buildPDFContainer(note: Note, previewElement: HTMLElement): Promi
 
   await waitForImagesToLoad(container)
 
-  const htmlElement = document.documentElement
-  const wasDarkMode = htmlElement.classList.contains('dark')
-  if (wasDarkMode) htmlElement.classList.remove('dark')
-
+  // Re-render mermaid for PDF inside the container — the container has a white
+  // background so mermaid's default light theme renders correctly without us
+  // having to toggle `dark` on the document root (which would flash the visible
+  // preview to light mode for the duration of the render).
   await rerenderMermaidForPDF(clone)
 
   return { container, clone }
-}
-
-// Detach inline code backgrounds from text to work around html2canvas inline
-// text positioning bug: html2canvas renders inline element text at the BOTTOM
-// of the element's CSS rect (text_bottom ≈ rect.bottom - padding-bottom),
-// regardless of how tall the rect is (parent line-height inflates rect height).
-//
-// Fix: create absolutely-positioned <div>s anchored to rect.bottom, sized to
-// wrap the actual glyph height + padding. The code element keeps only its text
-// (transparent background). html2canvas renders the bg div at the correct
-// position and the transparent text on top.
-//
-// Call immediately before html2canvas — NOT for HTML export (coordinates are
-// valid only at PDF_CONTAINER_WIDTH layout, not full viewport width).
-function detachInlineCodeBackgrounds(container: HTMLElement, clone: HTMLElement): void {
-  const containerRect = container.getBoundingClientRect()
-  clone.querySelectorAll<HTMLElement>('code:not([class*="language-"])').forEach(code => {
-    const rect = code.getBoundingClientRect()
-    const s = window.getComputedStyle(code)
-    const fontSize = parseFloat(s.fontSize)
-    const paddingTop = parseFloat(s.paddingTop)
-    const paddingBottom = parseFloat(s.paddingBottom)
-    const borderWidth = parseFloat(s.borderTopWidth)
-
-    // Anchor to rect.bottom: text content ends at rect.bottom - paddingBottom.
-    // textHeight ≈ full em-square (safe upper bound, avoids glyph clipping).
-    const textHeight = fontSize
-    const bgTop = (rect.bottom - paddingBottom - textHeight - paddingTop - borderWidth) - containerRect.top
-    const bgHeight = textHeight + paddingTop + paddingBottom + 2 * borderWidth
-
-    const bg = document.createElement('div')
-    bg.style.cssText = `
-      position: absolute;
-      left: ${rect.left - containerRect.left}px;
-      top: ${bgTop}px;
-      width: ${rect.width}px;
-      height: ${bgHeight}px;
-      background-color: ${s.backgroundColor};
-      border: ${s.borderTopWidth} solid ${s.borderTopColor};
-      border-radius: ${s.borderRadius};
-      box-sizing: border-box;
-      pointer-events: none;
-    `
-    container.insertBefore(bg, clone)
-
-    // Use setProperty with important to override pdfOverride !important rules.
-    code.style.setProperty('background-color', 'transparent', 'important')
-    code.style.setProperty('border', 'none', 'important')
-  })
 }
 
 /**
@@ -158,9 +112,6 @@ function detachInlineCodeBackgrounds(container: HTMLElement, clone: HTMLElement)
  * Useful for debugging rendering issues before exporting to PDF.
  */
 export async function exportToHTML(note: Note, previewElement: HTMLElement): Promise<void> {
-  const htmlElement = document.documentElement
-  const wasDarkMode = htmlElement.classList.contains('dark')
-
   const { container } = await buildPDFContainer(note, previewElement)
 
   // Collect all stylesheets from the current document
@@ -188,7 +139,6 @@ pre[class*="language-"], pre[class*="language-"] code { color: #f8f8f2 !importan
 </body>
 </html>`
 
-  if (wasDarkMode) htmlElement.classList.add('dark')
   document.body.removeChild(container)
 
   const win = window.open('', '_blank')
@@ -198,58 +148,129 @@ pre[class*="language-"], pre[class*="language-"] code { color: #f8f8f2 !importan
   }
 }
 
+// Aspect ratio threshold: diagrams wider than this (relative to height) are
+// rendered on their own landscape page. Anything below stays inline in the
+// portrait flow.
+const WIDE_DIAGRAM_ASPECT_RATIO = 1.8
+
+function isWideMermaidDiagram(el: HTMLElement): boolean {
+  if (!el.classList.contains('mermaid-wrapper')) return false
+  const svg = el.querySelector('svg')
+  if (!svg) return false
+  const viewBox = svg.getAttribute('viewBox')
+  if (!viewBox) return false
+  const parts = viewBox.split(/\s+/).map(parseFloat)
+  if (parts.length < 4) return false
+  const [, , vbW, vbH] = parts
+  if (!(vbW > 0) || !(vbH > 0)) return false
+  return vbW / vbH >= WIDE_DIAGRAM_ASPECT_RATIO
+}
+
+function applyContainerStyles(el: HTMLElement, widthPx: number): void {
+  el.style.cssText = `
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: ${widthPx}px;
+    padding: 0;
+    background: white;
+    color: #1f2937;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    pointer-events: none;
+    z-index: -1;
+  `
+}
+
 export async function exportToPDF(note: Note, previewElement: HTMLElement): Promise<void> {
   try {
-    const htmlElement = document.documentElement
-    const wasDarkMode = htmlElement.classList.contains('dark')
+    // buildPDFContainer already re-renders mermaid with the light theme.
+    const { container: fullContainer, clone: fullClone } = await buildPDFContainer(note, previewElement)
+    // We don't render fullContainer directly — we'll build per-segment containers below.
+    document.body.removeChild(fullContainer)
 
-    const { container, clone } = await buildPDFContainer(note, previewElement)
+    const markdownPreview = (fullClone.querySelector('.markdown-preview') as HTMLElement) || fullClone
 
-    // Collect break points from block-level elements
-    const markdownPreview = clone.querySelector('.markdown-preview') || clone
-    const breakPoints = collectBreakPoints(markdownPreview as HTMLElement, container)
-
-    // Render to canvas
-    const canvas = await html2canvas(container, {
-      scale: PDF_RENDER_SCALE,
-      useCORS: true,
-      allowTaint: true,
-      backgroundColor: '#ffffff',
-      logging: false,
-    })
-
-    // Restore dark mode
-    if (wasDarkMode) {
-      htmlElement.classList.add('dark')
+    // Walk top-level children, splitting on wide mermaid diagrams.
+    type Segment =
+      | { type: 'portrait'; nodes: HTMLElement[] }
+      | { type: 'landscape'; diagram: HTMLElement }
+    const segments: Segment[] = []
+    let portraitBuf: HTMLElement[] = []
+    for (const child of Array.from(markdownPreview.children) as HTMLElement[]) {
+      if (isWideMermaidDiagram(child)) {
+        if (portraitBuf.length > 0) {
+          segments.push({ type: 'portrait', nodes: portraitBuf })
+          portraitBuf = []
+        }
+        segments.push({ type: 'landscape', diagram: child })
+      } else {
+        portraitBuf.push(child)
+      }
+    }
+    if (portraitBuf.length > 0) {
+      segments.push({ type: 'portrait', nodes: portraitBuf })
     }
 
-    // Clean up
-    document.body.removeChild(container)
+    // jsPDF auto-creates page 1 in the constructor orientation. We always call
+    // addPage() per output page so each page has its own explicit orientation,
+    // then drop the blank page 1 at the end.
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+    let pageCount = 0
 
-    // Calculate dimensions
-    // canvas pixels per mm = canvas.width / PDF_CONTENT_WIDTH
+    for (const segment of segments) {
+      if (segment.type === 'portrait') {
+        pageCount += await renderPortraitSegment(pdf, segment.nodes)
+      } else {
+        await renderLandscapePage(pdf, segment.diagram)
+        pageCount += 1
+      }
+    }
+
+    pdf.deletePage(1)
+
+    addFooters(pdf, note, pageCount)
+
+    pdf.save(sanitizeFilename(note.title) + '.pdf')
+  } catch (error) {
+    console.error('Failed to export PDF:', error)
+    throw new Error('Failed to export to PDF')
+  }
+}
+
+async function renderPortraitSegment(pdf: jsPDF, nodes: HTMLElement[]): Promise<number> {
+  // Build a container holding only this segment's nodes inside a .markdown-preview wrapper.
+  const container = document.createElement('div')
+  applyContainerStyles(container, PDF_CONTAINER_WIDTH)
+  appendPdfOverrideStyle(container)
+  const previewWrap = document.createElement('div')
+  previewWrap.className = 'markdown-preview'
+  nodes.forEach(n => previewWrap.appendChild(n))
+  container.appendChild(previewWrap)
+  document.body.appendChild(container)
+
+  try {
+    await waitForImagesToLoad(container)
+
+    const breakPoints = collectBreakPoints(previewWrap, container)
+
+    const canvas = await htmlToCanvas(container, {
+      pixelRatio: PDF_RENDER_SCALE,
+      backgroundColor: '#ffffff',
+      cacheBust: true,
+    })
+
     const pxPerMm = canvas.width / PDF_CONTENT_WIDTH
     const contentHeightPx = PDF_CONTENT_HEIGHT * pxPerMm
-
-    // Scale break points to canvas coordinates
     const scaledBreaks = breakPoints.map(bp => bp * PDF_RENDER_SCALE)
-
-    // Find optimal page break positions
     const pageSlices = computePageSlices(scaledBreaks, contentHeightPx, canvas.height)
 
-    // Build PDF
-    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
-    const totalPages = pageSlices.length
-    const exportDate = new Date().toLocaleDateString()
-
-    for (let i = 0; i < totalPages; i++) {
-      if (i > 0) pdf.addPage()
+    for (let i = 0; i < pageSlices.length; i++) {
+      pdf.addPage('a4', 'portrait')
 
       const { startY, endY } = pageSlices[i]
       const sliceHeight = endY - startY
       if (sliceHeight <= 0) continue
 
-      // Slice canvas for this page
       const pageCanvas = document.createElement('canvas')
       pageCanvas.width = canvas.width
       pageCanvas.height = sliceHeight
@@ -258,26 +279,80 @@ export async function exportToPDF(note: Note, previewElement: HTMLElement): Prom
       ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height)
       ctx.drawImage(canvas, 0, startY, canvas.width, sliceHeight, 0, 0, canvas.width, sliceHeight)
 
-      // Place slice on PDF page
       const sliceHeightMm = sliceHeight / pxPerMm
       const imgData = pageCanvas.toDataURL('image/png')
       pdf.addImage(imgData, 'PNG', PDF_MARGIN_LEFT, PDF_MARGIN_TOP, PDF_CONTENT_WIDTH, sliceHeightMm)
-
-      // Footer: page number centered, title on the left, date on the right
-      pdf.setFontSize(8)
-      pdf.setTextColor(160, 160, 160)
-      const footerY = PDF_PAGE_HEIGHT - 8
-      pdf.text(note.path, PDF_MARGIN_LEFT, footerY)
-      pdf.text(`${i + 1} / ${totalPages}`, PDF_PAGE_WIDTH / 2, footerY, { align: 'center' })
-      pdf.text(exportDate, PDF_PAGE_WIDTH - PDF_MARGIN_RIGHT, footerY, { align: 'right' })
     }
 
-    // Download
-    const filename = sanitizeFilename(note.title) + '.pdf'
-    pdf.save(filename)
-  } catch (error) {
-    console.error('Failed to export PDF:', error)
-    throw new Error('Failed to export to PDF')
+    return pageSlices.length
+  } finally {
+    document.body.removeChild(container)
+  }
+}
+
+async function renderLandscapePage(pdf: jsPDF, diagram: HTMLElement): Promise<void> {
+  // A4 landscape content area in mm
+  const landscapeContentWidth = PDF_PAGE_HEIGHT - PDF_MARGIN_LEFT - PDF_MARGIN_RIGHT
+  const landscapeContentHeight = PDF_PAGE_WIDTH - PDF_MARGIN_TOP - PDF_MARGIN_BOTTOM
+  const containerWidthPx = Math.round(landscapeContentWidth * (96 / 25.4))
+
+  const container = document.createElement('div')
+  applyContainerStyles(container, containerWidthPx)
+  appendPdfOverrideStyle(container)
+  const previewWrap = document.createElement('div')
+  previewWrap.className = 'markdown-preview'
+  const diagramClone = diagram.cloneNode(true) as HTMLElement
+  previewWrap.appendChild(diagramClone)
+  container.appendChild(previewWrap)
+  document.body.appendChild(container)
+
+  try {
+    await waitForImagesToLoad(container)
+
+    const canvas = await htmlToCanvas(container, {
+      pixelRatio: PDF_RENDER_SCALE,
+      backgroundColor: '#ffffff',
+      cacheBust: true,
+    })
+
+    pdf.addPage('a4', 'landscape')
+
+    // Fit the diagram into the landscape content area, centered, preserving aspect ratio.
+    const imgAspect = canvas.width / canvas.height
+    const boxAspect = landscapeContentWidth / landscapeContentHeight
+    let drawW: number, drawH: number
+    if (imgAspect > boxAspect) {
+      drawW = landscapeContentWidth
+      drawH = landscapeContentWidth / imgAspect
+    } else {
+      drawH = landscapeContentHeight
+      drawW = landscapeContentHeight * imgAspect
+    }
+    const offsetX = PDF_MARGIN_LEFT + (landscapeContentWidth - drawW) / 2
+    const offsetY = PDF_MARGIN_TOP + (landscapeContentHeight - drawH) / 2
+
+    const imgData = canvas.toDataURL('image/png')
+    pdf.addImage(imgData, 'PNG', offsetX, offsetY, drawW, drawH)
+  } finally {
+    document.body.removeChild(container)
+  }
+}
+
+function addFooters(pdf: jsPDF, note: Note, totalPages: number): void {
+  const exportDate = new Date().toLocaleDateString()
+  pdf.setFontSize(8)
+  pdf.setTextColor(160, 160, 160)
+  for (let i = 1; i <= totalPages; i++) {
+    pdf.setPage(i)
+    const isLandscape = pdf.getPageWidth() > pdf.getPageHeight()
+    const pageW = pdf.getPageWidth()
+    const pageH = pdf.getPageHeight()
+    const footerY = pageH - 8
+    const leftX = isLandscape ? PDF_MARGIN_LEFT : PDF_MARGIN_LEFT
+    const rightX = pageW - PDF_MARGIN_RIGHT
+    pdf.text(note.path, leftX, footerY)
+    pdf.text(`${i} / ${totalPages}`, pageW / 2, footerY, { align: 'center' })
+    pdf.text(exportDate, rightX, footerY, { align: 'right' })
   }
 }
 
@@ -651,7 +726,6 @@ async function rerenderMermaidForPDF(container: HTMLElement): Promise<void> {
   const mermaidDivs = container.querySelectorAll('.mermaid[data-source]')
   if (mermaidDivs.length === 0) return
 
-  // Initialize mermaid with light theme
   mermaid.initialize({
     startOnLoad: false,
     theme: 'default',
