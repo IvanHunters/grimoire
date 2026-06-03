@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { ChevronLeft, ChevronRight, Folder, FileText, Terminal, ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Folder, FileText, Terminal, ChevronDown, ChevronUp, Settings2, Sparkles, Plus } from 'lucide-react'
 import { useNotes } from '../../contexts/NotesContext'
 import type { FolderNode } from '../../types/folder'
 import type { ClaudeSession } from '../../types/claude'
@@ -7,12 +7,14 @@ import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
 import { SwipeableItem } from '../common/SwipeableItem'
 import NewNoteModal from '../modals/NewNoteModal'
 import NewFolderModal from '../modals/NewFolderModal'
+import NewSkillModal from '../modals/NewSkillModal'
 import SessionManageModal from '../modals/SessionManageModal'
 import RenameModal from '../modals/RenameModal'
 import DeleteConfirmModal from '../modals/DeleteConfirmModal'
 import FolderProjectPathModal from '../modals/FolderProjectPathModal'
 import { sessionsAPI } from '../../api/sessions'
 import { foldersAPI } from '../../api/folders'
+import { skillsAPI, type SkillSummary } from '../../api/skills'
 import { exportFolderToZip } from '../../utils/export'
 
 interface SidebarProps {
@@ -48,6 +50,8 @@ interface FolderTreeNodeProps {
   currentNote: any
   collapsedFolders: Set<string>
   dragOverFolder: string | null
+  skillStates?: Map<string, SkillSummary>
+  onNewSkill?: () => void
   onToggleFolder: (path: string) => void
   onNoteClick: (note: any) => void
   onFolderContextMenu: (e: React.MouseEvent, path: string) => void
@@ -68,6 +72,8 @@ function FolderTreeNode({
   currentNote,
   collapsedFolders,
   dragOverFolder,
+  skillStates,
+  onNewSkill,
   onToggleFolder,
   onNoteClick,
   onFolderContextMenu,
@@ -83,6 +89,10 @@ function FolderTreeNode({
   const isCollapsed = collapsedFolders.has(folder.path)
   const folderNotes = notes.filter((note) => note.folder === folder.path)
   const totalNotesCount = countNotesInFolder(folder, notes)
+  const isSkillsRoot = folder.isSystem && folder.source === 'skills'
+  // A skill folder is a direct child of Skills/ — show enabled/disabled badge from skillStates.
+  const isSkillFolder = folder.path.startsWith('Skills/') && !folder.path.slice('Skills/'.length).includes('/')
+  const skillState = isSkillFolder ? skillStates?.get(folder.path.slice('Skills/'.length)) : undefined
 
   return (
     <div>
@@ -106,11 +116,35 @@ function FolderTreeNode({
         ) : (
           <ChevronDown className="w-3.5 h-3.5 text-slate-600" />
         )}
-        <Folder className="w-3.5 h-3.5 text-cyan-700" />
-        <span className="text-xs font-mono text-slate-400">{folder.name}</span>
-        <span className="ml-auto text-[10px] font-mono text-slate-700 pr-1">
-          {totalNotesCount}
-        </span>
+        {isSkillsRoot ? (
+          <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+        ) : (
+          <Folder className={`w-3.5 h-3.5 ${isSkillFolder ? 'text-amber-700' : 'text-cyan-700'}`} />
+        )}
+        <span className={`text-xs font-mono ${isSkillsRoot ? 'text-amber-400' : 'text-slate-400'}`}>{folder.name}</span>
+        {skillState && !skillState.enabled && (
+          <span className="text-[9px] font-mono text-slate-700 uppercase ml-1">off</span>
+        )}
+        {skillState && !skillState.valid && (
+          <span className="text-[9px] font-mono text-red-500/80 uppercase ml-1" title="invalid frontmatter">!</span>
+        )}
+        {isSkillsRoot && onNewSkill && (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => { e.stopPropagation(); onNewSkill() }}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); onNewSkill() } }}
+            title="New skill"
+            className="ml-auto p-0.5 text-amber-500/70 hover:text-amber-400 cursor-pointer"
+          >
+            <Plus className="w-3 h-3" />
+          </span>
+        )}
+        {!isSkillsRoot && (
+          <span className="ml-auto text-[10px] font-mono text-slate-700 pr-1">
+            {totalNotesCount}
+          </span>
+        )}
       </button>
 
       {/* Notes in this folder (if not collapsed) */}
@@ -150,6 +184,8 @@ function FolderTreeNode({
               currentNote={currentNote}
               collapsedFolders={collapsedFolders}
               dragOverFolder={dragOverFolder}
+              skillStates={skillStates}
+              onNewSkill={onNewSkill}
               onToggleFolder={onToggleFolder}
               onNoteClick={onNoteClick}
               onFolderContextMenu={onFolderContextMenu}
@@ -189,6 +225,25 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     return () => window.removeEventListener('resize', handler)
   }, [])
   const { notes, folderTree, currentNote, fetchNotes, fetchFolders, createNote, createFolder, deleteNote, deleteFolder } = useNotes()
+
+  // Skills state: map of skill name to summary, used to render badges in the Skills/ subtree.
+  const [skillStates, setSkillStates] = useState<Map<string, SkillSummary>>(new Map())
+  const [newSkillVisible, setNewSkillVisible] = useState(false)
+
+  const refreshSkills = useCallback(async () => {
+    try {
+      const list = await skillsAPI.list()
+      const map = new Map<string, SkillSummary>()
+      for (const s of list) map.set(s.name, s)
+      setSkillStates(map)
+    } catch (err) {
+      console.warn('[Sidebar] failed to load skills:', err)
+    }
+  }, [])
+
+  useEffect(() => {
+    refreshSkills()
+  }, [refreshSkills])
 
   // Helper to get all folder paths
   const getAllFolderPaths = (node: FolderNode | null): string[] => {
@@ -966,8 +1021,15 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
         }}
       >
         <div className="space-y-1">
-          {/* Recursive folder tree */}
-          {folderTree.children && folderTree.children.map((folder) => (
+          {/* Recursive folder tree — system folders (Skills/) sink to the bottom */}
+          {folderTree.children && [...folderTree.children]
+            .sort((a, b) => {
+              const aSys = a.isSystem ? 1 : 0
+              const bSys = b.isSystem ? 1 : 0
+              if (aSys !== bSys) return aSys - bSys
+              return 0
+            })
+            .map((folder) => (
             <FolderTreeNode
               key={folder.path}
               folder={folder}
@@ -976,6 +1038,8 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
               currentNote={currentNote}
               collapsedFolders={collapsedFolders}
               dragOverFolder={dragOverFolder}
+              skillStates={skillStates}
+              onNewSkill={() => setNewSkillVisible(true)}
               onToggleFolder={toggleFolder}
               onNoteClick={handleNoteClick}
               onFolderContextMenu={handleFolderContextMenu}
@@ -1294,6 +1358,11 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
       <SessionManageModal
         visible={sessionManageVisible}
         onClose={() => setSessionManageVisible(false)}
+      />
+      <NewSkillModal
+        visible={newSkillVisible}
+        onClose={() => setNewSkillVisible(false)}
+        onCreated={() => { refreshSkills(); fetchFolders(); fetchNotes() }}
       />
     </>
   )

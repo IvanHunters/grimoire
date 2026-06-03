@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
+	"github.com/ivanohotnikov/markdown-editor/internal/skills"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 )
 
@@ -69,6 +70,11 @@ func (h *Handler) CreateNote(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.validator.Struct(req); err != nil {
 		http.Error(w, fmt.Sprintf("Validation error: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if skills.IsSkillPath(req.Folder) || skills.IsSkillPath(req.Folder+"/x") {
+		http.Error(w, "Use POST /api/skills to create entries under Skills/", http.StatusBadRequest)
 		return
 	}
 
@@ -216,6 +222,14 @@ func (h *Handler) UpdateNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.skills != nil && skills.IsSkillPath(note.Path) {
+		if err := h.skills.WriteNote(note); err != nil {
+			h.logger.Error("failed to write skill file", "path", note.Path, "error", err)
+			http.Error(w, "Failed to write skill file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
 	// Publish event for real-time sync
 	eventBus := events.GetEventBus()
 	eventBus.Publish(events.Event{
@@ -239,6 +253,13 @@ func (h *Handler) DeleteNote(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	store := storage.NewMongoStorage(h.db)
+
+	existing, err := store.GetNote(ctx, id)
+	if err == nil && skills.IsSkillPath(existing.Path) && existing.Type == models.NoteTypeSkill {
+		http.Error(w, "Use DELETE /api/skills/:name to delete a skill", http.StatusBadRequest)
+		return
+	}
+
 	if err := store.DeleteNote(ctx, id); err != nil {
 		h.logger.Error("failed to delete note", "id", id, "error", err)
 		http.Error(w, "Failed to delete note", http.StatusInternalServerError)

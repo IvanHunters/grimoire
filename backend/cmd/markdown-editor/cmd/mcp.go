@@ -13,6 +13,7 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
+	"github.com/ivanohotnikov/markdown-editor/internal/skills"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -48,6 +49,8 @@ type MCPContext struct {
 	logger         *slog.Logger
 	eventBus       *events.EventBus
 	config         *config.Config
+	skills         *skills.Syncer
+	skillSettings  *skills.SettingsStore
 }
 
 var mcpCmd = &cobra.Command{
@@ -59,12 +62,27 @@ var mcpCmd = &cobra.Command{
 
 // CreateMCPServer создаёт и настраивает MCP сервер
 func CreateMCPServer(store *storage.MongoStorage, sessionStorage *storage.SessionStorage, logger *slog.Logger, cfg *config.Config) *server.MCPServer {
+	return CreateMCPServerWithSkills(store, sessionStorage, logger, cfg, nil, nil)
+}
+
+// CreateMCPServerWithSkills creates the MCP server with an optional skills
+// syncer + settings store so skill tools can be registered.
+func CreateMCPServerWithSkills(
+	store *storage.MongoStorage,
+	sessionStorage *storage.SessionStorage,
+	logger *slog.Logger,
+	cfg *config.Config,
+	skillsSyncer *skills.Syncer,
+	skillsSettings *skills.SettingsStore,
+) *server.MCPServer {
 	mcpCtx := &MCPContext{
 		store:          store,
 		sessionStorage: sessionStorage,
 		logger:         logger,
 		eventBus:       events.GetEventBus(),
 		config:         cfg,
+		skills:         skillsSyncer,
+		skillSettings:  skillsSettings,
 	}
 
 	// Create MCP server
@@ -85,6 +103,9 @@ func CreateMCPServer(store *storage.MongoStorage, sessionStorage *storage.Sessio
 	registerProjectTools(s, mcpCtx)
 	registerTaskTools(s, mcpCtx)
 	registerSessionTools(s, mcpCtx)
+	if mcpCtx.skills != nil {
+		registerSkillTools(s, mcpCtx)
+	}
 
 	return s
 }

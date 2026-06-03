@@ -6,6 +6,7 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
+	"github.com/ivanohotnikov/markdown-editor/internal/skills"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -23,6 +24,8 @@ type Handler struct {
 	logger         *slog.Logger
 	sessionManager *claude.SessionManager
 	taskRunner     TaskRunner // optional — set after scheduler is created
+	skills         *skills.Syncer
+	skillSettings  *skills.SettingsStore
 }
 
 // NewHandler creates a new HTTP handler
@@ -38,3 +41,9 @@ func NewHandler(cfg *config.Config, db *mongo.Database, sessionManager *claude.S
 
 // SetTaskRunner wires the scheduler into the handler after startup.
 func (h *Handler) SetTaskRunner(r TaskRunner) { h.taskRunner = r }
+
+// SetSkills wires the skills syncer and settings store into the handler.
+func (h *Handler) SetSkills(syncer *skills.Syncer, settings *skills.SettingsStore) {
+	h.skills = syncer
+	h.skillSettings = settings
+}

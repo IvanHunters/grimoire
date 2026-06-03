@@ -2,6 +2,8 @@
 export interface Folder {
   path: string
   projectPath?: string
+  isSystem?: boolean
+  source?: string
   createdAt: string
 }
 
@@ -10,6 +12,8 @@ export interface FolderNode {
   name: string
   path: string
   projectPath?: string
+  isSystem?: boolean
+  source?: string
   children?: FolderNode[]
   // UI state (not from backend)
   isCollapsed?: boolean

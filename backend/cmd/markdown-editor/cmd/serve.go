@@ -17,6 +17,7 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	mw "github.com/ivanohotnikov/markdown-editor/internal/middleware"
 	"github.com/ivanohotnikov/markdown-editor/internal/scheduler"
+	"github.com/ivanohotnikov/markdown-editor/internal/skills"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 	"github.com/ivanohotnikov/markdown-editor/internal/websocket"
 	"github.com/mark3labs/mcp-go/server"
@@ -103,10 +104,31 @@ func runServe(cmd *cobra.Command, args []string) error {
 	schedCtx, schedCancel := context.WithCancel(context.Background())
 	go sched.Start(schedCtx)
 
+	// Setup skills syncer: mirror ~/.claude/skills/ into Mongo and propagate edits to disk.
+	skillsRoot, err := skills.DefaultRoot()
+	if err != nil {
+		return fmt.Errorf("resolve skills root: %w", err)
+	}
+	settingsPath, err := skills.DefaultSettingsPath()
+	if err != nil {
+		return fmt.Errorf("resolve settings path: %w", err)
+	}
+	skillSettings := skills.NewSettingsStore(settingsPath)
+	skillSyncer := skills.NewSyncer(skillsRoot, store, skillSettings, logger)
+	if err := skillSyncer.ImportAll(ctx); err != nil {
+		logger.Warn("skills import failed", slog.Any("error", err))
+	} else {
+		logger.Info("skills imported", slog.String("root", skillsRoot))
+	}
+	if err := skillSyncer.Start(); err != nil {
+		logger.Warn("skills watcher failed to start", slog.Any("error", err))
+	}
+	defer skillSyncer.Stop()
 
 	// Setup HTTP server
 	handler := api.NewHandler(cfg, db, manager, logger)
 	handler.SetTaskRunner(sched)
+	handler.SetSkills(skillSyncer, skillSettings)
 	wsHandler := websocket.NewHandler(cfg, manager, store, logger)
 	httpRouter := chi.NewRouter()
 	httpRouter.Use(mw.Recovery(logger))
@@ -116,7 +138,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// WebSocket upgrade (http.Hijack) breaks if ResponseWriter is wrapped by compress.
 
 	// Create MCP server
-	mcpServer := CreateMCPServer(store, sessionStorage, logger, cfg)
+	mcpServer := CreateMCPServerWithSkills(store, sessionStorage, logger, cfg, skillSyncer, skillSettings)
 	mcpHTTPServer := server.NewStreamableHTTPServer(mcpServer)
 
 	// Routes
@@ -177,6 +199,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Post("/tasks/{id}/comments", handler.AddComment)
 		r.Put("/tasks/{id}/comments/{commentId}", handler.UpdateComment)
 		r.Delete("/tasks/{id}/comments/{commentId}", handler.DeleteComment)
+
+		// Skills (mirror of ~/.claude/skills/)
+		r.Get("/skills", handler.ListSkills)
+		r.Post("/skills", handler.CreateSkill)
+		r.Delete("/skills/{name}", handler.DeleteSkill)
+		r.Post("/skills/{name}/state", handler.SetSkillState)
+		r.Post("/skills/refresh", handler.RefreshSkills)
 	})
 
 	// WebSocket endpoint (on same port as HTTP API, no separate server needed)

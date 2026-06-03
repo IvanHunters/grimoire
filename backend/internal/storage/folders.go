@@ -54,8 +54,17 @@ func (s *MongoStorage) CreateFolder(ctx context.Context, folder *models.Folder) 
 	return nil
 }
 
+// ErrSystemFolder is returned when an operation is rejected because the folder
+// is marked as system-managed (e.g. the Skills/ mirror of ~/.claude/skills/).
+var ErrSystemFolder = fmt.Errorf("folder is system-managed and cannot be modified")
+
 // DeleteFolder deletes a folder and all its notes
 func (s *MongoStorage) DeleteFolder(ctx context.Context, path string) error {
+	existing, err := s.GetFolder(ctx, path)
+	if err == nil && existing.IsSystem {
+		return ErrSystemFolder
+	}
+
 	// First, delete all notes in this folder and subfolders
 	notesCollection := s.db.Collection(notesCollection)
 
@@ -67,8 +76,7 @@ func (s *MongoStorage) DeleteFolder(ctx context.Context, path string) error {
 		},
 	}
 
-	_, err := notesCollection.DeleteMany(ctx, filter)
-	if err != nil {
+	if _, err := notesCollection.DeleteMany(ctx, filter); err != nil {
 		return fmt.Errorf("failed to delete notes in folder: %w", err)
 	}
 
@@ -119,6 +127,8 @@ func BuildFolderTree(folders []*models.Folder) *models.FolderNode {
 			Name:        name,
 			Path:        folder.Path,
 			ProjectPath: folder.ProjectPath,
+			IsSystem:    folder.IsSystem,
+			Source:      folder.Source,
 			Children:    make([]*models.FolderNode, 0),
 		}
 
@@ -146,6 +156,10 @@ func (s *MongoStorage) MoveFolder(ctx context.Context, fromPath, toPath string) 
 	}
 	if fromPath == toPath {
 		return fmt.Errorf("from and to paths are the same")
+	}
+
+	if existing, err := s.GetFolder(ctx, fromPath); err == nil && existing.IsSystem {
+		return ErrSystemFolder
 	}
 
 	// Check if destination folder already exists

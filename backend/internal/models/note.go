@@ -4,6 +4,13 @@ import (
 	"time"
 )
 
+// Note type values stored in Note.Type.
+const (
+	NoteTypeProject       = "project"
+	NoteTypeSkill         = "skill"
+	NoteTypeSkillResource = "skill-resource"
+)
+
 // Note represents a markdown note
 type Note struct {
 	ID             string    `json:"id" bson:"id"`
