@@ -167,13 +167,15 @@ function FolderTreeNode({
               onContextMenu={(e) => onNoteContextMenu(e, note)}
               onDragStart={(e) => onNoteDragStart(e, note)}
               onDragEnd={onNoteDragEnd}
-              className={`w-full flex items-center gap-2 py-1.5 rounded text-left transition ${
+              className={`w-full flex items-center gap-1.5 py-1.5 rounded text-left transition ${
                 currentNote?.id === note.id
                   ? 'bg-cyan-500/10 border-l-2 border-cyan-500/50'
                   : 'hover:bg-white/[0.04] border-l-2 border-transparent'
               }`}
               style={{ paddingLeft: `${(level + 1) * 12 + 6}px` }}
             >
+              {/* Chevron-width spacer so note icons align with sibling sub-folder icons */}
+              <span className="w-3.5 flex-shrink-0" />
               <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${currentNote?.id === note.id ? 'text-cyan-500' : 'text-slate-600'}`} />
               <span className={`text-xs font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
             </button>
@@ -981,12 +983,15 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
                 onContextMenu={(e) => handleNoteContextMenu(e, note)}
                 onDragStart={(e) => handleNoteDragStart(e, note)}
                 onDragEnd={handleNoteDragEnd}
-                className={`w-full flex items-center gap-2 px-2 py-1.5 rounded text-left transition ${
+                className={`w-full flex items-center gap-1.5 py-1.5 rounded text-left transition ${
                   currentNote?.id === note.id
-                    ? 'bg-cyan-500/10 border-l-2 border-cyan-500/50 pl-1.5'
+                    ? 'bg-cyan-500/10 border-l-2 border-cyan-500/50'
                     : 'hover:bg-white/[0.04] border-l-2 border-transparent'
                 }`}
+                style={{ paddingLeft: '6px' }}
               >
+                {/* Chevron-width spacer so root note icons align with root folder icons */}
+                <span className="w-3.5 flex-shrink-0" />
                 <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${currentNote?.id === note.id ? 'text-cyan-500' : 'text-slate-600'}`} />
                 <span className={`text-xs font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
               </button>
