@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/ivanohotnikov/markdown-editor/internal/api"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/daemon"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	mw "github.com/ivanohotnikov/markdown-editor/internal/middleware"
 	"github.com/ivanohotnikov/markdown-editor/internal/scheduler"
@@ -99,6 +100,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// timeout := time.Duration(cfg.SessionTimeout) * time.Second
 	// manager.MonitorInactiveSessions(timeout, 1*time.Minute)
 
+	// Hold a persistent connection to the claude daemon for the lifetime
+	// of grimoire. Per `claude daemon --help`, the supervisor exits when
+	// its last client disconnects — and takes all worker sessions with
+	// it. Our regular daemon.Client opens short-lived sockets per call,
+	// so without this keep-alive the daemon thinks "no clients" between
+	// requests and reaps everything within seconds. With it, claude
+	// daemon stays up as long as grimoire is up.
+	daemonKeepAliveCancel := func() {}
+	if os.Getenv("USE_DAEMON_BACKEND") != "" {
+		keepAliveClient := &daemon.Client{Logger: logger}
+		daemonKeepAliveCancel = keepAliveClient.StartKeepAlive(2 * time.Second)
+		logger.Info("daemon keep-alive started")
+		// Kill orphan grimoire-* workers that have no JSONL on disk —
+		// leftovers from previous backend lives where the user never
+		// typed into a spawned session. Without this they accumulate
+		// in the sidebar as "···<short>" placeholders forever.
+		go claude.SweepOrphanWorkers(logger)
+	}
+
 	// Setup task scheduler
 	sched := scheduler.New(store, cfg.MongoDBURI, cfg.MongoDBDatabase, logger)
 	schedCtx, schedCancel := context.WithCancel(context.Background())
@@ -129,7 +149,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	handler := api.NewHandler(cfg, db, manager, logger)
 	handler.SetTaskRunner(sched)
 	handler.SetSkills(skillSyncer, skillSettings)
-	wsHandler := websocket.NewHandler(cfg, manager, store, logger)
+	wsHandler := websocket.NewHandler(cfg, manager, store, sessionStorage, logger)
 	httpRouter := chi.NewRouter()
 	httpRouter.Use(mw.Recovery(logger))
 	httpRouter.Use(mw.Logging(logger))
@@ -167,12 +187,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Post("/import/db", handler.ImportDB)
 
 		r.Get("/sessions", handler.ListSessions)
-		r.Get("/sessions/stats", handler.SessionStats)
-		r.Get("/sessions/all", handler.ListAllSessions)
-		r.Post("/sessions/rotate", handler.RotateSessions)
+		r.Get("/sessions/by-project", handler.SessionsByCwd)
+		r.Get("/sessions/search", handler.SearchSessions)
+		r.Post("/sessions/import", handler.ImportSession)
 		r.Delete("/sessions/{id}", handler.DeleteSession)
+		r.Get("/sessions/{id}/status", handler.SessionStatus)
+		r.Get("/sessions/{id}/transcript", handler.SessionTranscript)
+		r.Get("/sessions/{id}/jsonl", handler.SessionRawJSONL)
 		r.Put("/sessions/{id}/name", handler.RenameSession)
-		r.Delete("/sessions/{id}/history", handler.ClearSessionHistory)
+		r.Post("/sessions/{id}/compact", handler.CompactSession)
 
 		// Projects
 		r.Get("/projects", handler.ListProjects)
@@ -250,8 +273,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Stop scheduler
 	schedCancel()
 
-	// Close all Claude sessions
+	// Close all Claude sessions (detach-only; daemon workers survive)
 	manager.CloseAll()
+
+	// Release the daemon keep-alive socket AFTER detach. This lets the
+	// daemon shut itself down if no other clients hold it — or stay up
+	// if `claude attach` or another grimoire instance is still alive.
+	daemonKeepAliveCancel()
 
 	// Graceful shutdown
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -1,22 +1,26 @@
 package claude
 
 import (
-	"os"
+	"io"
 	"os/exec"
 	"sync"
 	"time"
 
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/daemon"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 )
 
 const maxOutputBufferSize = 500 * 1024 // 500KB terminal output buffer
 
-// ClaudeSession represents an active Claude subprocess session
+// ClaudeSession represents an active Claude session. Backed by either a
+// local subprocess (Cmd != nil, PTY is a creack/pty *os.File) or by the
+// claude daemon (Cmd == nil, PTY is a *daemon.AttachConn). Callers should
+// not assume which — use the methods, not the underlying type.
 type ClaudeSession struct {
 	ID            string
 	Name          string
-	Cmd           *exec.Cmd
-	PTY           *os.File // Pseudo-terminal for interactive control
+	Cmd           *exec.Cmd          // nil when daemon-backed
+	PTY           io.ReadWriteCloser // PTY for subprocess; AttachConn for daemon
 	DangerousMode bool
 	WorkingDir    string
 	MCPConfigPath string
@@ -24,9 +28,37 @@ type ClaudeSession struct {
 	LastActivity  time.Time
 	Messages      []models.ClaudeMessage // History stored on backend
 	OutputBuffer  []byte                 // Circular buffer for terminal output (last 500KB)
-	subscribers   []chan []byte          // Fan-out: each WebSocket connection gets its own channel
-	subMu         sync.Mutex
-	mu            sync.Mutex
+
+	// Daemon-backend fields. All nil/empty for subprocess sessions.
+	DaemonClient *daemon.Client // socket client; non-nil ↔ daemon-backed
+	DaemonShort  string         // 8-hex short id used by daemon ops
+	DaemonUUID   string         // full UUID claude assigned (differs from ID)
+
+	// ContextPromptSent is set to true after the handler has injected
+	// the "SESSION CONTEXT" prompt into the terminal once. Without this
+	// flag, every WS reconnect within seconds of session creation would
+	// re-paste the entire context block into a working terminal.
+	ContextPromptSent bool
+
+	subscribers []chan []byte // Fan-out: each WebSocket connection gets its own channel
+	subMu       sync.Mutex
+	mu          sync.Mutex
+}
+
+// IsDaemonBacked reports whether this session is hosted by the claude
+// daemon vs. a local subprocess we own.
+func (s *ClaudeSession) IsDaemonBacked() bool { return s.DaemonClient != nil }
+
+// Resize forwards a terminal-size change to the right backend: the daemon
+// over op:resize, or the local PTY via creack/pty.Setsize. The latter is
+// implemented in subprocess.go because it requires a *os.File.
+func (s *ClaudeSession) Resize(cols, rows int) error {
+	if s.IsDaemonBacked() {
+		if ac, ok := s.PTY.(*daemon.AttachConn); ok {
+			return ac.Resize(cols, rows)
+		}
+	}
+	return resizeSubprocessPTY(s.PTY, cols, rows)
 }
 
 // SendMessage sends a message to the Claude subprocess

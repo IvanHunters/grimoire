@@ -17,8 +17,17 @@ type CurrentNote struct {
 	ProjectPath string `json:"projectPath"`
 }
 
-// DetermineWorkingDir determines the working directory for Claude subprocess
-// Priority: note projectPath → folder projectPath (inherited) → /tmp/claude-{hash}
+// DetermineWorkingDir determines the working directory for a Claude session.
+//
+// Priority:
+//  1. Note's explicit projectPath (links a note to a repo on disk)
+//  2. Folder-inherited projectPath
+//  3. Persistent per-note dir at ~/.markdown-editor/sessions/<hash>/
+//     (was /tmp/claude-<hash> before — wiped on reboot; now survives)
+//  4. System temp dir as last-resort fallback
+//
+// Sessions in tier 3 accumulate over time. A periodic GC (not implemented
+// here) should sweep dirs older than N days whose notes no longer exist.
 func DetermineWorkingDir(currentNote *CurrentNote, folderProjectPath string, sessionID string) (string, error) {
 	// Priority 1: Explicit project path from note metadata
 	if currentNote != nil && currentNote.ProjectPath != "" {
@@ -36,15 +45,37 @@ func DetermineWorkingDir(currentNote *CurrentNote, folderProjectPath string, ses
 		}
 	}
 
-	// Priority 3: Temp directory with hash of note path
-	hash := hashNotePath(currentNote)
-	tempDir := filepath.Join("/tmp", fmt.Sprintf("claude-%s", hash))
-	if err := os.MkdirAll(tempDir, 0755); err == nil {
-		return tempDir, nil
+	// Priority 3: Persistent per-note directory.
+	if dataDir, err := sessionsDataDir(); err == nil {
+		hash := hashNotePath(currentNote)
+		sessionDir := filepath.Join(dataDir, hash)
+		if err := os.MkdirAll(sessionDir, 0755); err == nil {
+			return sessionDir, nil
+		}
 	}
 
 	// Fallback: system temp directory
 	return os.TempDir(), nil
+}
+
+// sessionsDataDir returns the persistent root for per-note session cwds.
+// Defaults to ~/.markdown-editor/sessions/, overridable via the
+// MARKDOWN_EDITOR_DATA_DIR env var (in which case the leaf is /sessions).
+// The directory is created on first call.
+func sessionsDataDir() (string, error) {
+	root := os.Getenv("MARKDOWN_EDITOR_DATA_DIR")
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("home dir: %w", err)
+		}
+		root = filepath.Join(home, ".markdown-editor")
+	}
+	sessions := filepath.Join(root, "sessions")
+	if err := os.MkdirAll(sessions, 0755); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", sessions, err)
+	}
+	return sessions, nil
 }
 
 // hashNotePath creates a hash from note folder and name

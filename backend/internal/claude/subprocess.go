@@ -3,6 +3,7 @@ package claude
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -15,15 +16,42 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 )
 
-// startPTYReader reads from PTY and broadcasts to all subscribers
+// resizeSubprocessPTY changes the PTY size of a locally-owned subprocess
+// session. Returns an error if rw isn't actually a *os.File (which is the
+// case for daemon-backed sessions — those route resize through
+// ClaudeSession.Resize → AttachConn.Resize instead).
+func resizeSubprocessPTY(rw io.ReadWriteCloser, cols, rows int) error {
+	f, ok := rw.(*os.File)
+	if !ok {
+		return fmt.Errorf("resize: PTY is not *os.File (backend mismatch)")
+	}
+	return pty.Setsize(f, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
+// startPTYReader reads from PTY and broadcasts to all subscribers. Works
+// for both backends — session.PTY is io.ReadWriteCloser. On exit it
+// always closes subscribers; for subprocess sessions the cmd.Wait
+// goroutine also calls CloseAllSubscriptions but it's idempotent.
 func startPTYReader(session *ClaudeSession, logger *slog.Logger) {
-	logger.Info("starting PTY reader", slog.String("session_id", session.ID))
+	logger.Info("starting PTY reader",
+		slog.String("session_id", session.ID),
+		slog.Bool("daemon_backed", session.IsDaemonBacked()),
+	)
+	defer session.CloseAllSubscriptions()
 	buf := make([]byte, 4096)
 
 	for {
 		n, err := session.PTY.Read(buf)
 		if err != nil {
-			if err.Error() != "EOF" && err.Error() != "read /dev/ptmx: input/output error" {
+			msg := err.Error()
+			// All three are expected on a clean session close:
+			//   - "EOF" from creack/pty when subprocess exits
+			//   - "input/output error" from creack/pty on macOS at slave-side close
+			//   - "use of closed network connection" from daemon AttachConn on shutdown
+			isExpected := msg == "EOF" ||
+				msg == "read /dev/ptmx: input/output error" ||
+				strings.Contains(msg, "use of closed network connection")
+			if !isExpected {
 				logger.Error("PTY read error", slog.Any("error", err))
 			}
 			logger.Info("PTY reader stopped", slog.String("session_id", session.ID))
@@ -147,19 +175,42 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 	return session, nil
 }
 
-// shutdownSession gracefully shuts down a Claude session
+// shutdownSession gracefully shuts down a Claude session. Branches on the
+// backend: daemon-backed sessions go through op:kill on the daemon (the
+// daemon owns the process lifecycle); subprocess-backed sessions follow
+// the classic Ctrl+D → SIGTERM → SIGKILL escalation.
 func shutdownSession(session *ClaudeSession, logger *slog.Logger) error {
 	logger.Info("shutting down claude session",
 		slog.String("session_id", session.ID),
+		slog.Bool("daemon_backed", session.IsDaemonBacked()),
 	)
 
+	if session.IsDaemonBacked() {
+		return shutdownDaemonSession(session, logger, true)
+	}
+	return shutdownSubprocessSession(session, logger)
+}
+
+// detachSession releases our local hold on a session without killing
+// the underlying worker. Use for graceful grimoire shutdown so daemon
+// workers survive the restart — user can re-attach next time.
+func detachSession(session *ClaudeSession, logger *slog.Logger) error {
+	if session.IsDaemonBacked() {
+		return shutdownDaemonSession(session, logger, false)
+	}
+	// Subprocess sessions can't survive grimoire restart — they're our
+	// child processes. Full shutdown is the only option.
+	return shutdownSubprocessSession(session, logger)
+}
+
+func shutdownSubprocessSession(session *ClaudeSession, logger *slog.Logger) error {
 	// Step 1: Send Ctrl+D (EOF) to PTY
 	if session.PTY != nil {
 		_, _ = session.PTY.Write([]byte{4}) // ASCII 4 = Ctrl+D
 		time.Sleep(2 * time.Second)
 
 		// Check if process exited
-		if session.Cmd.ProcessState == nil || !session.Cmd.ProcessState.Exited() {
+		if session.Cmd != nil && (session.Cmd.ProcessState == nil || !session.Cmd.ProcessState.Exited()) {
 			// Step 2: Send SIGTERM
 			logger.Info("sending SIGTERM to claude subprocess",
 				slog.String("session_id", session.ID),
@@ -191,6 +242,51 @@ func shutdownSession(session *ClaudeSession, logger *slog.Logger) error {
 		slog.String("session_id", session.ID),
 	)
 
+	return nil
+}
+
+// shutdownDaemonSession releases this side of a daemon-hosted session.
+// killWorker=true tells the daemon to fully terminate the worker
+// (used when the user explicitly kills/restarts the session). false
+// detaches only — the worker keeps running in the daemon so the user
+// can re-attach later (used during grimoire graceful shutdown so a
+// backend restart doesn't take user's live conversations with it).
+func shutdownDaemonSession(session *ClaudeSession, logger *slog.Logger, killWorker bool) error {
+	// 1. Close our local attach (detach from the daemon-hosted PTY).
+	if session.PTY != nil {
+		if err := session.PTY.Close(); err != nil {
+			logger.Debug("attach close error (often expected at shutdown)",
+				slog.String("session_id", session.ID),
+				slog.Any("error", err),
+			)
+		}
+	}
+
+	// 2. Optionally tell the daemon to kill the worker too. We use Remove
+	// (kill + jobdir cleanup) so we don't leak ~/.claude/jobs/<short>/
+	// entries when explicitly closing. On graceful shutdown we SKIP this:
+	// the daemon worker stays alive across grimoire restarts, which is
+	// the whole point of the daemon backend.
+	if killWorker && session.DaemonClient != nil && session.DaemonShort != "" {
+		if err := session.DaemonClient.Remove(session.DaemonShort); err != nil {
+			logger.Error("daemon remove failed",
+				slog.String("session_id", session.ID),
+				slog.String("daemon_short", session.DaemonShort),
+				slog.Any("error", err),
+			)
+			// Non-fatal: even if the daemon doesn't ack the kill, we've
+			// already detached locally so our state is consistent.
+		}
+	}
+
+	// 3. Close subscribers — the daemon-backed reader goroutine usually
+	// does this on EOF, but if shutdown races ahead we close here too.
+	session.CloseAllSubscriptions()
+
+	logger.Info("daemon-backed session shutdown complete",
+		slog.String("session_id", session.ID),
+		slog.Bool("worker_killed", killWorker),
+	)
 	return nil
 }
 

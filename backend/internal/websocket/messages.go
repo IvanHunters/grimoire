@@ -26,6 +26,43 @@ type WSMessage struct {
 	TaskContext   *TaskContext         `json:"taskContext,omitempty"`
 	Cols          int                 `json:"cols,omitempty"`
 	Rows          int                 `json:"rows,omitempty"`
+
+	// ResumeFromSessionID, when set on an "init" message, tells the
+	// backend to spawn the claude session via --resume <uuid> instead
+	// of starting fresh. The cwd is resolved from the historical
+	// session's JSONL header, ignoring the usual DetermineWorkingDir
+	// chain. Used by the "Continue this session" button on a historical
+	// transcript view.
+	ResumeFromSessionID string `json:"resumeFromSessionId,omitempty"`
+
+	// ResumeFork, when paired with ResumeFromSessionID, passes
+	// --fork-session to claude so the new session branches off a copy
+	// of the transcript instead of continuing the original. The new
+	// session gets its own UUID assigned by the daemon. Used by the
+	// "Fork" button alongside "Continue".
+	ResumeFork bool `json:"resumeFork,omitempty"`
+
+	// AttachToSessionID, when set, tells the backend to attach to a
+	// live daemon worker by its UUID instead of spawning or resuming.
+	// Used when the user clicks an active session in the sidebar — we
+	// connect to the existing PTY rather than dispatching a new
+	// process. Falls through to error if the daemon doesn't know that
+	// UUID. Cwd from the daemon record is used; CurrentNote is ignored.
+	AttachToSessionID string `json:"attachToSessionId,omitempty"`
+
+	// SessionName, when set, is the user-given display name for the
+	// session being spawned/resumed/forked. Persisted to the Mongo
+	// overlay so the sidebar listing shows it instead of the daemon's
+	// structured token ("grimoire-fork-…", etc). Only honored when
+	// non-empty and not a "grimoire-" structured token itself.
+	SessionName string `json:"sessionName,omitempty"`
+
+	// SkipContextPrompt is an internal flag set by handleRestartSession
+	// when calling handleInit. It tells the init code path to mark the
+	// new session's ContextPromptSent=true upfront so the SESSION
+	// CONTEXT wall of text doesn't get re-pasted into the terminal on
+	// every restart. Not exposed via JSON — only the handler sets it.
+	SkipContextPrompt bool `json:"-"`
 }
 
 // WSResponse represents a WebSocket message to client

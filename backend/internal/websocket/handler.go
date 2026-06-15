@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/discovery"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
@@ -43,19 +43,21 @@ var upgrader = websocket.Upgrader{
 
 // Handler handles WebSocket connections for Claude chat
 type Handler struct {
-	cfg     *config.Config
-	manager *claude.SessionManager
-	storage *storage.MongoStorage
-	logger  *slog.Logger
+	cfg            *config.Config
+	manager        *claude.SessionManager
+	storage        *storage.MongoStorage
+	sessionStorage *storage.SessionStorage
+	logger         *slog.Logger
 }
 
 // NewHandler creates a new WebSocket handler
-func NewHandler(cfg *config.Config, manager *claude.SessionManager, store *storage.MongoStorage, logger *slog.Logger) *Handler {
+func NewHandler(cfg *config.Config, manager *claude.SessionManager, store *storage.MongoStorage, sessionStorage *storage.SessionStorage, logger *slog.Logger) *Handler {
 	return &Handler{
-		cfg:     cfg,
-		manager: manager,
-		storage: store,
-		logger:  logger,
+		cfg:            cfg,
+		manager:        manager,
+		storage:        store,
+		sessionStorage: sessionStorage,
+		logger:         logger,
 	}
 }
 
@@ -155,20 +157,74 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 		}
 	}
 
-	// Determine working directory
-	workingDir, err := claude.DetermineWorkingDir(msg.CurrentNote, folderProjectPath, msg.SessionID)
-	if err != nil {
-		h.logger.Error("failed to determine working directory", slog.Any("error", err))
-		conn.WriteJSON(WSResponse{
-			Type:  "error",
-			Error: "Failed to determine working directory",
-		})
-		return
+	// Determine working directory. For resume flows we override with the
+	// historical session's cwd — claude resolves the transcript via
+	// (cwd, sessionId), so the cwd must match. For attach flows the
+	// daemon's record carries the cwd, we pick it up in GetOrAttach
+	// itself; here we just leave workingDir blank for that path.
+	var workingDir string
+	if msg.AttachToSessionID != "" {
+		// Cwd comes from the daemon record; no lookup needed.
+	} else if msg.ResumeFromSessionID != "" {
+		path, lookupErr := discovery.SessionPath(msg.ResumeFromSessionID)
+		if lookupErr != nil {
+			h.logger.Error("resume target not found",
+				slog.String("resume_from", msg.ResumeFromSessionID),
+				slog.Any("error", lookupErr),
+			)
+			conn.WriteJSON(WSResponse{
+				Type:  "error",
+				Error: "Historical session not found on disk",
+			})
+			return
+		}
+		header, hdrErr := discovery.ReadHeader(path)
+		if hdrErr != nil || header.Cwd == "" {
+			h.logger.Error("resume target has no cwd in header",
+				slog.String("resume_from", msg.ResumeFromSessionID),
+				slog.Any("error", hdrErr),
+			)
+			conn.WriteJSON(WSResponse{
+				Type:  "error",
+				Error: "Could not determine cwd for resume",
+			})
+			return
+		}
+		workingDir = header.Cwd
+		h.logger.Info("resume cwd resolved",
+			slog.String("resume_from", msg.ResumeFromSessionID),
+			slog.String("cwd", workingDir),
+		)
+	} else {
+		var ddErr error
+		workingDir, ddErr = claude.DetermineWorkingDir(msg.CurrentNote, folderProjectPath, msg.SessionID)
+		if ddErr != nil {
+			h.logger.Error("failed to determine working directory", slog.Any("error", ddErr))
+			conn.WriteJSON(WSResponse{
+				Type:  "error",
+				Error: "Failed to determine working directory",
+			})
+			return
+		}
 	}
 
-	// Determine session name from current note or task
+	// Determine session name from current note or task.
+	// Only apply the note's title to genuinely note-bound sessions
+	// (sessionId starting with "note-"). For global-* tabs, daemon
+	// UUIDs, or attach/resume flows, the note in the editor is
+	// incidental — the session has its own identity (daemon name,
+	// JSONL ai-title). Naming an unrelated chat after whatever note
+	// happened to be open created the "every session shows the same
+	// title" confusion users reported.
 	sessionName := ""
-	if msg.CurrentNote != nil && msg.CurrentNote.Name != "" {
+	isNoteBound := strings.HasPrefix(msg.SessionID, "note-") && !strings.HasPrefix(msg.SessionID, "note-task-")
+	// Explicit name from the WS payload wins — fork-from-kebab,
+	// rename-on-the-fly, or anything that lets the user pick a label.
+	// Reject "grimoire-…" tokens (only sent in error / by integration
+	// tests that forwarded the structured name verbatim).
+	if msg.SessionName != "" && !strings.HasPrefix(msg.SessionName, "grimoire-") {
+		sessionName = msg.SessionName
+	} else if isNoteBound && msg.CurrentNote != nil && msg.CurrentNote.Name != "" {
 		sessionName = msg.CurrentNote.Name
 	} else if msg.TaskContext != nil && msg.TaskContext.Title != "" {
 		title := msg.TaskContext.Title
@@ -186,15 +242,77 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 		systemPrompt = buildTaskSystemPrompt(msg.TaskContext, folderProjectPath)
 	}
 
-	// Get or create session
-	session, err := h.manager.GetOrCreate(msg.SessionID, msg.DangerousMode, workingDir, sessionName, systemPrompt)
-	if err != nil {
-		h.logger.Error("failed to create session", slog.Any("error", err))
+	// Stash frontend cols/rows for the immediate daemon Dispatch/Attach.
+	// Without this, claude renders initial scrollback at the daemon
+	// default 80x24, and the subsequent terminal_resize SIGWINCH only
+	// repaints the current screen — scrollback retains 80-col wrap,
+	// xterm shows misaligned text until claude redraws.
+	if msg.Cols > 0 && msg.Rows > 0 {
+		claude.SetPendingDims(msg.SessionID, msg.Cols, msg.Rows)
+	}
+
+	// Write the user-given name into the overlay keyed by grimoireID
+	// BEFORE spawn so the very next sidebar poll picks it up — even
+	// if it lands before manager.sessions[grimoireID] is populated.
+	// Listing.go's managedInfo also feeds the name, but only after
+	// the spawn goroutine finishes. Belt and braces.
+	if msg.SessionName != "" && !strings.HasPrefix(msg.SessionName, "grimoire-") && h.sessionStorage != nil {
+		go func(id, name string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.sessionStorage.UpsertSessionName(ctx, id, name); err != nil {
+				h.logger.Warn("preflight overlay write (non-fatal)",
+					slog.String("session_id", id), slog.Any("error", err))
+			}
+		}(msg.SessionID, msg.SessionName)
+	}
+
+	// Spawn (or attach to existing) session. Three branches:
+	//   AttachToSessionID → daemon.Attach on existing live worker
+	//   ResumeFromSessionID → claude --resume from on-disk JSONL
+	//   default → fresh spawn (subprocess or daemon dispatch)
+	var session *claude.ClaudeSession
+	var spawnErr error
+	switch {
+	case msg.AttachToSessionID != "":
+		session, spawnErr = h.manager.GetOrAttach(msg.SessionID, msg.AttachToSessionID)
+	case msg.ResumeFromSessionID != "":
+		session, spawnErr = h.manager.GetOrResume(msg.SessionID, msg.ResumeFromSessionID, workingDir, sessionName, msg.ResumeFork)
+	default:
+		session, spawnErr = h.manager.GetOrCreate(msg.SessionID, msg.DangerousMode, workingDir, sessionName, systemPrompt)
+	}
+	if spawnErr != nil {
+		h.logger.Error("failed to create session", slog.Any("error", spawnErr))
 		conn.WriteJSON(WSResponse{
 			Type:  "error",
 			Error: "Failed to create Claude session",
 		})
 		return
+	}
+
+	// Persist the user-given name to the Mongo overlay keyed by the
+	// daemon's session UUID. The listing code reads overlay first, so
+	// after this write the sidebar shows the human name instead of the
+	// daemon's "grimoire-fork-…" structured token. Skip for note-bound
+	// sessions: they don't have a separate daemon UUID exposed in the
+	// listing the same way, and the listing already pulls the right
+	// name from the note path. Best-effort — log on failure.
+	if msg.SessionName != "" && !strings.HasPrefix(msg.SessionName, "grimoire-") && h.sessionStorage != nil && session.DaemonUUID != "" {
+		go func(uuid, name string) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// Upsert (not Update) — for fresh forks/resumes the Mongo
+			// record keyed by daemon UUID doesn't exist yet (it's
+			// keyed by our grimoireID), so a strict Update fails with
+			// MatchedCount=0 and the overlay name is never persisted.
+			// Listing then falls back to the daemon's "grimoire-fork-…"
+			// token which we sanitize to "···<short>" — exactly what
+			// the user reported as "хрен знает с каким именем".
+			if err := h.sessionStorage.UpsertSessionName(ctx, uuid, name); err != nil {
+				h.logger.Warn("save overlay name (non-fatal)",
+					slog.String("session_uuid", uuid), slog.Any("error", err))
+			}
+		}(session.DaemonUUID, msg.SessionName)
 	}
 
 	// Send success response
@@ -228,8 +346,17 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 			SessionID: session.ID,
 			Messages:  messages,
 		})
-	} else if msg.CurrentNote != nil {
-		// Send automatic context prompt for new sessions
+	} else if msg.SkipContextPrompt {
+		// Handler-internal hint (e.g. from restart) says don't inject
+		// context. Mark sent so future reconnects also skip.
+		session.ContextPromptSent = true
+	} else if msg.CurrentNote != nil && !session.ContextPromptSent && msg.ResumeFromSessionID == "" {
+		// Send automatic context prompt — once per session lifetime,
+		// AND only on fresh spawns. When the session was resumed via
+		// `claude --bg --resume`, the JSONL already carries the prior
+		// SESSION CONTEXT in claude's model state, so re-pasting it
+		// just spams the visible terminal with duplicate text.
+		session.ContextPromptSent = true
 		var contextParts []string
 
 		contextParts = append(contextParts, "===========================================================")
@@ -502,9 +629,24 @@ func (h *Handler) handleSwitchSession(conn *wsWriter, msg *WSMessage) {
 	})
 }
 
-// handleRestartSession restarts a session with preserved history
+// handleRestartSession restarts a session with preserved history.
+//
+// Capture the prior daemon worker's UUID BEFORE Close kills it — that
+// UUID is the JSONL file claude has been writing to, and we want the
+// new process to continue from it via `claude --bg --resume <uuid>`.
+// Otherwise restart spawns a blank claude that has no memory of the
+// conversation and re-injects the entire SESSION CONTEXT wall.
 func (h *Handler) handleRestartSession(ctx context.Context, conn *wsWriter, msg *WSMessage) {
-	// Close existing session
+	// Restart never wants the SESSION CONTEXT wall re-pasted into the
+	// terminal — the user explicitly asked to restart, not be re-onboarded.
+	// Flag the init code path to mark ContextPromptSent=true upfront.
+	msg.SkipContextPrompt = true
+
+	resumeFromUUID := ""
+	if existing, err := h.manager.Get(msg.SessionID); err == nil && existing != nil {
+		resumeFromUUID = existing.DaemonUUID
+	}
+
 	if err := h.manager.Close(msg.SessionID); err != nil {
 		h.logger.Warn("failed to close session for restart",
 			slog.String("session_id", msg.SessionID),
@@ -512,7 +654,29 @@ func (h *Handler) handleRestartSession(ctx context.Context, conn *wsWriter, msg 
 		)
 	}
 
-	// Initialize new session
+	// Only route through resume when the prior worker actually wrote a
+	// JSONL transcript. Warm-spare workers that never received a user
+	// message exist in the daemon but have no on-disk file — passing
+	// their UUID to handleInit's resume branch would fail with
+	// "transcript not found" and abort the whole restart. Empty
+	// resumeFromUUID (or non-existent path) falls back to default
+	// fresh-spawn path.
+	if resumeFromUUID != "" {
+		if _, pathErr := discovery.SessionPath(resumeFromUUID); pathErr == nil {
+			msg.ResumeFromSessionID = resumeFromUUID
+			msg.ResumeFork = false
+			h.logger.Info("restart with resume",
+				slog.String("session_id", msg.SessionID),
+				slog.String("resume_from", resumeFromUUID),
+			)
+		} else {
+			h.logger.Info("restart without resume (no transcript yet)",
+				slog.String("session_id", msg.SessionID),
+				slog.String("daemon_uuid", resumeFromUUID),
+			)
+		}
+	}
+
 	h.handleInit(ctx, conn, msg)
 }
 
@@ -521,16 +685,20 @@ func (h *Handler) handleTerminalResize(conn *websocket.Conn, msg *WSMessage) {
 	if msg.Cols <= 0 || msg.Rows <= 0 {
 		return
 	}
+	h.logger.Debug("resize",
+		slog.String("session_id", msg.SessionID),
+		slog.Int("cols", msg.Cols),
+		slog.Int("rows", msg.Rows),
+	)
 
 	session, err := h.manager.Get(msg.SessionID)
 	if err != nil {
 		return
 	}
 
-	if err := pty.Setsize(session.PTY, &pty.Winsize{
-		Rows: uint16(msg.Rows),
-		Cols: uint16(msg.Cols),
-	}); err != nil {
+	// session.Resize routes to creack/pty for subprocess sessions or
+	// daemon.AttachConn.Resize for daemon-backed ones.
+	if err := session.Resize(msg.Cols, msg.Rows); err != nil {
 		h.logger.Error("failed to resize PTY",
 			slog.String("session_id", msg.SessionID),
 			slog.Any("error", err),

@@ -11,26 +11,6 @@ type ClaudeMessage struct {
 	Timestamp time.Time `json:"timestamp" bson:"timestamp"`
 }
 
-// SessionMeta is a lightweight session view without message bodies.
-type SessionMeta struct {
-	ID           string    `json:"id" bson:"_id"`
-	Name         string    `json:"name" bson:"name"`
-	Status       string    `json:"status" bson:"status"`
-	WorkingDir   string    `json:"workingDir" bson:"working_dir"`
-	LastActivity time.Time `json:"lastActivity" bson:"last_activity"`
-	CreatedAt    time.Time `json:"createdAt" bson:"created_at"`
-	MessageCount int       `json:"messageCount" bson:"message_count"`
-	SizeBytes    int       `json:"sizeBytes" bson:"size_bytes"`
-}
-
-// SessionStats holds aggregate statistics for the sessions collection.
-type SessionStats struct {
-	TotalSessions  int     `json:"totalSessions"`
-	ActiveSessions int     `json:"activeSessions"`
-	TotalMessages  int     `json:"totalMessages"`
-	TotalSizeMB    float64 `json:"totalSizeMb"`
-}
-
 // ClaudeSession represents a Claude chat session (for persistence)
 type ClaudeSession struct {
 	ID            string          `json:"id" bson:"_id"`
@@ -44,4 +24,12 @@ type ClaudeSession struct {
 	CreatedAt     time.Time       `json:"createdAt" bson:"created_at"`
 	UpdatedAt     time.Time       `json:"updatedAt" bson:"updated_at"`
 	LastActivity  time.Time       `json:"lastActivity" bson:"last_activity"`
+
+	// Transient live state, populated only by ListActiveSessions for
+	// the sessions list endpoint — never persisted to Mongo. Empty for
+	// historical / persisted sessions.
+	Tempo  string `json:"tempo,omitempty" bson:"-"`
+	State  string `json:"state,omitempty" bson:"-"`
+	Detail string `json:"detail,omitempty" bson:"-"`
+	Needs  string `json:"needs,omitempty" bson:"-"`
 }

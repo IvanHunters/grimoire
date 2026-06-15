@@ -10,6 +10,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/compact"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/daemon"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/discovery"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
@@ -2082,287 +2086,32 @@ Example: create_note("path": "%s/architecture.md", "content": "...")`,
 	)
 }
 
+
+// registerSessionTools registers Claude-facing MCP tools for managing
+// daemon-backed sessions. All legacy Mongo-message-history and session-notes
+// tools were removed — they were unused by the UI after the daemon
+// migration. What remains: self-identification, search across daemon
+// + JSONL transcripts, spawn, rename, delete.
 func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
-	// list_sessions — list sessions sorted by last activity
-	s.AddTool(
-		mcp.NewTool("list_sessions",
-			mcp.WithDescription("List Claude chat sessions sorted by last activity. Returns metadata without message bodies."),
-			mcp.WithNumber("limit", mcp.Description("Maximum number of sessions to return (default 30)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			limit := 30
-			if argsMap, ok := req.Params.Arguments.(map[string]interface{}); ok {
-				if v, ok := argsMap["limit"].(float64); ok && v > 0 {
-					limit = int(v)
-				}
-			}
-			sessions, err := mcpCtx.sessionStorage.ListAllSessions(ctx, limit)
-			if err != nil {
-				return nil, fmt.Errorf("failed to list sessions: %w", err)
-			}
-			if len(sessions) == 0 {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("No sessions found")}}, nil
-			}
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "Found %d sessions:\n\n", len(sessions))
-			for _, sess := range sessions {
-				msgCount := len(sess.Messages)
-				fmt.Fprintf(&sb, "- **%s** (id: `%s`)\n  status: %s | messages: %d | last active: %s\n",
-					sess.Name, sess.ID, sess.Status, msgCount, sess.LastActivity.Format("2006-01-02 15:04"))
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
-		},
-	)
-
-	// get_session_history — read last N messages from a session
-	s.AddTool(
-		mcp.NewTool("get_session_history",
-			mcp.WithDescription("Get message history for a specific session. Returns messages in chronological order."),
-			mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID")),
-			mcp.WithNumber("limit", mcp.Description("Number of most recent messages to return (default 50)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID, _ := argsMap["session_id"].(string)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
-			}
-			limit := 50
-			if v, ok := argsMap["limit"].(float64); ok && v > 0 {
-				limit = int(v)
-			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get session: %w", err)
-			}
-			if sess == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session not found: " + sessionID)}}, nil
-			}
-			msgs := sess.Messages
-			if len(msgs) > limit {
-				msgs = msgs[len(msgs)-limit:]
-			}
-			if len(msgs) == 0 {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Session '%s' has no messages", sess.Name))}}, nil
-			}
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "Session: **%s** (%d messages shown of %d total)\n\n", sess.Name, len(msgs), len(sess.Messages))
-			for _, m := range msgs {
-				content := m.Content
-				if len(content) > 500 {
-					content = content[:500] + "... [truncated]"
-				}
-				fmt.Fprintf(&sb, "**[%s]** %s\n%s\n\n", m.Role, m.Timestamp.Format("15:04 02 Jan"), content)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
-		},
-	)
-
-	// clear_session_history — remove all messages from a session
-	s.AddTool(
-		mcp.NewTool("clear_session_history",
-			mcp.WithDescription("Clear all messages from a session. The session metadata (name, status) is preserved."),
-			mcp.WithString("session_id", mcp.Required(), mcp.Description("Session ID to clear")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID, _ := argsMap["session_id"].(string)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
-			}
-			if err := mcpCtx.sessionStorage.ClearSessionMessages(ctx, sessionID); err != nil {
-				return nil, fmt.Errorf("failed to clear session: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session history cleared: " + sessionID)}}, nil
-		},
-	)
-
-	// search_session_history — find sessions containing messages matching a query
-	s.AddTool(
-		mcp.NewTool("search_session_history",
-			mcp.WithDescription("Search for sessions containing messages that match a query string (case-insensitive). Returns session metadata; use get_session_history to read full messages."),
-			mcp.WithString("query", mcp.Required(), mcp.Description("Search query (case-insensitive substring match)")),
-			mcp.WithNumber("limit", mcp.Description("Maximum number of sessions to return (default 20)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			query, _ := argsMap["query"].(string)
-			if query == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: query is required")}}, nil
-			}
-			limit := 20
-			if v, ok := argsMap["limit"].(float64); ok && v > 0 {
-				limit = int(v)
-			}
-			sessions, err := mcpCtx.sessionStorage.SearchSessionMessages(ctx, query, limit)
-			if err != nil {
-				return nil, fmt.Errorf("failed to search sessions: %w", err)
-			}
-			if len(sessions) == 0 {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("No sessions found matching: " + query)}}, nil
-			}
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "Found %d sessions matching '%s':\n\n", len(sessions), query)
-			for _, sess := range sessions {
-				fmt.Fprintf(&sb, "- **%s** (id: `%s`) — last active: %s\n",
-					sess.Name, sess.ID, sess.LastActivity.Format("2006-01-02 15:04"))
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
-		},
-	)
-
-	// search_session_messages — grep with surrounding context
-	s.AddTool(
-		mcp.NewTool("search_session_messages",
-			mcp.WithDescription("Search messages across all sessions and return matching messages with surrounding context. Shows which session, message index, role, timestamp, and N messages before/after each match."),
-			mcp.WithString("query", mcp.Required(), mcp.Description("Search query (case-insensitive substring match)")),
-			mcp.WithNumber("context_before", mcp.Description("Number of messages before each match to include (default 2)")),
-			mcp.WithNumber("context_after", mcp.Description("Number of messages after each match to include (default 2)")),
-			mcp.WithNumber("max_sessions", mcp.Description("Maximum number of sessions to search through (default 10)")),
-			mcp.WithNumber("max_matches", mcp.Description("Maximum total matches to return across all sessions (default 20)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			query, _ := argsMap["query"].(string)
-			if query == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: query is required")}}, nil
-			}
-			ctxBefore := 2
-			if v, ok := argsMap["context_before"].(float64); ok && v >= 0 {
-				ctxBefore = int(v)
-			}
-			ctxAfter := 2
-			if v, ok := argsMap["context_after"].(float64); ok && v >= 0 {
-				ctxAfter = int(v)
-			}
-			maxSessions := 10
-			if v, ok := argsMap["max_sessions"].(float64); ok && v > 0 {
-				maxSessions = int(v)
-			}
-			maxMatches := 20
-			if v, ok := argsMap["max_matches"].(float64); ok && v > 0 {
-				maxMatches = int(v)
-			}
-
-			sessions, err := mcpCtx.sessionStorage.SearchSessionMessagesWithContent(ctx, query, maxSessions)
-			if err != nil {
-				return nil, fmt.Errorf("failed to search sessions: %w", err)
-			}
-			if len(sessions) == 0 {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("No messages found matching: " + query)}}, nil
-			}
-
-			queryLower := strings.ToLower(query)
-			var sb strings.Builder
-			totalMatches := 0
-
-			for _, sess := range sessions {
-				if totalMatches >= maxMatches {
-					break
-				}
-				msgs := sess.Messages
-				sessHeader := false
-
-				for i, msg := range msgs {
-					if totalMatches >= maxMatches {
-						break
-					}
-					if !strings.Contains(strings.ToLower(msg.Content), queryLower) {
-						continue
-					}
-
-					if !sessHeader {
-						fmt.Fprintf(&sb, "## Session: %s (id: `%s`)\n\n", sess.Name, sess.ID)
-						sessHeader = true
-					}
-
-					start := i - ctxBefore
-					if start < 0 {
-						start = 0
-					}
-					end := i + ctxAfter + 1
-					if end > len(msgs) {
-						end = len(msgs)
-					}
-
-					fmt.Fprintf(&sb, "### Match at message %d/%d\n", i+1, len(msgs))
-					for j := start; j < end; j++ {
-						m := msgs[j]
-						marker := "  "
-						if j == i {
-							marker := "**"
-							content := m.Content
-							if len(content) > 600 {
-								content = content[:600] + "... [truncated]"
-							}
-							fmt.Fprintf(&sb, "%s[%s]** %s\n%s\n\n", marker, m.Role, m.Timestamp.Format("15:04 02 Jan"), content)
-							continue
-						}
-						_ = marker
-						content := m.Content
-						if len(content) > 200 {
-							content = content[:200] + "... [truncated]"
-						}
-						fmt.Fprintf(&sb, "  [%s] %s\n%s\n\n", m.Role, m.Timestamp.Format("15:04 02 Jan"), content)
-					}
-					fmt.Fprintln(&sb, "---")
-					totalMatches++
-				}
-			}
-
-			if totalMatches == 0 {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("No messages found matching: " + query)}}, nil
-			}
-			header := fmt.Sprintf("Found %d match(es) across %d session(s) for '%s':\n\n", totalMatches, len(sessions), query)
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(header + sb.String())}}, nil
-		},
-	)
-
-	// get_my_session_id — returns the session ID of the calling Claude instance
+	// get_my_session_id — let claude identify itself inside grimoire.
 	s.AddTool(
 		mcp.NewTool("get_my_session_id",
-			mcp.WithDescription("Returns the session ID and metadata of the current Claude session. Use this to identify yourself, rename your session, or access your own history."),
+			mcp.WithDescription("Returns the session ID of the current Claude session. Use this to identify yourself before calling rename_my_session or other self-targeting tools."),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			sessionID := sessionIDFromCtx(ctx)
 			if sessionID == "" {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("GRIMOIRE_SESSION_ID not set — running outside a managed session")}}, nil
 			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("session_id: " + sessionID)}}, nil
-			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
-			if err != nil || sess == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("session_id: " + sessionID + "\n(session not yet persisted)")}}, nil
-			}
-			result := fmt.Sprintf("session_id: %s\nname: %s\nstatus: %s\nworking_dir: %s\nlast_active: %s\nmessages: %d",
-				sess.ID, sess.Name, sess.Status, sess.WorkingDir,
-				sess.LastActivity.Format("2006-01-02 15:04:05"),
-				len(sess.Messages),
-			)
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(result)}}, nil
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("session_id: " + sessionID)}}, nil
 		},
 	)
 
-	// rename_my_session — lets Claude rename its own session
+	// rename_my_session — convenience: rename own session without
+	// having to pass session_id (auto-detected from env/context).
 	s.AddTool(
 		mcp.NewTool("rename_my_session",
-			mcp.WithDescription("Rename the current session. Pass session_id explicitly if GRIMOIRE_SESSION_ID is not auto-detected (get it via: echo $GRIMOIRE_SESSION_ID)."),
+			mcp.WithDescription("Rename the current session. Pass session_id explicitly if GRIMOIRE_SESSION_ID is not auto-detected."),
 			mcp.WithString("name", mcp.Required(), mcp.Description("New name for the session (short, descriptive)")),
 			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
 		),
@@ -2379,115 +2128,291 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			if mcpCtx.sessionStorage == nil {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
 			}
-			if err := mcpCtx.sessionStorage.UpdateSessionName(ctx, sessionID, name); err != nil {
+			if err := mcpCtx.sessionStorage.UpsertSessionName(ctx, sessionID, name); err != nil {
 				return nil, fmt.Errorf("failed to rename session: %w", err)
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session renamed to: " + name)}}, nil
 		},
 	)
 
-	// get_session_notes — read notes from any session (by ID) or own session
+	// search_sessions — combined name + JSONL content search. Each
+	// session hit includes up to 5 surrounding-message snippets so
+	// claude can confirm the match in context.
 	s.AddTool(
-		mcp.NewTool("get_session_notes",
-			mcp.WithDescription("Read the persistent notes attached to a session. Pass session_id explicitly if auto-detection fails (get it via: echo $GRIMOIRE_SESSION_ID)."),
-			mcp.WithString("session_id", mcp.Description("Session ID (omit to use own session)")),
+		mcp.NewTool("search_sessions",
+			mcp.WithDescription("Search Claude sessions by name OR by conversation content. Returns matches grouped by session, with snippet context around each content hit. Use this to locate a session before renaming/deleting/attaching."),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Substring to match. Case-insensitive.")),
+			mcp.WithString("cwd", mcp.Description("Optional working-directory filter — scopes to one project")),
+			mcp.WithNumber("limit", mcp.Description("Max results per mode (default 20)")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
 			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id required. Pass it explicitly or run inside a managed session.")}}, nil
+			query, _ := argsMap["query"].(string)
+			cwd, _ := argsMap["cwd"].(string)
+			if query == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: query is required")}}, nil
 			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
+			limit := 20
+			if v, ok := argsMap["limit"].(float64); ok && v > 0 {
+				limit = int(v)
+			}
+
+			items, err := claude.ListSessionsByCwd(cwd)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get session: %w", err)
+				return nil, fmt.Errorf("list sessions: %w", err)
 			}
-			if sess == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session not found: " + sessionID)}}, nil
+			lcq := strings.ToLower(query)
+			var nameHits []claude.SessionListItem
+			for _, it := range items {
+				if strings.Contains(strings.ToLower(it.Name), lcq) ||
+					strings.Contains(strings.ToLower(it.FirstPrompt), lcq) ||
+					strings.Contains(strings.ToLower(it.Cwd), lcq) ||
+					strings.Contains(strings.ToLower(it.SessionID), lcq) {
+					nameHits = append(nameHits, it)
+					if len(nameHits) >= limit {
+						break
+					}
+				}
 			}
-			if sess.Notes == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("(no notes for session " + sessionID + ")")}}, nil
+
+			contentHits, err := discovery.Search(ctx, query, cwd, limit*3)
+			if err != nil {
+				mcpCtx.logger.Warn("transcript content search failed", slog.Any("error", err))
 			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sess.Notes)}}, nil
+
+			if len(nameHits) == 0 && len(contentHits) == 0 {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("No sessions match '" + query + "'")}}, nil
+			}
+			var sb strings.Builder
+			// Quick lookup of SessionListItem by ID so content-hit rows
+			// can show size/last-activity that discovery.SearchHit
+			// doesn't carry on its own.
+			byID := make(map[string]claude.SessionListItem, len(items))
+			for _, it := range items {
+				byID[it.SessionID] = it
+			}
+			if len(nameHits) > 0 {
+				fmt.Fprintf(&sb, "## Matches by name/path (%d)\n\n", len(nameHits))
+				for _, it := range nameHits {
+					live := "historical"
+					if it.Live != nil {
+						live = "LIVE"
+					}
+					fmt.Fprintf(&sb, "- **%s** `%s`\n  cwd: `%s` · %s · %s · last: %s\n",
+						it.Name, it.SessionID, it.Cwd, live, humanBytes(it.SizeBytes),
+						it.LastActivity.Format("2006-01-02 15:04"))
+				}
+				sb.WriteString("\n")
+			}
+			if len(contentHits) > 0 {
+				bySession := map[string][]discovery.SearchHit{}
+				order := []string{}
+				for _, h := range contentHits {
+					if _, ok := bySession[h.SessionID]; !ok {
+						order = append(order, h.SessionID)
+					}
+					bySession[h.SessionID] = append(bySession[h.SessionID], h)
+				}
+				fmt.Fprintf(&sb, "## Matches in conversation (%d sessions)\n\n", len(order))
+				for _, id := range order {
+					hs := bySession[id]
+					first := hs[0]
+					sizeStr := ""
+					lastStr := ""
+					if meta, ok := byID[id]; ok {
+						sizeStr = " · " + humanBytes(meta.SizeBytes)
+						lastStr = " · last: " + meta.LastActivity.Format("2006-01-02 15:04")
+					}
+					fmt.Fprintf(&sb, "- **%s** `%s` · cwd: `%s` · %d hits%s%s\n", first.SessionName, id, first.Cwd, len(hs), sizeStr, lastStr)
+					perSessionShown := 5
+					for i, h := range hs {
+						if i >= perSessionShown {
+							fmt.Fprintf(&sb, "  + %d more in this session\n", len(hs)-perSessionShown)
+							break
+						}
+						snippet := h.Snippet
+						if len(snippet) > 250 {
+							snippet = snippet[:250] + "…"
+						}
+						fmt.Fprintf(&sb, "  · [%s line %d] %s\n", h.Role, h.LineNumber, snippet)
+					}
+				}
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
 		},
 	)
 
-	// set_session_notes — replace all notes in the current session
+	// start_session — three modes, picked by which args are set:
+	//   1. NEW (default): fresh `claude --bg` in `cwd`.
+	//   2. RESUME: continue an existing session by passing `resume_from`
+	//      — claude --bg --resume <uuid>. Cwd is inherited from the
+	//      JSONL header; can be omitted.
+	//   3. FORK: like resume but with --fork-session — creates a copy
+	//      that branches off; original session stays untouched.
 	s.AddTool(
-		mcp.NewTool("set_session_notes",
-			mcp.WithDescription("Replace the entire notes field of a session. Pass session_id explicitly if auto-detection fails (get it via: echo $GRIMOIRE_SESSION_ID)."),
-			mcp.WithString("notes", mcp.Required(), mcp.Description("New notes content (replaces existing)")),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
+		mcp.NewTool("start_session",
+			mcp.WithDescription("Launch a background Claude session. Three modes:\n  - new: omit resume_from to spawn a fresh `claude --bg` in `cwd`.\n  - resume: pass `resume_from=<uuid>` to continue an existing transcript.\n  - fork: pass `resume_from=<uuid>` + `fork=true` to branch off a copy (original untouched).\nThe session appears in grimoire's sidebar within ~3 seconds."),
+			mcp.WithString("name", mcp.Required(), mcp.Description("Human-readable name for the session")),
+			mcp.WithString("cwd", mcp.Description("Absolute working directory. Required for new mode; for resume/fork it's looked up from the source transcript when empty.")),
+			mcp.WithString("prompt", mcp.Description("Optional initial user message (new mode only; ignored for resume/fork)")),
+			mcp.WithString("resume_from", mcp.Description("UUID of an existing session to continue or fork. Find one via search_sessions.")),
+			mcp.WithBoolean("fork", mcp.Description("When true alongside resume_from, --fork-session is added so the new session is a branch with its own UUID; the original chat stays untouched.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
+			name, _ := argsMap["name"].(string)
+			cwd, _ := argsMap["cwd"].(string)
+			prompt, _ := argsMap["prompt"].(string)
+			resumeFrom, _ := argsMap["resume_from"].(string)
+			fork, _ := argsMap["fork"].(bool)
+			if name == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: name is required")}}, nil
 			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			notes, _ := argsMap["notes"].(string)
-			if err := mcpCtx.sessionStorage.UpdateSessionNotes(ctx, sessionID, notes); err != nil {
-				return nil, fmt.Errorf("failed to set notes: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session notes updated")}}, nil
-		},
-	)
 
-	// append_to_session_notes — append text to current session notes
-	s.AddTool(
-		mcp.NewTool("append_to_session_notes",
-			mcp.WithDescription("Append text to the end of session notes. Pass session_id explicitly if auto-detection fails (get it via: echo $GRIMOIRE_SESSION_ID)."),
-			mcp.WithString("text", mcp.Required(), mcp.Description("Text to append")),
-			mcp.WithString("separator", mcp.Description("Separator between old and new content (default: newline)")),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
+			// Resolve cwd for resume/fork from the source JSONL header
+			// when caller didn't supply one. `claude --resume` locates
+			// the transcript via (cwd, uuid) — must match.
+			if resumeFrom != "" {
+				if cwd == "" {
+					if path, err := discovery.SessionPath(resumeFrom); err == nil {
+						if tr, err := discovery.ReadTranscript(path); err == nil && tr.Header.Cwd != "" {
+							cwd = tr.Header.Cwd
+						}
+					}
+				}
+				if cwd == "" {
+					return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: cwd required (could not derive from resume_from transcript)")}}, nil
+				}
+			} else if cwd == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: cwd is required for new sessions")}}, nil
 			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
+
+			client := &daemon.Client{Logger: mcpCtx.logger}
+			opts := daemon.DispatchOpts{
+				Cwd:  cwd,
+				Name: name,
 			}
-			text, _ := argsMap["text"].(string)
-			if text == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: text is required")}}, nil
-			}
-			separator := "\n"
-			if sep, ok := argsMap["separator"].(string); ok && sep != "" {
-				separator = sep
-			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get session: %w", err)
-			}
-			var newNotes string
-			if sess != nil && sess.Notes != "" {
-				newNotes = sess.Notes + separator + text
+			mode := "new"
+			if resumeFrom != "" {
+				opts.ResumeSessionID = resumeFrom
+				opts.Fork = fork
+				if fork {
+					mode = "fork"
+				} else {
+					mode = "resume"
+				}
 			} else {
-				newNotes = text
+				opts.Prompt = prompt
 			}
-			if err := mcpCtx.sessionStorage.UpdateSessionNotes(ctx, sessionID, newNotes); err != nil {
-				return nil, fmt.Errorf("failed to append notes: %w", err)
+			disp, err := client.Dispatch(opts)
+			if err != nil {
+				return nil, fmt.Errorf("daemon dispatch: %w", err)
 			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Appended to session notes")}}, nil
+			// Persist user-given name to overlay so it shows in the
+			// sidebar instead of the daemon's structured token.
+			if mcpCtx.sessionStorage != nil && !strings.HasPrefix(name, "grimoire-") {
+				_ = mcpCtx.sessionStorage.UpsertSessionName(ctx, disp.SessionID, name)
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Session started (%s).\n  name: %s\n  cwd: %s\n  uuid: %s\n  short: %s\n  via: %s\n",
+				mode, name, cwd, disp.SessionID, disp.Short, disp.Via)
+			if resumeFrom != "" {
+				fmt.Fprintf(&sb, "  resume_from: %s\n", resumeFrom)
+			}
+			sb.WriteString("\nWill appear in sidebar within a few seconds.")
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
 		},
 	)
 
-	// prepend_to_session_notes — prepend text to current session notes
+	// rename_session — rename ANY session by UUID.
 	s.AddTool(
-		mcp.NewTool("prepend_to_session_notes",
-			mcp.WithDescription("Prepend text to the beginning of session notes. Pass session_id explicitly if auto-detection fails (get it via: echo $GRIMOIRE_SESSION_ID)."),
-			mcp.WithString("text", mcp.Required(), mcp.Description("Text to prepend")),
-			mcp.WithString("separator", mcp.Description("Separator between new and old content (default: newline)")),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
+		mcp.NewTool("rename_session",
+			mcp.WithDescription("Rename any session by ID. The name shows in grimoire's sidebar and Sessions Modal."),
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Full session UUID (find via search_sessions)")),
+			mcp.WithString("name", mcp.Required(), mcp.Description("New display name")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]interface{})
+			sessionID, _ := argsMap["session_id"].(string)
+			name, _ := argsMap["name"].(string)
+			if sessionID == "" || name == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id and name are required")}}, nil
+			}
+			if mcpCtx.sessionStorage == nil {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
+			}
+			if err := mcpCtx.sessionStorage.UpsertSessionName(ctx, sessionID, name); err != nil {
+				return nil, fmt.Errorf("rename: %w", err)
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session renamed to: " + name)}}, nil
+		},
+	)
+
+	// delete_session — kill daemon worker + JSONL + overlay. Destructive.
+	s.AddTool(
+		mcp.NewTool("delete_session",
+			mcp.WithDescription("Delete a session permanently. Kills the daemon worker if live AND removes the JSONL transcript. No undo — use search_sessions to confirm the UUID first."),
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Full session UUID to delete")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]interface{})
+			sessionID, _ := argsMap["session_id"].(string)
+			if sessionID == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
+			}
+
+			killed := false
+			client := &daemon.Client{Logger: mcpCtx.logger}
+			if jobs, err := client.ListSessions(); err == nil {
+				for _, j := range jobs {
+					if j.SessionID == sessionID {
+						if err := client.Remove(j.Short); err == nil {
+							killed = true
+						}
+						break
+					}
+				}
+			}
+
+			path, err := discovery.SessionPath(sessionID)
+			transcriptRemoved := false
+			if err == nil && path != "" {
+				if rmErr := osRemove(path); rmErr == nil {
+					transcriptRemoved = true
+				}
+			}
+
+			dbCleared := false
+			if mcpCtx.sessionStorage != nil {
+				if err := mcpCtx.sessionStorage.DeleteSession(ctx, sessionID); err == nil {
+					dbCleared = true
+				}
+			}
+
+			if !killed && !transcriptRemoved && !dbCleared {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Nothing to delete — session not found in daemon, on disk, or in Mongo")}}, nil
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
+				fmt.Sprintf("Deleted session %s\n  daemon worker killed: %v\n  transcript removed: %v\n  mongo record cleared: %v",
+					sessionID, killed, transcriptRemoved, dbCleared),
+			)}}, nil
+		},
+	)
+
+	// compact_my_session — claude-callable trigger for the deterministic
+	// transcript compactor. Claude invokes this when it senses the
+	// context is getting heavy (high tool_result count) and wants to
+	// shed weight WITHOUT a lossy LLM-rewritten summary. We replace
+	// bulky tool_result bodies on older turns with short stubs (keeping
+	// tool_use_id pairing intact) and produce a deterministic ledger
+	// of every tool call so detail isn't lost — the original transcript
+	// is archived first so restore is one mv away.
+	s.AddTool(
+		mcp.NewTool("compact_my_session",
+			mcp.WithDescription("Shrink the current session's JSONL transcript by evicting bulky tool_result payloads from older turns. Preserves recent context verbatim, generates a structured ledger of all tool calls so nothing is lost, archives the original. Use when context feels heavy AND you want to keep working without a lossy /compact rewrite. The actual context-window benefit lands on the next resume — the in-memory conversation isn't shortened."),
+			mcp.WithNumber("keep_recent_tool_results", mcp.Description("Number of most-recent tool_result blocks to keep verbatim. Older ones get evicted to stubs. Default 30 (~ last 15 user/assistant exchanges).")),
+			mcp.WithNumber("max_stub_bytes", mcp.Description("Bytes of the original tool_result tail to keep inside the stub for recall. Default 200.")),
+			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection from GRIMOIRE_SESSION_ID fails)")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			argsMap, _ := req.Params.Arguments.(map[string]interface{})
@@ -2495,168 +2420,76 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			if sessionID == "" {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
 			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			text, _ := argsMap["text"].(string)
-			if text == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: text is required")}}, nil
-			}
-			separator := "\n"
-			if sep, ok := argsMap["separator"].(string); ok && sep != "" {
-				separator = sep
-			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
+			path, err := discovery.SessionPath(sessionID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get session: %w", err)
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: transcript not found for session " + sessionID)}}, nil
 			}
-			var newNotes string
-			if sess != nil && sess.Notes != "" {
-				newNotes = text + separator + sess.Notes
+			opts := compact.Options{DropToolUseResultMirror: true}
+			if v, ok := argsMap["keep_recent_tool_results"].(float64); ok && v > 0 {
+				opts.KeepRecentToolResults = int(v)
+			}
+			if v, ok := argsMap["max_stub_bytes"].(float64); ok && v > 0 {
+				opts.MaxStubBytes = int(v)
+			}
+
+			var ledgerBuf strings.Builder
+			res, err := compact.Compact(path, opts, &ledgerBuf)
+			if err != nil {
+				return nil, fmt.Errorf("compact: %w", err)
+			}
+
+			// Persist ledger as sidecar so it survives even if claude
+			// drops the tool response from its context.
+			ledgerPath := path + ".ledger.md"
+			if werr := os.WriteFile(ledgerPath, []byte(ledgerBuf.String()), 0o644); werr != nil {
+				mcpCtx.logger.Warn("write ledger sidecar", slog.String("path", ledgerPath), slog.Any("error", werr))
 			} else {
-				newNotes = text
+				res.Stats.LedgerPath = ledgerPath
 			}
-			if err := mcpCtx.sessionStorage.UpdateSessionNotes(ctx, sessionID, newNotes); err != nil {
-				return nil, fmt.Errorf("failed to prepend notes: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Prepended to session notes")}}, nil
-		},
-	)
 
-	// replace_in_session_notes — find and replace text within session notes
-	s.AddTool(
-		mcp.NewTool("replace_in_session_notes",
-			mcp.WithDescription("Find and replace a substring in session notes. Pass session_id explicitly if auto-detection fails."),
-			mcp.WithString("old_text", mcp.Required(), mcp.Description("Text to find (must match exactly)")),
-			mcp.WithString("new_text", mcp.Required(), mcp.Description("Replacement text")),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Compacted session %s\n", sessionID)
+			fmt.Fprintf(&sb, "  lines: %d\n", res.Stats.Lines)
+			fmt.Fprintf(&sb, "  tool_results total: %d  evicted: %d\n", res.Stats.ToolResults, res.Stats.ToolResultsEvicted)
+			fmt.Fprintf(&sb, "  bytes: %s to %s\n", humanBytes(res.Stats.BytesBefore), humanBytes(res.Stats.BytesAfter))
+			fmt.Fprintf(&sb, "  approx tokens: %d to %d (saved ~%d)\n",
+				res.Stats.ApproxTokensBefore, res.Stats.ApproxTokensAfter,
+				res.Stats.ApproxTokensBefore-res.Stats.ApproxTokensAfter)
+			fmt.Fprintf(&sb, "  archive: %s\n", res.Stats.ArchivePath)
+			if res.Stats.LedgerPath != "" {
+				fmt.Fprintf(&sb, "  ledger:  %s\n", res.Stats.LedgerPath)
 			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			oldText, _ := argsMap["old_text"].(string)
-			newText, _ := argsMap["new_text"].(string)
-			if oldText == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: old_text is required")}}, nil
-			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get session: %w", err)
-			}
-			if sess == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session not found")}}, nil
-			}
-			if !strings.Contains(sess.Notes, oldText) {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: old_text not found in session notes")}}, nil
-			}
-			updated := strings.Replace(sess.Notes, oldText, newText, 1)
-			if err := mcpCtx.sessionStorage.UpdateSessionNotes(ctx, sessionID, updated); err != nil {
-				return nil, fmt.Errorf("failed to update notes: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session notes updated")}}, nil
+			fmt.Fprintf(&sb, "\nThe context shrink takes effect on the NEXT resume of this session — your CURRENT in-memory conversation is unaffected. Consider restarting the terminal when convenient.\n")
+			// Don't inline the ledger — that would pile fresh bytes into
+			// claude's context window when the whole point of compact is
+			// to LIGHTEN the context. The ledger is on disk; if claude
+			// needs detail it can Read the file.
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
 		},
 	)
+}
 
-	// delete_from_session_notes — remove a specific substring from session notes
-	s.AddTool(
-		mcp.NewTool("delete_from_session_notes",
-			mcp.WithDescription("Remove a specific substring from session notes. Pass session_id explicitly if auto-detection fails."),
-			mcp.WithString("text", mcp.Required(), mcp.Description("Text to remove (must match exactly)")),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
-			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			text, _ := argsMap["text"].(string)
-			if text == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: text is required")}}, nil
-			}
-			sess, err := mcpCtx.sessionStorage.GetSession(ctx, sessionID)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get session: %w", err)
-			}
-			if sess == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session not found")}}, nil
-			}
-			if !strings.Contains(sess.Notes, text) {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: text not found in session notes")}}, nil
-			}
-			updated := strings.Replace(sess.Notes, text, "", 1)
-			if err := mcpCtx.sessionStorage.UpdateSessionNotes(ctx, sessionID, updated); err != nil {
-				return nil, fmt.Errorf("failed to update notes: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Text removed from session notes")}}, nil
-		},
-	)
+// osRemove is a tiny wrapper kept here so tests can stub out filesystem
+// access without pulling os into the test surface. Production just
+// proxies to os.Remove.
+func osRemove(path string) error { return os.Remove(path) }
 
-	// clear_session_notes — wipe all notes from the current session
-	s.AddTool(
-		mcp.NewTool("clear_session_notes",
-			mcp.WithDescription("Remove all notes from a session. Pass session_id explicitly if auto-detection fails."),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
-			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			if err := mcpCtx.sessionStorage.UpdateSessionNotes(ctx, sessionID, ""); err != nil {
-				return nil, fmt.Errorf("failed to clear notes: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session notes cleared")}}, nil
-		},
+// humanBytes formats a byte count as a short human string: 432 B,
+// 18 KB, 3.4 MB, 1.2 GB. One decimal for KB+, none for bytes.
+func humanBytes(n int64) string {
+	const (
+		kb = 1024
+		mb = 1024 * 1024
+		gb = 1024 * 1024 * 1024
 	)
-
-	// append_to_session_history — write a message into the current session's message history
-	s.AddTool(
-		mcp.NewTool("append_to_session_history",
-			mcp.WithDescription("Append a message to a session's conversation history. Pass session_id explicitly if auto-detection fails (get it via: echo $GRIMOIRE_SESSION_ID)."),
-			mcp.WithString("role", mcp.Required(), mcp.Description("Message role: 'user' or 'assistant'")),
-			mcp.WithString("content", mcp.Required(), mcp.Description("Message content to record")),
-			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection fails)")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			argsMap, _ := req.Params.Arguments.(map[string]interface{})
-			sessionID := resolveSessionID(ctx, argsMap)
-			if sessionID == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id not set. Pass it explicitly or run inside a managed session.")}}, nil
-			}
-			if mcpCtx.sessionStorage == nil {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Session storage not available")}}, nil
-			}
-			role, _ := argsMap["role"].(string)
-			content, _ := argsMap["content"].(string)
-			if role != "user" && role != "assistant" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: role must be 'user' or 'assistant'")}}, nil
-			}
-			if content == "" {
-				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: content is required")}}, nil
-			}
-			msg := models.ClaudeMessage{
-				Role:      role,
-				Content:   content,
-				Timestamp: time.Now(),
-			}
-			if err := mcpCtx.sessionStorage.AppendSessionMessage(ctx, sessionID, msg); err != nil {
-				return nil, fmt.Errorf("failed to append message: %w", err)
-			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Message appended to session history")}}, nil
-		},
-	)
+	switch {
+	case n < kb:
+		return fmt.Sprintf("%d B", n)
+	case n < mb:
+		return fmt.Sprintf("%.1f KB", float64(n)/kb)
+	case n < gb:
+		return fmt.Sprintf("%.1f MB", float64(n)/mb)
+	default:
+		return fmt.Sprintf("%.1f GB", float64(n)/gb)
+	}
 }
