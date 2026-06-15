@@ -53,7 +53,7 @@ const Preview = forwardRef<HTMLDivElement, PreviewProps>(({ className = '', cont
 
   return (
     <div ref={ref} className={`h-full overflow-auto ${className}`}>
-      <div className="markdown-preview p-4 md:p-8 max-w-4xl mx-auto">
+      <div className="markdown-preview p-4 md:p-8 max-w-5xl xl:max-w-6xl mx-auto">
         <ReactMarkdown
           remarkPlugins={[remarkGfm, remarkBreaks]}
           rehypePlugins={[[rehypePrism, { ignoreMissing: true, showLineNumbers: true }]]}

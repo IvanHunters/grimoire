@@ -446,14 +446,47 @@ mark {
   background: rgba(6,182,212,0.03);
 }
 
-/* Tables */
+/* Tables.
+ * Two goals:
+ *   1. Don't character-break short words — the parent .markdown-preview
+ *      sets word-break:break-word, which is fine for paragraphs but
+ *      mangles short cells once columns get narrow. Cells opt out.
+ *   2. Use available width — the preview itself caps at 896px, but
+ *      tables can break out into the surrounding pane via negative
+ *      margin + calc'd width when there's lots of space. Padding is
+ *      tightened too so more content fits per row before overflow.
+ */
 .markdown-preview table {
   border-collapse: collapse;
   width: 100%;
   margin: 1.5em 0;
   border: 1px solid rgba(255,255,255,0.08);
   border-radius: 6px;
-  overflow: hidden;
+  display: block;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+
+/* On wide screens, let tables break out of the 896px preview cap and
+ * use up to the surrounding pane width — saves horizontal scrolling
+ * when the column count is high but each cell's content is short. */
+@media (min-width: 1024px) {
+  .markdown-preview table {
+    width: max-content;
+    max-width: min(100%, calc(100vw - 320px));
+    min-width: 100%;
+  }
+}
+
+.markdown-preview table th,
+.markdown-preview table td {
+  word-break: normal;
+  overflow-wrap: break-word;
+  white-space: normal;
+  padding: 6px 10px;
+  font-size: 0.92em;
 }
 
 .dark .markdown-preview table {

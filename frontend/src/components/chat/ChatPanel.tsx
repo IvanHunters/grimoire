@@ -1,28 +1,100 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { X, RotateCcw, Trash2 } from 'lucide-react'
+import { X, RotateCcw, RefreshCw, Trash2, MoreVertical, FileJson, GitFork, Pencil, Archive } from 'lucide-react'
 import { TerminalChat, type TerminalChatHandle } from './TerminalChat'
-import { sessionsAPI } from '../../api/sessions'
+import { sessionsAPI, type SessionStatus } from '../../api/sessions'
 import { useNotes } from '../../contexts/NotesContext'
+import { useSessionStatus } from '../../hooks/useSessionStatus'
 import type { TaskContextPayload } from '../../hooks/useTerminalWebSocket'
 
 interface ChatPanelProps {
   visible: boolean
   onClose: () => void
-  noteId: string
+  /** Note-bound mode: derives sessionId = `note-${noteId}`. */
+  noteId?: string
   taskContext?: TaskContextPayload | null
   onCloseMobileSidebar?: () => void
+  /** Free-form mode: caller supplies an explicit session id (UUID, global-*, etc).
+   *  Takes precedence over noteId when set. Used for sidebar / sessions modal
+   *  attach flows where the session isn't bound to a note. */
+  customSessionId?: string
+  /** Display name for header when customSessionId is set (sidebar passes the
+   *  session's friendly label). Ignored in note-bound mode. */
+  customSessionName?: string
+  /** Resume an on-disk JSONL — daemon spawns `claude --resume <uuid>`. */
+  resumeFromSessionId?: string
+  /** When resuming, fork the transcript instead of continuing. */
+  resumeFork?: boolean
+  /** Attach to an externally-spawned live daemon worker. */
+  attachToSessionId?: string
+  /** Called when user picks "Fork" from the kebab menu. Parent should
+   *  switch its attached-session state to the new (id, name) — that
+   *  unmounts the current TerminalChat and mounts a fresh one which
+   *  sends the resumeFromSessionId+resumeFork init for the new id. */
+  onForked?: (newSessionId: string, newSessionName: string, sourceSessionId: string) => void
 }
 
-function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar }: ChatPanelProps) {
+function ChatPanel({
+  visible,
+  onClose,
+  noteId,
+  taskContext,
+  onCloseMobileSidebar,
+  customSessionId,
+  customSessionName,
+  resumeFromSessionId,
+  resumeFork,
+  attachToSessionId,
+  onForked,
+}: ChatPanelProps) {
   const { currentNote } = useNotes()
   const [sessionKey, setSessionKey] = useState(0)
   const [showKeyboard, setShowKeyboard] = useState(() => localStorage.getItem('terminal.showKeyboard') !== 'false')
   const [pasteOpen, setPasteOpen] = useState(false)
-  const [sessionName, setSessionName] = useState<string>('')
+  const [sessionName, setSessionName] = useState<string>(customSessionName || '')
+  const [kebabOpen, setKebabOpen] = useState(false)
+  const [kebabPos, setKebabPos] = useState<{ top: number; right: number } | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
   const terminalRef = useRef<TerminalChatHandle>(null)
+  const kebabRef = useRef<HTMLDivElement>(null)
+  const kebabBtnRef = useRef<HTMLButtonElement>(null)
 
-  const sessionId = `note-${noteId}`
+  // Close kebab on outside-click. Cheap pointerdown listener while open.
+  // Note: outside-click checks BOTH the trigger ref AND the portaled
+  // dropdown (matched by data attribute) since the dropdown lives in
+  // document.body and isn't a DOM descendant of the trigger.
+  useEffect(() => {
+    if (!kebabOpen) return
+    const handler = (e: PointerEvent) => {
+      const target = e.target as Node
+      const inTrigger = kebabRef.current?.contains(target)
+      const inDropdown = (target as HTMLElement).closest?.('[data-chat-kebab-dropdown]')
+      if (!inTrigger && !inDropdown) {
+        setKebabOpen(false)
+      }
+    }
+    window.addEventListener('pointerdown', handler)
+    return () => window.removeEventListener('pointerdown', handler)
+  }, [kebabOpen])
+
+  // Recompute kebab dropdown position whenever it opens. Uses the
+  // button's bounding rect so the menu sticks to the trigger even
+  // when terminal panel is mobile-fullscreen vs desktop side-panel.
+  useEffect(() => {
+    if (!kebabOpen || !kebabBtnRef.current) return
+    const r = kebabBtnRef.current.getBoundingClientRect()
+    setKebabPos({ top: r.bottom + 4, right: window.innerWidth - r.right })
+  }, [kebabOpen])
+
+  // customSessionId beats noteId. Falls back to empty when neither set —
+  // the parent should gate `visible` so this never renders without ID.
+  const sessionId = customSessionId || (noteId ? `note-${noteId}` : '')
+
+  // Poll the daemon-backed status while the panel is open. Subprocess
+  // sessions get synthesized state=running on the backend, so this is
+  // safe to enable unconditionally.
+  const { status } = useSessionStatus(sessionId, { enabled: visible, intervalMs: 2000 })
 
   useEffect(() => {
     let cancelled = false
@@ -63,30 +135,188 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
     return () => clearTimeout(t)
   }, [visible])
 
+  // Restart throttle: rapid clicks would otherwise spawn N daemon
+  // workers (each killing the previous), polluting JSONL on disk and
+  // burning daemon spare-worker capacity. 2-second cooldown is enough
+  // to settle one full restart cycle (dispatch ~30ms + ready ~500ms +
+  // PTY first paint ~1s) before allowing the next.
+  const restartingRef = useRef(false)
+  const [restarting, setRestarting] = useState(false)
   const handleRestart = useCallback(() => {
+    if (restartingRef.current) return
+    restartingRef.current = true
+    setRestarting(true)
     terminalRef.current?.restart()
+    setTimeout(() => {
+      restartingRef.current = false
+      setRestarting(false)
+    }, 2000)
   }, [])
 
-  const handleKill = useCallback(async () => {
-    try {
-      await sessionsAPI.deleteSession(sessionId)
-      setSessionKey(prev => prev + 1)
-    } catch {
-      setSessionKey(prev => prev + 1)
+  // Listen for external restart triggers (Sidebar Compact dispatches
+  // this after the backend JSONL shrink so the live worker reloads
+  // from the compacted transcript). Matches by session id — events for
+  // other panels are ignored.
+  useEffect(() => {
+    const onRestartReq = (e: Event) => {
+      const ce = e as CustomEvent<{ sessionId: string }>
+      if (ce.detail?.sessionId === sessionId) handleRestart()
     }
-  }, [sessionId])
+    window.addEventListener('claude-session-restart-request', onRestartReq)
+    return () => window.removeEventListener('claude-session-restart-request', onRestartReq)
+  }, [sessionId, handleRestart])
+
+  const handleKill = useCallback(async () => {
+    // Kill = backend deletes the session + JSONL, AND we close the
+    // panel so the WS doesn't reconnect-and-respawn. The old behaviour
+    // (deleteSession + sessionKey bump) re-mounted TerminalChat which
+    // immediately sent a new init → backend GetOrCreate spawned a
+    // replacement worker → "kill" appeared to do nothing.
+    // Also clean up the localStorage tab so Quick Terminal doesn't
+    // restore this id on next panel open.
+    try {
+      await sessionsAPI.deleteSession(sessionId, { deleteTranscript: true })
+    } catch (e) {
+      console.error('kill session failed', e)
+    }
+    try {
+      const raw = localStorage.getItem('global-terminal-tabs')
+      if (raw) {
+        const tabs = JSON.parse(raw) as Array<{ sessionId: string; label: string }>
+        const filtered = tabs.filter(t => t.sessionId !== sessionId)
+        if (filtered.length !== tabs.length) {
+          localStorage.setItem('global-terminal-tabs', JSON.stringify(filtered))
+          window.dispatchEvent(new CustomEvent('global-terminal-tabs-changed'))
+        }
+      }
+    } catch {}
+    onClose()
+  }, [sessionId, onClose])
 
   const sendKey = useCallback((data: string) => {
     terminalRef.current?.sendKey(data)
+  }, [])
+
+  // Repaint = kick the claude TUI to redraw itself without killing
+  // the session. Sends Ctrl+L (form feed, the conventional "redraw"
+  // signal in unix TUIs) to claude over PTY, then refits xterm so
+  // it sends a resize event that triggers claude's own SIGWINCH
+  // handler (defensive — most claude versions repaint on \x0c
+  // alone but a resize forces a re-layout from authoritative dims).
+  // Use when display is broken from a mid-stream attach or
+  // resize-race issue.
+  const handleRepaint = useCallback(() => {
+    setKebabOpen(false)
+    // \x0c = Ctrl+L
+    terminalRef.current?.sendKey('\x0c')
+    // Small delay so claude processes Ctrl+L first, then refit
+    // triggers a fresh resize → SIGWINCH → full re-layout.
+    setTimeout(() => terminalRef.current?.refit(), 80)
   }, [])
 
   const blurTerminal = useCallback(() => {
     terminalRef.current?.blur()
   }, [])
 
+  // Export: simple anchor click triggering the backend's Content-
+  // Disposition stream. Keeps big transcripts out of the JS heap.
+  const handleExport = useCallback(() => {
+    if (!sessionId) return
+    setKebabOpen(false)
+    const a = document.createElement('a')
+    a.href = `/api/sessions/${sessionId}/jsonl`
+    a.download = `${sessionId}.jsonl`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }, [sessionId])
+
+  // Fork: spawn a daemon child via `claude --resume --fork-session`
+  // against the current session's JSONL. Generates a new client-side
+  // UUID as the grimoireID for the fork so it's a separate row in
+  // every listing (and won't smart-attach back into the parent).
+  // Caller (HomePage) gets onForked(newId, newName, sourceId) and
+  // re-targets the panel.
+  const handleFork = useCallback(() => {
+    if (!sessionId || !onForked) {
+      setKebabOpen(false)
+      return
+    }
+    const proposed = window.prompt('Имя для форка (опционально):', sessionName || 'fork')
+    if (proposed === null) {
+      setKebabOpen(false)
+      return
+    }
+    const newId = crypto.randomUUID()
+    onForked(newId, proposed.trim() || sessionName || 'fork', sessionId)
+    setKebabOpen(false)
+  }, [sessionId, sessionName, onForked])
+
+  const beginRename = useCallback(() => {
+    setRenameValue(sessionName || '')
+    setRenaming(true)
+    setKebabOpen(false)
+  }, [sessionName])
+
+  // Compact: trigger backend deterministic eviction THEN restart so the
+  // shrunken JSONL is what claude loads. Without the restart the live
+  // worker still holds the full in-memory transcript and the user sees
+  // no benefit until the next manual restart.
+  const [compacting, setCompacting] = useState(false)
+  const handleCompact = useCallback(async () => {
+    if (!sessionId || compacting) return
+    setKebabOpen(false)
+    setCompacting(true)
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/compact`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ generate_ledger: true }),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const j = await r.json()
+      // Log stats so they are recoverable from devtools; the user
+      // explicitly asked for "compact + restart in one click", so we
+      // skip the modal that previously paused the flow.
+      console.info('[compact]', {
+        bytes: `${j.bytes_before} to ${j.bytes_after}`,
+        tokens: `${j.approx_tokens_before} to ${j.approx_tokens_after}`,
+        evicted: `${j.tool_results_evicted}/${j.tool_results}`,
+        archive: j.archive_path, ledger: j.ledger_path,
+      })
+      // Restart via the same path the manual Restart button uses —
+      // throttle is shared so a fast double-fire is safe.
+      handleRestart()
+    } catch (err) {
+      console.error('compact failed', err)
+      alert('Compact failed: ' + (err as Error).message)
+    } finally {
+      setCompacting(false)
+    }
+  }, [sessionId, compacting, handleRestart])
+
+  const commitRename = useCallback(async () => {
+    const trimmed = renameValue.trim()
+    if (!trimmed || trimmed === sessionName) {
+      setRenaming(false)
+      return
+    }
+    try {
+      await sessionsAPI.renameSession(sessionId, trimmed)
+      setSessionName(trimmed)
+    } catch (err) {
+      console.error('rename failed', err)
+    } finally {
+      setRenaming(false)
+    }
+  }, [renameValue, sessionName, sessionId])
+
   return (
     <div
-      className="fixed right-0 flex flex-col z-20 top-14 w-full md:w-[680px] terminal-panel"
+      // Mobile: cover the whole viewport (top:0) so the page header
+      // doesn't waste 56px when the terminal is open. Desktop keeps
+      // the side-panel layout (top:14, w:680px).
+      className="fixed right-0 flex flex-col z-30 top-0 md:top-14 w-full md:w-[680px] terminal-panel"
       style={{ bottom: `${keyboardOffset}px`, display: visible ? undefined : 'none' }}
     >
 
@@ -104,9 +334,26 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
             >
               CLAUDE / TERMINAL
             </div>
-            {taskContext ? (
+            {renaming ? (
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onBlur={commitRename}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { e.preventDefault(); commitRename() }
+                  if (e.key === 'Escape') { e.preventDefault(); setRenaming(false) }
+                }}
+                className="font-mono bg-transparent border-b border-cyan-500/50 text-cyan-300 outline-none mt-0.5 px-0 py-0"
+                style={{ fontSize: 9 }}
+              />
+            ) : taskContext ? (
               <div className="font-mono text-slate-700 truncate mt-0.5" style={{ fontSize: 9 }}>
                 task: {taskContext.title}
+              </div>
+            ) : customSessionId ? (
+              <div className="font-mono text-slate-700 truncate mt-0.5" style={{ fontSize: 9 }}>
+                {sessionName || customSessionName || sessionId.slice(0, 8)}
               </div>
             ) : currentNote && (
               <div className="font-mono text-slate-700 truncate mt-0.5" style={{ fontSize: 9 }}>
@@ -114,16 +361,30 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
               </div>
             )}
           </div>
+          <StatusBadge status={status} />
         </div>
 
-        <div className="flex items-center gap-0.5 flex-shrink-0">
+        <div className="flex items-center gap-1.5 md:gap-0.5 flex-shrink-0">
           <button
-            onClick={handleRestart}
+            onClick={handleRepaint}
             className="terminal-btn"
-            title="Restart Session"
+            title="Repaint (Ctrl+L into claude, fixes garbled display)"
           >
             <RotateCcw className="w-3 h-3" />
           </button>
+          {/* Kebab trigger. The dropdown itself is rendered via portal
+              into document.body (see below) so it isn't clipped by
+              xterm's stacking context. */}
+          <div className="relative" ref={kebabRef}>
+            <button
+              ref={kebabBtnRef}
+              onClick={() => setKebabOpen(v => !v)}
+              className={`terminal-btn ${kebabOpen ? 'bg-white/5 text-slate-300' : ''}`}
+              title="More actions"
+            >
+              <MoreVertical className="w-3 h-3" />
+            </button>
+          </div>
           <button
             onClick={handleKill}
             className="terminal-btn terminal-btn-kill"
@@ -148,6 +409,8 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
         </div>
       </div>
 
+      <BlockedBanner status={status} />
+
       {/* ── Terminal ────────────────────────────────────────────── */}
       <div className="flex-1 min-h-0 relative z-10 flex flex-col">
         <TerminalChat
@@ -158,6 +421,21 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
           dangerousMode={true}
           taskContext={taskContext}
           onFocus={onCloseMobileSidebar}
+          resumeFromSessionId={resumeFromSessionId}
+          resumeFork={resumeFork}
+          attachToSessionId={attachToSessionId}
+          hideInternalHeader
+          onReady={() => {
+            // Auto-repaint after the WS comes up. ONLY refit — never
+            // send Ctrl+L automatically because claude's TUI binds it
+            // (and similar control keys) to slash actions that would
+            // wipe the conversation. The resize alone is enough: it
+            // sends SIGWINCH to the PTY and claude re-lays out the
+            // current screen at the authoritative xterm dims. The
+            // 800ms delay lets claude's first frame land first so the
+            // resize re-flow has something to redraw.
+            window.setTimeout(() => terminalRef.current?.refit(), 800)
+          }}
         />
       </div>
 
@@ -167,6 +445,7 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
       {/* ── Mobile Virtual Keyboard (hidden on md+) ─────────────── */}
       {showKeyboard && <div className="md:hidden flex-shrink-0 relative z-10 terminal-keyboard">
         <div className="terminal-key-row">
+          <TermKey variant="danger" label="esc"  onPress={() => sendKey('\x1b')}   />
           <TermKey variant="nav"    label="↑"    onPress={() => sendKey('\x1b[A')} />
           <TermKey variant="nav"    label="↓"    onPress={() => sendKey('\x1b[B')} />
           <TermKey variant="nav"    label="←"    onPress={() => sendKey('\x1b[D')} />
@@ -192,6 +471,61 @@ function ChatPanel({ visible, onClose, noteId, taskContext, onCloseMobileSidebar
           onPaste={(text) => { if (text) sendKey(text); setPasteOpen(false) }}
         />
       )}
+
+      {/* Kebab dropdown rendered via portal so it floats above xterm's
+          stacking context (xterm sets its own z-index and would clip
+          an absolutely-positioned in-flow dropdown). Position is
+          recomputed from the trigger button's bounding rect. */}
+      {kebabOpen && kebabPos && createPortal(
+        <div
+          data-chat-kebab-dropdown
+          className="fixed z-[100] min-w-[160px] bg-[#0a0b10] border border-white/[0.09] rounded shadow-2xl py-1"
+          style={{ top: kebabPos.top, right: kebabPos.right }}
+        >
+          <button
+            onClick={() => { setKebabOpen(false); handleRestart() }}
+            disabled={restarting}
+            className={`w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors ${restarting ? 'opacity-40 cursor-not-allowed' : ''}`}
+          >
+            <RefreshCw className={`w-3 h-3 text-amber-400/80 ${restarting ? 'animate-spin' : ''}`} />
+            {restarting ? 'Restarting…' : 'Restart session'}
+          </button>
+          <button
+            onClick={handleExport}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <FileJson className="w-3 h-3 text-amber-400/80" />
+            Export .jsonl
+          </button>
+          {onForked && (
+            <button
+              onClick={handleFork}
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+            >
+              <GitFork className="w-3 h-3 text-violet-400/80" />
+              Fork…
+            </button>
+          )}
+          <button
+            onClick={beginRename}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <Pencil className="w-3 h-3 text-cyan-400/80" />
+            Rename…
+          </button>
+          <button
+            onClick={handleCompact}
+            disabled={compacting}
+            className={`w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors ${compacting ? 'opacity-40 cursor-not-allowed' : ''}`}
+            title="Evict bulky tool_result payloads from older turns. Original archived. Effect lands on next resume."
+          >
+            <Archive className={`w-3 h-3 text-emerald-400/80 ${compacting ? 'animate-pulse' : ''}`} />
+            {compacting ? 'Compacting…' : 'Compact'}
+          </button>
+        </div>,
+        document.body,
+      )}
+
     </div>
   )
 }
@@ -301,6 +635,72 @@ function PasteOverlay({ onCancel, onPaste }: { onCancel: () => void; onPaste: (t
     </div>,
     document.body,
   )
+}
+
+// Tiny presence indicator next to the chat title. Colour reflects what
+// the session is doing right now; tooltip shows the Haiku-generated detail.
+// Daemon-backed sessions have rich state; subprocess sessions show a
+// neutral "running" dot.
+function StatusBadge({ status }: { status: SessionStatus | null }) {
+  if (!status) return null
+  const { color, label } = badgeMeta(status)
+  const tooltip = status.detail
+    ? `${label} · ${status.detail}`
+    : label
+  return (
+    <div
+      className="flex items-center gap-1 flex-shrink-0 ml-2"
+      title={tooltip}
+      style={{ fontSize: 9 }}
+    >
+      <span
+        className="inline-block rounded-full"
+        style={{
+          width: 8,
+          height: 8,
+          background: color,
+          boxShadow: status.tempo === 'active' ? `0 0 6px ${color}` : 'none',
+        }}
+      />
+      <span className="font-mono uppercase tracking-wider text-slate-500">
+        {label}
+      </span>
+    </div>
+  )
+}
+
+// Banner shown above the terminal when the session is waiting for the
+// user's input (state=blocked + needs has the question). The chat is
+// still usable; this is a hint that scrolling up will reveal what claude
+// is asking.
+function BlockedBanner({ status }: { status: SessionStatus | null }) {
+  if (!status || status.state !== 'blocked' || !status.needs) return null
+  return (
+    <div className="relative z-10 flex-shrink-0 px-3 py-2 border-b border-amber-500/30 bg-amber-500/10">
+      <div className="font-mono text-amber-300/90" style={{ fontSize: 10, letterSpacing: '0.08em' }}>
+        <span className="uppercase tracking-wider mr-2">⏳ needs you:</span>
+        {status.needs}
+      </div>
+    </div>
+  )
+}
+
+function badgeMeta(s: SessionStatus): { color: string; label: string } {
+  // Identical logic to sidebar's SessionStatusPill. tempo wins over
+  // state because daemon's phase ("state") flips on lifecycle
+  // events and can lag — when claude is actively emitting output
+  // (tempo=active), it CAN'T be waiting for user input even if
+  // state still says "blocked" from a moment ago.
+  if (s.state === 'failed') return { color: '#ef4444', label: 'failed' }
+  if (s.state === 'stopped') return { color: '#6b7280', label: 'stopped' }
+  if (s.tempo === 'active') return { color: '#22d3ee', label: 'working' }
+  if (s.tempo === 'blocked' || s.state === 'blocked') {
+    return { color: '#fb923c', label: 'needs you' }
+  }
+  if (s.state === 'done' || s.state === 'working' || s.state === 'running') {
+    return { color: '#22c55e', label: 'ready' }
+  }
+  return { color: '#64748b', label: 'unknown' }
 }
 
 export default ChatPanel

@@ -6,6 +6,9 @@ import NewNoteModal from '../modals/NewNoteModal'
 import SearchModal from '../modals/SearchModal'
 import ImportDBModal from '../modals/ImportDBModal'
 import GlobalTerminalPanel from '../chat/GlobalTerminalPanel'
+import SessionsModal from '../sessions/SessionsModal'
+import TranscriptViewer from '../sessions/TranscriptViewer'
+import ResumeChatModal from '../sessions/ResumeChatModal'
 import { exportToPDF, exportToWord, exportAllNotesToZip, exportToHTML } from '../../utils/export'
 
 interface HeaderProps {
@@ -24,7 +27,61 @@ function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, onCloseMobile
   const [showExportMenu, setShowExportMenu] = useState(false)
   const [showImportDB, setShowImportDB] = useState(false)
   const [globalTerminalOpen, setGlobalTerminalOpen] = useState(false)
+  const [sessionsModalOpen, setSessionsModalOpen] = useState(false)
+  const [viewerSessionId, setViewerSessionId] = useState<string | null>(null)
+  const [viewerScrollLine, setViewerScrollLine] = useState<number | undefined>(undefined)
+  const [resumeSessionId, setResumeSessionId] = useState<string | null>(null)
+  const [resumeSessionName, setResumeSessionName] = useState<string>('')
+  const [resumeMode, setResumeMode] = useState<'resume' | 'fork' | 'attach'>('resume')
   const exportMenuRef = useRef<HTMLDivElement>(null)
+
+  // Opening a transcript leaves the underlying modal mounted — that's
+  // how the back-stack works: X on viewer returns to whichever modal
+  // launched it (SessionsModal or GlobalSearchModal). Z-index handles
+  // visual stacking.
+  const openTranscript = (sessionId: string, lineNumber?: number) => {
+    setViewerSessionId(sessionId)
+    setViewerScrollLine(lineNumber)
+  }
+
+  // attachToLive opens ResumeChatModal in 'attach' mode, hooking up to
+  // an existing live daemon worker by its UUID. Bypasses the transcript
+  // viewer — that's pointless for sessions still in flight.
+  const attachToLive = (sessionId: string, name: string) => {
+    setResumeMode('attach')
+    setResumeSessionId(sessionId)
+    setResumeSessionName(name)
+  }
+
+  // Cmd+K / Ctrl+K opens the SessionsModal (which has its own search
+  // input). Cmd+Shift+S also opens SessionsModal. Notes search keeps
+  // its own shortcut (Cmd+Shift+F) untouched.
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (!mod) return
+      if (e.key === 'k' || e.key === 'K') {
+        if (e.shiftKey || e.altKey) return
+        e.preventDefault()
+        setSessionsModalOpen(true)
+        return
+      }
+      if (e.shiftKey && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault()
+        setSessionsModalOpen(true)
+      }
+    }
+    // Sidebar (and anywhere else) can open the Sessions Modal via a
+    // window event — keeps state private to Header without lifting it
+    // up to a shared parent or context.
+    const openHandler = () => setSessionsModalOpen(true)
+    window.addEventListener('keydown', handler)
+    window.addEventListener('open-sessions-modal', openHandler)
+    return () => {
+      window.removeEventListener('keydown', handler)
+      window.removeEventListener('open-sessions-modal', openHandler)
+    }
+  }, [])
 
   const handleNewNote = () => setShowNewNoteModal(true)
 
@@ -279,6 +336,52 @@ function Header({ onNoteSelect, previewRef, onToggleMobileSidebar, onCloseMobile
         visible={globalTerminalOpen}
         onClose={() => setGlobalTerminalOpen(false)}
         onMobileSidebarClose={onCloseMobileSidebar}
+      />
+
+      <SessionsModal
+        visible={sessionsModalOpen}
+        onClose={() => setSessionsModalOpen(false)}
+        onOpenSession={(id, isLive, name) => {
+          // Live → attach to running worker (no transcript needed).
+          // Historical → open viewer; user picks Continue/Fork from there.
+          if (isLive) attachToLive(id, name)
+          else openTranscript(id)
+        }}
+        currentProjectCwd={currentNote?.projectPath || undefined}
+      />
+      <TranscriptViewer
+        visible={!!viewerSessionId}
+        sessionId={viewerSessionId}
+        scrollToLine={viewerScrollLine}
+        onClose={() => {
+          setViewerSessionId(null)
+          setViewerScrollLine(undefined)
+        }}
+        onContinue={(id, name) => {
+          // Leave viewer mounted — modal back-stack returns here when
+          // the resume modal closes. ResumeChatModal z-2200 covers
+          // TranscriptViewer z-2100 visually.
+          setResumeMode('resume')
+          setResumeSessionId(id)
+          setResumeSessionName(name)
+        }}
+        onFork={(id, name) => {
+          setResumeMode('fork')
+          setResumeSessionId(id)
+          setResumeSessionName(name)
+        }}
+        onAttachLive={(id, name) => attachToLive(id, name)}
+      />
+      <ResumeChatModal
+        visible={!!resumeSessionId}
+        sessionId={resumeSessionId}
+        sessionName={resumeSessionName}
+        mode={resumeMode}
+        onClose={() => {
+          setResumeSessionId(null)
+          setResumeSessionName('')
+          setResumeMode('resume')
+        }}
       />
     </>
   )

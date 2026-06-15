@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 export interface ContextMenuItem {
   icon?: string
@@ -20,6 +20,34 @@ interface ContextMenuProps {
 
 function ContextMenu({ visible, x, y, items, onClose }: ContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null)
+  // Clamped position so the menu never overflows the viewport. When
+  // user right-clicks near the bottom/right edge, the rendered menu
+  // would otherwise extend past the visible area and items get cut.
+  // Initial value mirrors the requested position; useLayoutEffect
+  // measures actual dims after first paint and corrects.
+  const [pos, setPos] = useState({ x, y })
+
+  // Single useLayoutEffect handles both reset-on-anchor-change AND
+  // clamp-to-viewport. The previous two-effect setup had a race:
+  // a deferred useEffect reset pos to the raw (x, y) AFTER the
+  // sync useLayoutEffect had already clamped it, so the menu
+  // briefly landed off-screen for one paint. Fires before paint
+  // when visible/x/y/items change.
+  useLayoutEffect(() => {
+    if (!visible || !menuRef.current) return
+    const rect = menuRef.current.getBoundingClientRect()
+    const margin = 8 // breathing room from viewport edge
+    let nx = x
+    let ny = y
+    if (x + rect.width > window.innerWidth - margin) {
+      nx = Math.max(margin, window.innerWidth - rect.width - margin)
+    }
+    if (y + rect.height > window.innerHeight - margin) {
+      ny = Math.max(margin, window.innerHeight - rect.height - margin)
+    }
+    setPos({ x: nx, y: ny })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, x, y, items])
 
   // Close on click outside
   useEffect(() => {
@@ -66,7 +94,7 @@ function ContextMenu({ visible, x, y, items, onClose }: ContextMenuProps) {
     <div
       ref={menuRef}
       className={`context-menu ${visible ? 'show' : ''}`}
-      style={{ left: `${x}px`, top: `${y}px` }}
+      style={{ left: `${pos.x}px`, top: `${pos.y}px` }}
     >
       {items.map((item, index) => {
         if (item.divider) {

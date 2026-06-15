@@ -39,6 +39,16 @@ function HomePage() {
   const [mountedChatNoteIds, setMountedChatNoteIds] = useState<string[]>([])
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [mobilePanel, setMobilePanel] = useState<'editor' | 'preview'>('editor')
+  // Sidebar attach modal: when user clicks a non-note session in the
+  // sidebar list, we open this modal in 'open' mode to render the
+  // existing PTY without spawning anything new.
+  const [attachSessionId, setAttachSessionId] = useState<string | null>(null)
+  const [attachSessionName, setAttachSessionName] = useState<string>('')
+  // When the user forks a session from the ChatPanel kebab, we mount a
+  // fresh TerminalChat with resumeFromSessionId=source + resumeFork=true.
+  // attachForkSourceId holds the SOURCE's full UUID for the next mount;
+  // it's null once the fork is established (after first init).
+  const [attachForkSourceId, setAttachForkSourceId] = useState<string | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<HTMLDivElement>(null)
   const previewRef = useRef<HTMLDivElement>(null)
@@ -254,7 +264,11 @@ function HomePage() {
     setMobileSidebarOpen(false)
   }
 
-  // Handle session deletion - close chat panel if deleted session is currently open
+  // Handle session deletion - close ANY chat panel currently showing
+  // the deleted session. Two paths exist depending on how the panel
+  // was opened: note-bound (chatNoteId state) or sidebar-attached
+  // (attachSessionId state). Without closing both, the WS in the
+  // still-open panel reconnects to a dead session and respawns it.
   const handleSessionDeleted = (deletedSessionId: string) => {
     const deletedNoteId = deletedSessionId.startsWith('note-') ? deletedSessionId.slice(5) : deletedSessionId
     setMountedChatNoteIds(prev => prev.filter(id => id !== deletedNoteId))
@@ -265,6 +279,11 @@ function HomePage() {
         setChatNoteId(null)
       }
     }
+    if (attachSessionId === deletedSessionId) {
+      setAttachSessionId(null)
+      setAttachSessionName('')
+      setAttachForkSourceId(null)
+    }
   }
 
   // Synchronized scroll (only in split view)
@@ -273,6 +292,28 @@ function HomePage() {
     previewRef,
     enabled: viewMode === 'split' && !showWelcome,
   })
+
+  // Sidebar context-menu "Fork…" dispatches this event with the
+  // source session id + the user-given name. Run the same flow the
+  // in-terminal kebab Fork uses: generate a new client UUID, route
+  // to attach mode, ChatPanel mounts with resume props and dispatches
+  // claude --bg --resume <source> --fork-session.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent<{ sourceId: string; name: string }>
+      const { sourceId, name } = ce.detail || ({} as { sourceId: string; name: string })
+      if (!sourceId || !name) return
+      const newId = crypto.randomUUID()
+      setAttachForkSourceId(sourceId)
+      setAttachSessionName(name)
+      setAttachSessionId(newId)
+      const refresh = () => window.dispatchEvent(new CustomEvent('claude-sessions-refresh'))
+      setTimeout(refresh, 1200)
+      setTimeout(refresh, 2500)
+    }
+    window.addEventListener('fork-session-request', handler)
+    return () => window.removeEventListener('fork-session-request', handler)
+  }, [])
 
   // Initialize and restore panel widths
   useLayoutEffect(() => {
@@ -343,6 +384,16 @@ function HomePage() {
           onToggleCollapse={setSidebarCollapsed}
           onNoteSelect={handleNoteSelect}
           onOpenChatWithNote={handleOpenChatWithNote}
+          onAttachToSession={(id, name) => {
+            // Regular sidebar click — NOT a fork action. Reset the
+            // fork-source state so the next ChatPanel mount doesn't
+            // re-send resumeFromSessionId/fork in its WS init,
+            // which would spawn yet another fork against the OLD
+            // source (Bug from fork audit).
+            setAttachForkSourceId(null)
+            setAttachSessionId(id)
+            setAttachSessionName(name)
+          }}
           onSessionDeleted={handleSessionDeleted}
           activeSessionId={showChatPanel && chatNoteId ? `note-${chatNoteId}` : undefined}
           mobileOpen={mobileSidebarOpen}
@@ -487,6 +538,46 @@ function HomePage() {
           onCloseMobileSidebar={() => setMobileSidebarOpen(false)}
         />
       ))}
+
+      {/* Sidebar-driven attach: reuses ChatPanel (same right-side
+          terminal panel with mobile keyboard / status badge / paste
+          overlay that note-bound chats use) but with an explicit
+          sessionId instead of a note. Closing here keeps the daemon
+          worker alive; reopening from sidebar re-attaches. */}
+      {attachSessionId && (
+        <ChatPanel
+          // Re-key on the active sessionId so a fork forces a fresh
+          // TerminalChat mount — otherwise React reuses the old component
+          // and never re-sends the resume init.
+          key={attachSessionId}
+          visible={!!attachSessionId}
+          customSessionId={attachSessionId}
+          customSessionName={attachSessionName}
+          resumeFromSessionId={attachForkSourceId ?? undefined}
+          resumeFork={!!attachForkSourceId}
+          onClose={() => {
+            setAttachSessionId(null)
+            setAttachSessionName('')
+            setAttachForkSourceId(null)
+          }}
+          onCloseMobileSidebar={() => setMobileSidebarOpen(false)}
+          onForked={(newId, newName, sourceId) => {
+            // Switch the panel to the new fork. Backend will dispatch
+            // `claude --resume <sourceId> --fork-session` on next init.
+            setAttachForkSourceId(sourceId)
+            setAttachSessionName(newName)
+            setAttachSessionId(newId)
+            // Backend takes ~1s to populate m.sessions after Dispatch
+            // returns (sleep 400ms + attach). Schedule a few sidebar
+            // refreshes so the fork's row appears with its proper
+            // user-given name as soon as the manager session exists
+            // — instead of waiting up to 3s for the regular poll.
+            const refresh = () => window.dispatchEvent(new CustomEvent('claude-sessions-refresh'))
+            setTimeout(refresh, 1200)
+            setTimeout(refresh, 2500)
+          }}
+        />
+      )}
     </div>
   )
 }

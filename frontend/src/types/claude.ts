@@ -18,6 +18,11 @@ export interface ClaudeSession {
   lastActivity: string
   createdAt: string
   initialized: boolean // Whether backend session is initialized
+  /** Live daemon state, set by ListActiveSessions for sidebar status badge. */
+  tempo?: 'idle' | 'active' | 'blocked' | 'unknown' | string
+  state?: 'working' | 'blocked' | 'done' | 'failed' | 'stopped' | 'running' | 'unknown' | string
+  detail?: string
+  needs?: string
 }
 
 export type WSMessageType =

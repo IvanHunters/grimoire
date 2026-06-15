@@ -1,4 +1,4 @@
-import { useRef, useCallback, forwardRef, useImperativeHandle } from 'react'
+import { useRef, useCallback, useState, forwardRef, useImperativeHandle } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -12,6 +12,26 @@ interface TerminalChatProps {
   dangerousMode?: boolean
   taskContext?: TaskContextPayload | null
   onFocus?: () => void
+  /**
+   * If set, the backend spawns this session via claude --resume <uuid>
+   * from the historical transcript's cwd. Forwarded to the WebSocket
+   * init message. Caller is responsible for using the historical UUID
+   * as `sessionId` too (so reconnect finds the right session).
+   */
+  resumeFromSessionId?: string
+  /** Pass to fork off the historical transcript instead of continuing. */
+  resumeFork?: boolean
+  /**
+   * If set, the backend attaches to a live daemon session by this UUID
+   * — no spawn, no resume. Used by sidebar click on an active session.
+   */
+  attachToSessionId?: string
+  /** When the parent already renders a header with sessionName /
+   *  dangerous-mode badge, hide TerminalChat's internal duplicate. */
+  hideInternalHeader?: boolean
+  /** Fired every time the underlying WS reaches OPEN. Use to trigger
+   *  a post-attach repaint of the claude TUI. */
+  onReady?: () => void
 }
 
 export interface TerminalChatHandle {
@@ -22,7 +42,7 @@ export interface TerminalChatHandle {
 }
 
 export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
-  ({ sessionId, sessionName, dangerousMode = true, taskContext, onFocus }, ref) => {
+  ({ sessionId, sessionName, dangerousMode = true, taskContext, onFocus, resumeFromSessionId, resumeFork, attachToSessionId, hideInternalHeader, onReady }, ref) => {
   const { currentNote } = useNotes()
   const terminalRef = useRef<HTMLDivElement>(null)
   const xtermRef = useRef<Terminal | null>(null)
@@ -31,6 +51,17 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
   const sendResizeRef = useRef<((cols: number, rows: number) => void) | null>(null)
   const resizeTimeoutRef = useRef<number | undefined>(undefined)
   const isResizingRef = useRef(false)
+
+  // Initial xterm dimensions. Gated > 0 so useTerminalWebSocket waits
+  // for xterm to mount + fit before opening the connection. Without
+  // this, init goes out with sessionId only — backend then has to
+  // spawn the daemon worker at a default 80x24, claude renders
+  // initial scrollback at that size, frontend resize arrives 50-100ms
+  // later and only repaints the CURRENT screen via SIGWINCH. The
+  // scrollback retains 80-col positioning while the viewport is
+  // wider → visible character/line corruption that recovers only
+  // when claude redraws.
+  const [initialDims, setInitialDims] = useState<{ cols: number; rows: number } | null>(null)
 
   // Handle output from WebSocket — accepts Uint8Array (decoded from base64)
   const handleOutput = useCallback((data: Uint8Array) => {
@@ -56,13 +87,21 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     }
   }, [])
 
-  // Setup WebSocket connection
+  // Setup WebSocket connection — gated on initialDims so the init
+  // payload carries the correct cols/rows.
   const { sendInput, sendRestart, sendResize } = useTerminalWebSocket({
     sessionId,
     dangerousMode,
     currentNote: taskContext ? null : currentNote,
     taskContext: taskContext ?? null,
     onOutput: handleOutput,
+    resumeFromSessionId,
+    resumeFork,
+    attachToSessionId,
+    sessionName,
+    initialCols: initialDims?.cols,
+    initialRows: initialDims?.rows,
+    onReady,
   })
 
   // Keep sendInput and sendResize refs up to date
@@ -77,7 +116,18 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
   // Expose methods to parent
   useImperativeHandle(ref, () => ({
     restart: () => {
-      if (xtermRef.current) xtermRef.current.reset()
+      // reset() wipes the visible buffer + cursor state + terminal modes
+      // but leaves scrollback intact. clear() drops scrollback too — we
+      // want both: the new session should render into a totally blank
+      // terminal so leftover frames from the old PTY don't peek through.
+      // Order matters: clear first (drops history), then reset (cursor
+      // home, attrs default). Backend then kills the worker, respawns,
+      // and streams fresh PTY output over the same WS into the now-empty
+      // terminal.
+      if (xtermRef.current) {
+        try { xtermRef.current.clear() } catch {}
+        try { xtermRef.current.reset() } catch {}
+      }
       sendRestart()
     },
     sendKey: (data: string) => {
@@ -151,6 +201,10 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     // Open terminal
     term.open(terminalRef.current)
     fitAddon.fit()
+
+    // Publish initial dimensions so the WS hook can finally connect
+    // with cols/rows in the init payload.
+    setInitialDims({ cols: term.cols, rows: term.rows })
 
     // Handle user input - send to WebSocket
     term.onData((data) => {
@@ -277,27 +331,29 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
 
   return (
     <div className="flex flex-col flex-1 min-h-0" style={{ background: '#06080e' }}>
-      <div
-        className="flex-shrink-0 px-4 py-2 flex items-center gap-3"
-        style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
-      >
-        <span className="text-[10px] font-mono text-slate-700 truncate max-w-[220px]" title={sessionId}>
-          {sessionName
-            ? sessionName
-            : sessionId.startsWith('global-')
-            ? `global ···${sessionId.slice(-6)}`
-            : sessionId.startsWith('note-task-')
-            ? `task ···${sessionId.slice(-6)}`
-            : sessionId.startsWith('note-')
-            ? `note ···${sessionId.slice(-6)}`
-            : `···${sessionId.slice(-6)}`}
-        </span>
-        {dangerousMode && (
-          <span className="text-[10px] font-mono text-yellow-600/80 tracking-wide">
-            ⚠ dangerous mode
+      {!hideInternalHeader && (
+        <div
+          className="flex-shrink-0 px-4 py-2 flex items-center gap-3"
+          style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
+        >
+          <span className="text-[10px] font-mono text-slate-700 truncate max-w-[220px]" title={sessionId}>
+            {sessionName
+              ? sessionName
+              : sessionId.startsWith('global-')
+              ? `global ···${sessionId.slice(-6)}`
+              : sessionId.startsWith('note-task-')
+              ? `task ···${sessionId.slice(-6)}`
+              : sessionId.startsWith('note-')
+              ? `note ···${sessionId.slice(-6)}`
+              : `···${sessionId.slice(-6)}`}
           </span>
-        )}
-      </div>
+          {dangerousMode && (
+            <span className="text-[10px] font-mono text-yellow-600/80 tracking-wide">
+              ⚠ dangerous mode
+            </span>
+          )}
+        </div>
+      )}
       <div ref={terminalRef} className="flex-1 min-h-0 overflow-hidden p-2" onPointerDown={() => onFocus?.()} />
     </div>
   )

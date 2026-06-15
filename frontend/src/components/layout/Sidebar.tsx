@@ -8,7 +8,6 @@ import { SwipeableItem } from '../common/SwipeableItem'
 import NewNoteModal from '../modals/NewNoteModal'
 import NewFolderModal from '../modals/NewFolderModal'
 import NewSkillModal from '../modals/NewSkillModal'
-import SessionManageModal from '../modals/SessionManageModal'
 import RenameModal from '../modals/RenameModal'
 import DeleteConfirmModal from '../modals/DeleteConfirmModal'
 import FolderProjectPathModal from '../modals/FolderProjectPathModal'
@@ -16,6 +15,7 @@ import { sessionsAPI } from '../../api/sessions'
 import { foldersAPI } from '../../api/folders'
 import { skillsAPI, type SkillSummary } from '../../api/skills'
 import { exportFolderToZip } from '../../utils/export'
+import { SessionStatusPill, formatSessionAge } from '../sessions/SessionStatusPill'
 
 interface SidebarProps {
   width?: number
@@ -23,6 +23,14 @@ interface SidebarProps {
   onToggleCollapse?: (collapsed: boolean) => void
   onNoteSelect?: (note: any) => void
   onOpenChatWithNote?: (noteId: string) => void
+  /**
+   * Called when the user clicks a non-note session in the sidebar
+   * list (Quick Terminal tabs, daemon-only sessions, etc). The parent
+   * should open an attach modal so the user can interact with the
+   * existing live session. sessionId here is whatever the backend
+   * keyed the session by (often the daemon UUID).
+   */
+  onAttachToSession?: (sessionId: string, sessionName: string) => void
   onSessionDeleted?: (sessionId: string) => void
   activeSessionId?: string
   mobileOpen?: boolean
@@ -205,19 +213,7 @@ function FolderTreeNode({
   )
 }
 
-function formatSessionAge(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime()
-  const m = Math.floor(diff / 60000)
-  if (m < 1) return 'just now'
-  if (m < 60) return `${m}m`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h`
-  const d = Math.floor(h / 24)
-  if (d < 30) return `${d}d`
-  return `${Math.floor(d / 30)}mo`
-}
-
-function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelect, onOpenChatWithNote, onSessionDeleted, activeSessionId, mobileOpen = false, onMobileClose }: SidebarProps) {
+function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelect, onOpenChatWithNote, onAttachToSession, onSessionDeleted, activeSessionId, mobileOpen = false, onMobileClose }: SidebarProps) {
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768)
   useEffect(() => {
     const handler = () => setIsMobile(window.innerWidth < 768)
@@ -361,7 +357,6 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     visible: boolean
     parentPath: string
   }>({ visible: false, parentPath: '' })
-  const [sessionManageVisible, setSessionManageVisible] = useState(false)
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null)
   const [renamingSessionValue, setRenamingSessionValue] = useState('')
   const [sessionOrder, setSessionOrder] = useState<string[]>(() => {
@@ -558,13 +553,33 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
   // Handle session deletion
   const handleDeleteSession = async (sessionId: string) => {
     try {
-      await sessionsAPI.deleteSession(sessionId)
+      // deleteTranscript:true so the JSONL on disk goes too. Without
+      // this, the live worker is killed but the historical row keeps
+      // coming back on the next sidebar poll — looks like "delete
+      // didn't work".
+      await sessionsAPI.deleteSession(sessionId, { deleteTranscript: true })
       // Remove from local state immediately
       setClaudeSessions(prev => prev.filter(s => s.id !== sessionId))
       // Notify parent that session was deleted (to close chat panel if needed)
       if (onSessionDeleted) {
         onSessionDeleted(sessionId)
       }
+      // Drop the matching tab from GlobalTerminalPanel's localStorage.
+      // Without this, the panel restores the (now-dead) tab on its
+      // next open and respawns the session, which looks to the user
+      // like "I deleted it but it keeps coming back".
+      try {
+        const raw = localStorage.getItem('global-terminal-tabs')
+        if (raw) {
+          const tabs = JSON.parse(raw) as Array<{ sessionId: string; label: string }>
+          const filtered = tabs.filter(t => t.sessionId !== sessionId)
+          if (filtered.length !== tabs.length) {
+            localStorage.setItem('global-terminal-tabs', JSON.stringify(filtered))
+            // Notify any open GlobalTerminalPanel to refresh its tabs.
+            window.dispatchEvent(new CustomEvent('global-terminal-tabs-changed'))
+          }
+        }
+      } catch {}
     } catch (error) {
       console.error('Failed to delete session:', error)
       alert('Failed to delete session')
@@ -599,6 +614,77 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
           action: () => {
             setRenamingSessionId(session.id)
             setRenamingSessionValue(session.name || '')
+          },
+        },
+        {
+          text: 'Fork…',
+          icon: 'code-branch',
+          action: () => {
+            const suggested = session.name ? `${session.name} (fork)` : 'fork'
+            const name = window.prompt('Имя для форка:', suggested)
+            if (name == null) return
+            const trimmed = name.trim()
+            if (!trimmed) return
+            // HomePage listens for this event and runs the same
+            // onForked flow as the in-terminal kebab Fork action.
+            window.dispatchEvent(new CustomEvent('fork-session-request', {
+              detail: { sourceId: session.id, name: trimmed },
+            }))
+          },
+        },
+        {
+          text: 'Export .jsonl',
+          icon: 'download',
+          action: () => {
+            // Stream the session's JSONL transcript directly from the
+            // backend via Content-Disposition. Same flow as the chat
+            // panel's kebab Export — no JS heap allocation for big
+            // transcripts.
+            const a = document.createElement('a')
+            a.href = `/api/sessions/${session.id}/jsonl`
+            a.download = `${session.name || session.id}.jsonl`
+            document.body.appendChild(a)
+            a.click()
+            a.remove()
+          },
+        },
+        {
+          text: 'Compact + restart',
+          icon: 'archive',
+          action: async () => {
+            // Deterministic transcript shrink + restart so the live
+            // daemon worker reloads from the smaller JSONL. Without
+            // the restart, the in-memory conversation still carries
+            // the full context and the user sees zero benefit until a
+            // separate restart.
+            try {
+              const r = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/compact`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ generate_ledger: true }),
+              })
+              if (!r.ok) throw new Error(`HTTP ${r.status}`)
+              const j = await r.json()
+              console.info('[compact]', {
+                bytes: `${j.bytes_before} to ${j.bytes_after}`,
+                tokens: `${j.approx_tokens_before} to ${j.approx_tokens_after}`,
+                evicted: `${j.tool_results_evicted}/${j.tool_results}`,
+                archive: j.archive_path, ledger: j.ledger_path,
+              })
+              // Ask whatever ChatPanel currently owns this session to
+              // restart. HomePage / GlobalTerminalPanel listen and call
+              // the standard restart path (terminalRef.current.restart)
+              // which the kebab Restart button also uses.
+              window.dispatchEvent(new CustomEvent('claude-session-restart-request', {
+                detail: { sessionId: session.id },
+              }))
+              // Sidebar list refresh — daemon worker may briefly drop
+              // from listing while it cycles.
+              window.dispatchEvent(new CustomEvent('claude-sessions-refresh'))
+            } catch (err) {
+              console.error('compact failed', err)
+              alert('Compact failed: ' + (err as Error).message)
+            }
           },
         },
         {
@@ -968,21 +1054,63 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
     }
   }, [])
 
-  // Load Claude terminal sessions
+  // Load live Claude sessions from the in-memory manager. We keep
+  // using /api/sessions (not /api/sessions/by-project) so the IDs we
+  // get back match the grimoire-side keys in manager.sessions —
+  // critical because clicking a session reconnects via that exact
+  // key, and the daemon UUID (from by-project) wouldn't match.
+  //
+  // Name accuracy is handled backend-side: handler.init no longer
+  // overrides session.Name with the currently-open note's title for
+  // non-note sessions, so "Quick Terminal" / daemon names stay intact.
   useEffect(() => {
     const loadSessions = async () => {
       try {
-        const sessions = await sessionsAPI.listActiveSessions()
-        setClaudeSessions(sessions)
+        // Sidebar shows ONLY live sessions (daemon worker alive in
+        // the claude daemon). Historical transcripts on disk are
+        // available via Cmd+K (SessionsModal) — keeping them out
+        // of the sidebar avoids the "300 ghost rows" clutter and
+        // keeps the menu focused on what the user is actively
+        // working on right now. Click a historical from Cmd+K to
+        // resume it; once it spawns a daemon worker it shows here.
+        const all = await sessionsAPI.listByProject()
+        const top = all.filter((s) => !!s.live)
+        // Map SessionListItem → ClaudeSession shape so the existing
+        // render code below doesn't need to branch on data source.
+        const mapped: ClaudeSession[] = top.map((s) => ({
+          id: s.sessionId,
+          name: s.name,
+          workingDir: s.cwd,
+          dangerousMode: true,
+          messages: [],
+          isActive: !!s.live,
+          lastActivity: s.lastActivity,
+          createdAt: s.startedAt,
+          initialized: true,
+          tempo: s.live?.tempo,
+          state: s.live?.state,
+          detail: s.live?.detail,
+          needs: s.live?.needs,
+        }))
+        setClaudeSessions(mapped)
       } catch (error) {
         console.error('Failed to load Claude sessions:', error)
       }
     }
 
     loadSessions()
-    // Refresh sessions every 10 seconds
-    const interval = window.setInterval(loadSessions, 10000)
-    return () => clearInterval(interval)
+    // Refresh every 3s — status badges (working / waits input / done)
+    // need to feel responsive when claude finishes a task.
+    const interval = window.setInterval(loadSessions, 3000)
+    // External event triggers an immediate refresh — used by fork
+    // and other "I just changed something, show me the result now"
+    // flows so the user doesn't wait up to 3s for the next poll tick.
+    const refreshHandler = () => loadSessions()
+    window.addEventListener('claude-sessions-refresh', refreshHandler)
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('claude-sessions-refresh', refreshHandler)
+    }
   }, [])
 
   return (
@@ -1138,16 +1266,22 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
           <div className="flex items-center gap-2">
             <Terminal className="w-3.5 h-3.5 text-purple-500" />
             <span className="text-[10px] font-mono font-semibold tracking-widest text-slate-600 uppercase">Claude Sessions</span>
-            {claudeSessions && claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-')).length > 0 && (
+            {claudeSessions && claudeSessions.length > 0 && (
               <span className="text-[10px] font-mono bg-purple-500/10 text-purple-400 px-1.5 py-0.5 rounded border border-purple-500/20">
-                {claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-')).length}
+                {claudeSessions.length}
               </span>
             )}
           </div>
           <div className="flex items-center gap-1">
             <button
-              onClick={e => { e.stopPropagation(); setSessionManageVisible(true) }}
-              title="Manage session history"
+              onClick={e => {
+                e.stopPropagation()
+                // Open the Sessions Modal (Cmd+K) — same view as the
+                // global hotkey, dispatched as a window event so we
+                // don't have to plumb state up through HomePage.
+                window.dispatchEvent(new CustomEvent('open-sessions-modal'))
+              }}
+              title="Open sessions (Cmd+K)"
               className="p-1 text-slate-700 hover:text-purple-400 transition-colors rounded"
             >
               <Settings2 className="w-3 h-3" />
@@ -1163,12 +1297,16 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
         {/* Sessions list */}
         {!chatHistoryCollapsed && (
           <div className="overflow-y-auto px-2 pb-2" style={{ height: `${sessionsHeight}px` }}>
-            {!claudeSessions || claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-')).length === 0 ? (
+            {!claudeSessions || claudeSessions.length === 0 ? (
               <div className="text-[10px] font-mono text-slate-700 px-2 py-4 text-center tracking-wider uppercase">
                 no active sessions
               </div>
             ) : (() => {
-              const visibleSessions = claudeSessions.filter(s => !s.id.startsWith('global-') && !s.id.startsWith('note-global-'))
+              // Show every active session — note-bound chats, Quick
+              // Terminal tabs (global-*), and any other live daemon
+              // worker. User wants to see and re-attach to all open
+              // work, not just note-linked stuff.
+              const visibleSessions = claudeSessions
               const orderedSessions = [
                 ...sessionOrder.map(id => visibleSessions.find(s => s.id === id)).filter(Boolean) as typeof visibleSessions,
                 ...visibleSessions.filter(s => !sessionOrder.includes(s.id)),
@@ -1194,16 +1332,19 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
               return (
               <div className="space-y-0.5" onDragLeave={() => setDragOverIdx(null)}>
                 {orderedSessions.map((session, sessionIdx) => {
+                  // Names now come from listByProject which uses the
+                  // daemon-side name (or JSONL ai-title) — that's the
+                  // session's actual topic, not the note's. Fall back
+                  // only if the name is empty or generic.
                   let sessionName: string
-                  if (session.name && session.name !== 'Terminal Session') {
+                  if (session.name && session.name !== 'Terminal Session' && session.name !== '(unnamed)') {
                     sessionName = session.name
                   } else if (session.id.startsWith('note-task-')) {
                     sessionName = 'Task Session'
-                  } else if (session.id.startsWith('note-')) {
-                    const noteId = session.id.slice('note-'.length)
-                    sessionName = (notes || []).find(n => n.id === noteId)?.title ?? 'Note Session'
+                  } else if (session.id.startsWith('global-')) {
+                    sessionName = 'Quick Terminal'
                   } else {
-                    sessionName = 'Global Session'
+                    sessionName = session.id.slice(0, 16)
                   }
 
                   const isActive = activeSessionId === session.id
@@ -1225,11 +1366,21 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
                         onContextMenu={(e) => handleSessionContextMenu(e, session)}
                         onClick={() => {
                           if (isRenaming) return
-                          if (onOpenChatWithNote) {
-                            const noteId = session.id.startsWith('note-') ? session.id.replace('note-', '') : null
-                            if (noteId) onOpenChatWithNote(noteId)
-                            else onOpenChatWithNote('')
+                          // Note-bound session → open its primary chat
+                          // via the existing ChatPanel flow. Anything
+                          // else (global-*, task-*, raw daemon UUIDs)
+                          // → attach modal so we connect to the live
+                          // PTY without spawning a new process.
+                          if (session.id.startsWith('note-') && !session.id.startsWith('note-task-')) {
+                            const noteId = session.id.replace('note-', '')
+                            if (onOpenChatWithNote) onOpenChatWithNote(noteId)
+                          } else if (onAttachToSession) {
+                            onAttachToSession(session.id, sessionName)
                           }
+                          // Close the mobile sidebar so the terminal
+                          // gets the full viewport — matches the old
+                          // note-click behaviour.
+                          if (isMobile && onMobileClose) onMobileClose()
                         }}
                         className={`w-full flex items-start gap-2 px-2 py-1.5 rounded transition text-left select-none cursor-pointer ${
                           dragSessionId === session.id ? 'opacity-40' : ''
@@ -1258,8 +1409,11 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
                               className="w-full text-xs font-mono bg-transparent border-b border-cyan-500/50 text-cyan-300 outline-none pb-px"
                             />
                           ) : (
-                            <div className={`text-xs font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
-                              {sessionName}
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <div className={`flex-1 text-xs font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
+                                {sessionName}
+                              </div>
+                              <SessionStatusPill state={session.state} tempo={session.tempo} detail={session.detail} needs={session.needs} />
                             </div>
                           )}
                           <div className="text-[10px] font-mono text-slate-700 truncate">
@@ -1354,10 +1508,6 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
         parentPath={newFolderModal.parentPath}
         onClose={() => setNewFolderModal({ visible: false, parentPath: '' })}
         onCreate={handleCreateFolderConfirm}
-      />
-      <SessionManageModal
-        visible={sessionManageVisible}
-        onClose={() => setSessionManageVisible(false)}
       />
       <NewSkillModal
         visible={newSkillVisible}

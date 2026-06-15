@@ -16,6 +16,7 @@ import ChatPanel from '../components/chat/ChatPanel'
 import { useNotes } from '../contexts/NotesContext'
 import type { TaskContextPayload } from '../hooks/useTerminalWebSocket'
 import { useEventsWebSocket } from '../hooks/useEventsWebSocket'
+import { SessionStatusPill, formatSessionAge } from '../components/sessions/SessionStatusPill'
 
 const LS_COL_WIDTHS = 'tasks_column_widths'
 const LS_DETAIL_WIDTH = 'tasks_detail_width'
@@ -527,12 +528,43 @@ export default function TasksPage() {
     setShowChat(true)
   }
 
-  // Load sessions and poll
+  // Load sessions and poll — uses listByProject (same source as the
+  // main Sidebar) and keeps only LIVE daemon-backed workers. Historical
+  // transcripts on disk are intentionally excluded so the sidebar
+  // stays focused on what the user is actively running; Cmd+K opens
+  // SessionsModal for the full archive.
   useEffect(() => {
-    const load = () => sessionsAPI.listActiveSessions().then(setSessions).catch(() => {})
+    const load = async () => {
+      try {
+        const all = await sessionsAPI.listByProject()
+        const mapped: ClaudeSession[] = all
+          .filter((s) => !!s.live)
+          .map((s) => ({
+            id: s.sessionId,
+            name: s.name,
+            workingDir: s.cwd,
+            dangerousMode: true,
+            messages: [],
+            isActive: !!s.live,
+            lastActivity: s.lastActivity,
+            createdAt: s.startedAt,
+            initialized: true,
+            tempo: s.live?.tempo,
+            state: s.live?.state,
+            detail: s.live?.detail,
+            needs: s.live?.needs,
+          }))
+        setSessions(mapped)
+      } catch {}
+    }
     load()
-    const interval = window.setInterval(load, 10000)
-    return () => clearInterval(interval)
+    const interval = window.setInterval(load, 3000)
+    const refreshHandler = () => load()
+    window.addEventListener('claude-sessions-refresh', refreshHandler)
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('claude-sessions-refresh', refreshHandler)
+    }
   }, [])
 
   const handleOpenSession = (session: ClaudeSession) => {
@@ -833,28 +865,37 @@ export default function TasksPage() {
                     return (
                       <div
                         key={session.id}
-                        className={`group flex items-start gap-2 px-2 py-1.5 rounded cursor-pointer transition ${
+                        className={`w-full flex items-start gap-2 px-2 py-1.5 rounded transition text-left select-none cursor-pointer ${
                           isActive
-                            ? 'bg-cyan-500/10 border border-cyan-500/20'
+                            ? 'bg-purple-500/10 border border-purple-500/20'
                             : 'hover:bg-white/[0.03] border border-transparent'
                         }`}
                         onClick={() => handleOpenSession(session)}
                       >
-                        <Terminal className={`w-3 h-3 shrink-0 mt-0.5 ${isActive ? 'text-cyan-400' : 'text-cyan-700'}`} />
+                        <Terminal className={`w-3 h-3 flex-shrink-0 mt-0.5 ${isActive ? 'text-purple-400' : 'text-purple-600'}`} />
                         <div className="flex-1 min-w-0">
-                          <div className={`text-[11px] font-mono truncate ${isActive ? 'text-cyan-300' : 'text-slate-400'}`}>
-                            {label}
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <div className={`flex-1 text-xs font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
+                              {label}
+                            </div>
+                            <SessionStatusPill state={session.state} tempo={session.tempo} detail={session.detail} needs={session.needs} />
                           </div>
                           {session.workingDir && (
-                            <div className="text-[9px] font-mono text-slate-700 truncate">{session.workingDir}</div>
+                            <div className="text-[10px] font-mono text-slate-700 truncate">{session.workingDir}</div>
                           )}
+                          <div className="flex items-center gap-1.5 mt-0.5">
+                            {session.createdAt && (
+                              <span className="text-[9px] font-mono text-slate-800" title={`Created: ${new Date(session.createdAt).toLocaleString()}`}>
+                                {'+'}{formatSessionAge(session.createdAt)}
+                              </span>
+                            )}
+                            {session.lastActivity && (
+                              <span className="text-[9px] font-mono text-slate-700" title={`Last active: ${new Date(session.lastActivity).toLocaleString()}`}>
+                                {'·'} {formatSessionAge(session.lastActivity)} ago
+                              </span>
+                            )}
+                          </div>
                         </div>
-                        <button
-                          onClick={e => { e.stopPropagation(); handleDeleteSession(session.id) }}
-                          className="opacity-0 group-hover:opacity-100 text-red-500/50 hover:text-red-400 p-0.5 shrink-0 transition"
-                        >
-                          <X className="w-2.5 h-2.5" />
-                        </button>
                       </div>
                     )
                   })}
