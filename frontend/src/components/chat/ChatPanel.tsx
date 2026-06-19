@@ -273,17 +273,23 @@ function ChatPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ generate_ledger: true }),
       })
-      if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const j = await r.json()
-      // Log stats so they are recoverable from devtools; the user
-      // explicitly asked for "compact + restart in one click", so we
-      // skip the modal that previously paused the flow.
-      console.info('[compact]', {
-        bytes: `${j.bytes_before} to ${j.bytes_after}`,
-        tokens: `${j.approx_tokens_before} to ${j.approx_tokens_after}`,
-        evicted: `${j.tool_results_evicted}/${j.tool_results}`,
-        archive: j.archive_path, ledger: j.ledger_path,
-      })
+      if (r.status === 404) {
+        // No on-disk transcript yet (fresh session, zero turns).
+        // Nothing to compact — silently skip and just restart.
+        // User intent ≈ "give me a clean state for this session",
+        // which a plain restart already provides.
+        console.info('[compact] skipped: no transcript on disk yet')
+      } else if (!r.ok) {
+        throw new Error(`HTTP ${r.status}`)
+      } else {
+        const j = await r.json()
+        console.info('[compact]', {
+          bytes: `${j.bytes_before} to ${j.bytes_after}`,
+          tokens: `${j.approx_tokens_before} to ${j.approx_tokens_after}`,
+          evicted: `${j.tool_results_evicted}/${j.tool_results}`,
+          archive: j.archive_path, ledger: j.ledger_path,
+        })
+      }
       // Restart via the same path the manual Restart button uses —
       // throttle is shared so a fast double-fire is safe.
       handleRestart()

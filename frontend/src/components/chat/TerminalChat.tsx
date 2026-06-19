@@ -143,10 +143,28 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
         term?.scrollToBottom()
         if (vp) vp.scrollTop = vp.scrollHeight
       }
+      // Force a SIGWINCH-triggering resize even if dimensions didn't
+      // change. fit.fit() only emits onResize when cols/rows change,
+      // so after a tab-switch (where xterm already had the right
+      // size) claude never sees a SIGWINCH and its TUI stays at the
+      // OLD width's wrap points — replayed history bytes render
+      // garbled. Sending (cols-1, rows) then (cols, rows) gives
+      // claude two SIGWINCHes, forcing a clean repaint.
       try { fit.fit() } catch {}
       requestAnimationFrame(() => {
         try { fit.fit() } catch {}
         scrollToEnd()
+        const cols = term.cols
+        const rows = term.rows
+        if (cols > 1 && rows > 0 && sendResizeRef.current) {
+          // Jiggle: 1 col narrower then back, ~50ms apart, gives
+          // claude two SIGWINCHes regardless of current state.
+          sendResizeRef.current(cols - 1, rows)
+          setTimeout(() => {
+            sendResizeRef.current?.(cols, rows)
+            scrollToEnd()
+          }, 50)
+        }
         setTimeout(() => {
           try { fit.fit() } catch {}
           scrollToEnd()
