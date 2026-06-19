@@ -17,6 +17,8 @@ import { useNotes } from '../contexts/NotesContext'
 import type { TaskContextPayload } from '../hooks/useTerminalWebSocket'
 import { useEventsWebSocket } from '../hooks/useEventsWebSocket'
 import { SessionStatusPill, formatSessionAge } from '../components/sessions/SessionStatusPill'
+import SessionsModal from '../components/sessions/SessionsModal'
+import { ClaudeSessionsPanel } from '../components/sessions/ClaudeSessionsPanel'
 
 const LS_COL_WIDTHS = 'tasks_column_widths'
 const LS_DETAIL_WIDTH = 'tasks_detail_width'
@@ -268,11 +270,39 @@ export default function TasksPage() {
   // For non-task sessions opened from the sidebar — overrides the noteId passed to ChatPanel
   const [chatNoteIdOverride, setChatNoteIdOverride] = useState<string | null>(null)
 
-  // Claude sessions panel
-  const [sessions, setSessions] = useState<ClaudeSession[]>([])
-  const [sessionsCollapsed, setSessionsCollapsed] = useState(false)
-  const [sessionsHeight, setSessionsHeight] = useState(180)
+  // Claude sessions panel is now owned by ClaudeSessionsPanel — that
+  // component handles loading, polling, drag-reorder, rename, context
+  // menu and the resize handle. Only state we still need here is the
+  // SessionsModal toggle (Cmd+K target).
+  const [sessionsModalOpen, setSessionsModalOpen] = useState(false)
+  // Sidebar attach modal: clicking a non-note (or task-) session in
+  // the sessions panel (global-*, raw daemon UUIDs) opens ChatPanel
+  // bound to that exact sessionId via customSessionId — NOT spawning
+  // a new note-<id> one. Mirrors the same state on HomePage.
+  const [attachSessionId, setAttachSessionId] = useState<string | null>(null)
+  const [attachSessionName, setAttachSessionName] = useState<string>('')
   const sidebarRef = useRef<HTMLDivElement>(null)
+
+  // Wire the global 'open-sessions-modal' event + Cmd+K shortcut so
+  // the modal is reachable from TasksPage too (it's only mounted by
+  // Header on HomePage otherwise).
+  useEffect(() => {
+    const openHandler = () => setSessionsModalOpen(true)
+    const keyHandler = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey
+      if (!mod) return
+      if ((e.key === 'k' || e.key === 'K') && !e.shiftKey && !e.altKey) {
+        e.preventDefault()
+        setSessionsModalOpen(true)
+      }
+    }
+    window.addEventListener('open-sessions-modal', openHandler)
+    window.addEventListener('keydown', keyHandler)
+    return () => {
+      window.removeEventListener('open-sessions-modal', openHandler)
+      window.removeEventListener('keydown', keyHandler)
+    }
+  }, [])
 
   // Project folder management
   const [projectFolders, setProjectFolders] = useState<string[]>([])
@@ -528,44 +558,8 @@ export default function TasksPage() {
     setShowChat(true)
   }
 
-  // Load sessions and poll — uses listByProject (same source as the
-  // main Sidebar) and keeps only LIVE daemon-backed workers. Historical
-  // transcripts on disk are intentionally excluded so the sidebar
-  // stays focused on what the user is actively running; Cmd+K opens
-  // SessionsModal for the full archive.
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const all = await sessionsAPI.listByProject()
-        const mapped: ClaudeSession[] = all
-          .filter((s) => !!s.live)
-          .map((s) => ({
-            id: s.sessionId,
-            name: s.name,
-            workingDir: s.cwd,
-            dangerousMode: true,
-            messages: [],
-            isActive: !!s.live,
-            lastActivity: s.lastActivity,
-            createdAt: s.startedAt,
-            initialized: true,
-            tempo: s.live?.tempo,
-            state: s.live?.state,
-            detail: s.live?.detail,
-            needs: s.live?.needs,
-          }))
-        setSessions(mapped)
-      } catch {}
-    }
-    load()
-    const interval = window.setInterval(load, 3000)
-    const refreshHandler = () => load()
-    window.addEventListener('claude-sessions-refresh', refreshHandler)
-    return () => {
-      clearInterval(interval)
-      window.removeEventListener('claude-sessions-refresh', refreshHandler)
-    }
-  }, [])
+  // Sessions loading/polling moved into ClaudeSessionsPanel — see
+  // components/sessions/ClaudeSessionsPanel.tsx.
 
   const handleOpenSession = (session: ClaudeSession) => {
     if (session.id.startsWith('note-task-')) {
@@ -590,13 +584,23 @@ export default function TasksPage() {
     }
   }
 
-  const handleDeleteSession = async (sessionId: string) => {
-    try {
-      await sessionsAPI.deleteSession(sessionId)
-      setSessions(prev => prev.filter(s => s.id !== sessionId))
-      const currentSessionId = chatNoteIdOverride ? `note-${chatNoteIdOverride}` : (chatTask ? `note-task-${chatTask.id}` : null)
-      if (currentSessionId === sessionId) { setShowChat(false); setChatNoteIdOverride(null) }
-    } catch {}
+  // handleDeleteSession was unused — ClaudeSessionsPanel does the
+  // deletion via its context menu and notifies via the
+  // onSessionDeleted callback (we close the ChatPanel if it was the
+  // one whose session got killed).
+  const handleSessionDeleted = (sessionId: string) => {
+    const currentSessionId = chatNoteIdOverride
+      ? `note-${chatNoteIdOverride}`
+      : (chatTask ? `note-task-${chatTask.id}` : null)
+    if (currentSessionId === sessionId) {
+      setShowChat(false)
+      setChatNoteIdOverride(null)
+    }
+    // Also close the attach panel if it was bound to the killed session.
+    if (attachSessionId === sessionId) {
+      setAttachSessionId(null)
+      setAttachSessionName('')
+    }
   }
 
   useEventsWebSocket({
@@ -702,6 +706,23 @@ export default function TasksPage() {
         />
       )}
 
+      {/* Sidebar attach: ChatPanel bound to an explicit sessionId so
+          the WebSocket connects to the existing daemon worker by id
+          (no note-<id> spawn). Mirrors HomePage's attach flow. */}
+      {attachSessionId && (
+        <ChatPanel
+          key={attachSessionId}
+          visible={!!attachSessionId}
+          customSessionId={attachSessionId}
+          customSessionName={attachSessionName}
+          onClose={() => {
+            setAttachSessionId(null)
+            setAttachSessionName('')
+          }}
+          noteId=""
+        />
+      )}
+
       {/* Mobile sidebar overlay backdrop */}
       {isMobile && showMobileSidebar && (
         <div
@@ -710,12 +731,13 @@ export default function TasksPage() {
         />
       )}
 
-      {/* Projects sidebar */}
+      {/* Projects sidebar — width matches HomePage Sidebar default
+          (256 == w-64) so switching between pages doesn't reflow. */}
       <div
         ref={sidebarRef}
         className={`flex-col border-r flex-shrink-0 ${isMobile ? 'fixed left-0 top-0 bottom-0 z-50 transition-transform duration-200' : 'flex'}`}
         style={{
-          width: 208,
+          width: 256,
           background: '#090b11',
           borderColor: 'rgba(255,255,255,0.06)',
           transform: isMobile ? (showMobileSidebar ? 'translateX(0)' : 'translateX(-100%)') : undefined,
@@ -800,110 +822,44 @@ export default function TasksPage() {
             )
           })}
         </div>
-        {/* Claude Sessions */}
-        <div className="flex-shrink-0">
-          {/* Resize handle */}
-          {!sessionsCollapsed && (
-            <div
-              className="h-px hover:bg-cyan-500/40 cursor-ns-resize transition-colors"
-              style={{ background: 'rgba(255,255,255,0.06)' }}
-              onMouseDown={e => {
-                e.preventDefault()
-                const onMove = (mv: MouseEvent) => {
-                  if (!sidebarRef.current) return
-                  const bottom = sidebarRef.current.getBoundingClientRect().bottom
-                  const newH = Math.max(80, Math.min(500, bottom - mv.clientY - 8))
-                  setSessionsHeight(newH)
-                }
-                const onUp = () => {
-                  document.removeEventListener('mousemove', onMove)
-                  document.removeEventListener('mouseup', onUp)
-                }
-                document.addEventListener('mousemove', onMove)
-                document.addEventListener('mouseup', onUp)
-              }}
-            />
-          )}
-          <div
-            className="flex items-center justify-between px-3 py-2 cursor-pointer hover:bg-white/[0.02] transition border-t"
-            style={{ borderColor: 'rgba(255,255,255,0.06)' }}
-            onClick={() => setSessionsCollapsed(v => !v)}
-          >
-            <div className="flex items-center gap-2">
-              <Terminal className="w-3 h-3 text-cyan-600" />
-              <span className="text-[9px] font-mono font-semibold tracking-widest text-slate-700 uppercase">Sessions</span>
-              {sessions.length > 0 && (
-                <span className="text-[9px] font-mono bg-cyan-500/10 text-cyan-500 px-1 py-0.5 rounded border border-cyan-500/20">
-                  {sessions.length}
-                </span>
-              )}
-            </div>
-            {sessionsCollapsed
-              ? <ChevronDown className="w-3 h-3 text-slate-700" />
-              : <ChevronUp className="w-3 h-3 text-slate-700" />}
-          </div>
-
-          {!sessionsCollapsed && (
-            <div className="px-2 pb-2 overflow-y-auto" style={{ height: sessionsHeight }}>
-              {sessions.length === 0 ? (
-                <div className="text-[10px] font-mono text-slate-800 text-center py-3 tracking-wider uppercase">no sessions</div>
-              ) : (
-                <div className="space-y-0.5">
-                  {sessions.map(session => {
-                    const currentSessionId = chatNoteIdOverride ? `note-${chatNoteIdOverride}` : (chatTask ? `note-task-${chatTask.id}` : null)
-                    const isActive = !!currentSessionId && currentSessionId === session.id && showChat
-                    const taskId = session.id.startsWith('note-task-') ? session.id.slice('note-task-'.length) : null
-                    const linkedTask = taskId ? tasks.find(t => t.id === taskId) : null
-                    const cachedTitle = taskId ? taskTitleCache.current[taskId] : undefined
-                    const noteId = !taskId && session.id.startsWith('note-') ? session.id.slice('note-'.length) : null
-                    const linkedNote = noteId ? (notes || []).find(n => n.id === noteId) : null
-                    const label = linkedTask?.title
-                      ?? cachedTitle
-                      ?? linkedNote?.title
-                      ?? (session.name && session.name !== 'Terminal Session' ? session.name : null)
-                      ?? (taskId ? `task:${taskId.slice(0, 8)}` : session.id.slice(0, 12))
-                    return (
-                      <div
-                        key={session.id}
-                        className={`w-full flex items-start gap-2 px-2 py-1.5 rounded transition text-left select-none cursor-pointer ${
-                          isActive
-                            ? 'bg-purple-500/10 border border-purple-500/20'
-                            : 'hover:bg-white/[0.03] border border-transparent'
-                        }`}
-                        onClick={() => handleOpenSession(session)}
-                      >
-                        <Terminal className={`w-3 h-3 flex-shrink-0 mt-0.5 ${isActive ? 'text-purple-400' : 'text-purple-600'}`} />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <div className={`flex-1 text-xs font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
-                              {label}
-                            </div>
-                            <SessionStatusPill state={session.state} tempo={session.tempo} detail={session.detail} needs={session.needs} />
-                          </div>
-                          {session.workingDir && (
-                            <div className="text-[10px] font-mono text-slate-700 truncate">{session.workingDir}</div>
-                          )}
-                          <div className="flex items-center gap-1.5 mt-0.5">
-                            {session.createdAt && (
-                              <span className="text-[9px] font-mono text-slate-800" title={`Created: ${new Date(session.createdAt).toLocaleString()}`}>
-                                {'+'}{formatSessionAge(session.createdAt)}
-                              </span>
-                            )}
-                            {session.lastActivity && (
-                              <span className="text-[9px] font-mono text-slate-700" title={`Last active: ${new Date(session.lastActivity).toLocaleString()}`}>
-                                {'·'} {formatSessionAge(session.lastActivity)} ago
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        {/* Claude Sessions — same shared component as HomePage Sidebar. */}
+        <ClaudeSessionsPanel
+          isMobile={isMobile}
+          activeSessionId={
+            attachSessionId ?? (
+              chatNoteIdOverride ? `note-${chatNoteIdOverride}`
+                : (chatTask && showChat ? `note-task-${chatTask.id}` : undefined)
+            )
+          }
+          onSessionDeleted={handleSessionDeleted}
+          onAttachToSession={(id, name) => {
+            // Non-note session (global-*, daemon UUID) → bind ChatPanel
+            // to that exact sessionId via customSessionId so we attach
+            // to the existing PTY instead of spawning note-<id>.
+            // task-prefixed sessions are also handled here because the
+            // panel doesn't special-case them — same path is fine.
+            if (id.startsWith('note-task-')) {
+              // Restore the task-context flow for these (so the chat
+              // header shows the task title and ChatPanel binds via
+              // note-task-<id>). handleOpenSession already does this.
+              handleOpenSession({ id, name } as ClaudeSession)
+              return
+            }
+            // Close the regular task chat if open — only one ChatPanel
+            // should render at a time.
+            setShowChat(false)
+            setChatTask(null)
+            setChatNoteIdOverride(null)
+            setAttachSessionId(id)
+            setAttachSessionName(name)
+          }}
+          onOpenChatWithNote={(noteId) => {
+            // Note-bound session → same flow as clicking note-<id>:
+            // ChatPanel computes sessionId = `note-${noteId}` itself.
+            handleOpenSession({ id: `note-${noteId}`, name: '' } as ClaudeSession)
+          }}
+          onMobileClose={() => setShowMobileSidebar(false)}
+        />
       </div>
 
       {/* Main area */}
@@ -1207,6 +1163,26 @@ export default function TasksPage() {
           )}
         </div>
       </div>
+
+      {/* SessionsModal — mirrors HomePage so Cmd+K and the sidebar's
+          Settings2 button both work here. Clicking a live session
+          opens its chat in this page (handleOpenSession), historical
+          ones fall through with their UUID. */}
+      <SessionsModal
+        visible={sessionsModalOpen}
+        onClose={() => setSessionsModalOpen(false)}
+        onOpenSession={(id, isLive) => {
+          setSessionsModalOpen(false)
+          if (isLive) {
+            // Treat as a live session click — same code path as the
+            // sidebar list. Mock a minimal ClaudeSession; we only
+            // need the id to dispatch.
+            handleOpenSession({ id } as ClaudeSession)
+          }
+          // Historical: leave it to the user (no transcript viewer
+          // mounted on this page yet).
+        }}
+      />
     </div>
   )
 }
