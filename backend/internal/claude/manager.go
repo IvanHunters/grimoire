@@ -84,6 +84,10 @@ type SessionStorage interface {
 	UpdateSessionName(ctx context.Context, sessionID string, name string) error
 	UpdateSessionMessages(ctx context.Context, sessionID string, messages []models.ClaudeMessage) error
 	ListActiveSessions(ctx context.Context) ([]*models.ClaudeSession, error)
+	// ListNameOverrides returns user-chosen display names keyed by
+	// sessionID. Used by rehydrate / GetOrCreate to apply the user's
+	// preferred name over claude's auto-generated continuation titles.
+	ListNameOverrides(ctx context.Context) (map[string]string, error)
 }
 
 // SessionManager manages all Claude sessions
@@ -141,6 +145,255 @@ func SweepOrphanWorkers(logger *slog.Logger) {
 			slog.Int("total_jobs", len(jobs)),
 		)
 	}
+}
+
+// RehydrateFromDaemon scans the live daemon worker list and creates
+// in-memory ClaudeSession entries for each grimoire-* worker. Called
+// once at backend startup so the sidebar shows existing live workers
+// immediately, instead of waiting for the user to click each one
+// before the in-memory manager learns about it.
+//
+// What it covers:
+//   - `grimoire-<grimoireID>` — recovers full grimoire-side identity
+//     (e.g. `grimoire-note-task-bcc3100a-...` → manager keyed by
+//     `note-task-bcc3100a-...`). Click routes through ChatPanel
+//     correctly.
+//   - `grimoire-resume-<short>` / `grimoire-fork-<short>` — we don't
+//     know the original grimoire id, so we key by the worker's session
+//     UUID. Sidebar shows it under its daemon name or user-overlay.
+//
+// Skipped: workers without a `grimoire-*` name (foreign claude
+// processes) and workers in terminal state (failed/stopped/done with
+// no live PTY).
+//
+// The attach connection opens immediately so PTY output keeps flowing
+// from the moment the user reconnects. Cheap: one socket + reader
+// goroutine per session, dwarfed by daemon's own memory footprint.
+func (m *SessionManager) RehydrateFromDaemon(logger *slog.Logger) {
+	if m == nil {
+		return
+	}
+	client := &daemon.Client{Logger: logger}
+	jobs, err := client.ListSessions()
+	if err != nil {
+		logger.Warn("rehydrate: daemon list failed (skipping)",
+			slog.Any("error", err))
+		return
+	}
+
+	// Pre-fetch Mongo name overlay so the manager session shows the
+	// user-given name (e.g. "Bonding + TestFlight deploy") instead of
+	// the claude-auto-generated JSONL ai-title which often defaults to
+	// "This session is being continued..." after compact cycles.
+	nameOverlay := map[string]string{}
+	if m.storage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if m, err := m.storage.ListNameOverrides(ctx); err == nil {
+			nameOverlay = m
+		}
+	}
+
+	var rehydrated, skipped int
+	for i := range jobs {
+		j := jobs[i]
+
+		// Skip foreign workers (other claude clients on this machine).
+		if !strings.HasPrefix(j.Name, "grimoire-") {
+			skipped++
+			continue
+		}
+		// Skip terminal-state workers — attach would refuse them.
+		if j.State == "failed" || j.State == "stopped" || j.State == "done" {
+			skipped++
+			continue
+		}
+
+		// SKIP continuation-children workers (grimoire-resume-* /
+		// grimoire-fork-*). These are claude --resume / --fork
+		// sub-workers whose presence here would race with the
+		// canonical entry the user opens via UI. The smart-attach
+		// path in GetOrCreate finds them lazily on demand by name
+		// pattern — so they appear in the sidebar with the SAME
+		// canonical grimoire id (no duplicate row).
+		//
+		// Without this skip: each backend bounce + each compact cycle
+		// surfaces continuation-child workers as separate manager
+		// entries named "This session is being continued from a
+		// previous conversation..." — the persistent dup bug.
+		if strings.HasPrefix(j.Name, "grimoire-resume-") || strings.HasPrefix(j.Name, "grimoire-fork-") {
+			skipped++
+			continue
+		}
+		grimoireID := j.SessionID
+		if strings.HasPrefix(j.Name, "grimoire-") {
+			derived := strings.TrimPrefix(j.Name, "grimoire-")
+			if derived != "" {
+				grimoireID = derived
+			}
+		}
+
+		// Don't double-add. Two ways an entry might already exist:
+		//   1. Same grimoireID — second rehydrate or WS-init race
+		//   2. Different grimoireID but SAME DaemonShort — happens
+		//      when a user MCP-resumed a session (manager keyed by
+		//      canonical resume-source UUID), AND the daemon worker
+		//      shows up here under its daemon-assigned UUID. Without
+		//      this check, both end up in the sidebar as duplicates.
+		m.mu.RLock()
+		alreadyPresent := false
+		if _, ok := m.sessions[grimoireID]; ok {
+			alreadyPresent = true
+		} else {
+			for _, existing := range m.sessions {
+				if existing.DaemonShort != "" && existing.DaemonShort == j.Short {
+					alreadyPresent = true
+					break
+				}
+			}
+		}
+		m.mu.RUnlock()
+		if alreadyPresent {
+			skipped++
+			continue
+		}
+
+		// Display name: prefer the daemon's name when it's NOT one of
+		// our structured tokens. Otherwise leave empty and let the
+		// frontend / Mongo overlay paint a better label.
+		displayName := j.Name
+		if strings.HasPrefix(displayName, "grimoire-resume-") ||
+			strings.HasPrefix(displayName, "grimoire-fork-") ||
+			displayName == fmt.Sprintf("grimoire-%s", grimoireID) {
+			displayName = ""
+		}
+
+		sess, attachErr := attachDaemonSession(client, grimoireID, displayName, j, j.Cwd, "", false, logger)
+		if attachErr != nil {
+			logger.Warn("rehydrate: attach failed",
+				slog.String("daemon_short", j.Short),
+				slog.String("daemon_uuid", j.SessionID),
+				slog.Any("error", attachErr),
+			)
+			skipped++
+			continue
+		}
+		// CRITICAL: recover canonical DaemonUUID for resume/fork workers.
+		// Daemon recycles worker UUIDs across restarts — rec.SessionID is
+		// the LIVE worker's UUID, NOT the resume-source JSONL UUID. Without
+		// this, restart's "DaemonUUID drift detected, recovered via
+		// newest-jsonl-in-cwd" fallback kicks in and (when cwd contains
+		// multiple historical JSONLs) silently picks the WRONG transcript,
+		// leading to identity confusion in the sidebar:
+		//   user kills bonding session → backend rehydrate → restart picks
+		//   linstor.jsonl because both share cozystack/ cwd → manager
+		//   relabels session as "Linstor". User opens "Bonding" — sees
+		//   Linstor.
+		// The worker's name carries the original SHORT (`grimoire-resume-XX`).
+		// Resolve that short to a full canonical UUID via disk lookup.
+		if strings.HasPrefix(j.Name, "grimoire-resume-") || strings.HasPrefix(j.Name, "grimoire-fork-") {
+			short := j.Name
+			short = strings.TrimPrefix(short, "grimoire-resume-")
+			short = strings.TrimPrefix(short, "grimoire-fork-")
+			if canonicalUUID := resolveJSONLByShort(j.Cwd, short, logger); canonicalUUID != "" {
+				sess.DaemonUUID = canonicalUUID
+				logger.Info("rehydrate: canonical DaemonUUID recovered from short",
+					slog.String("grimoire_id", grimoireID),
+					slog.String("worker_session_id", j.SessionID),
+					slog.String("canonical_jsonl_uuid", canonicalUUID),
+					slog.String("short", short),
+				)
+			}
+		}
+		// Mark ContextPromptSent so a downstream WS reconnect doesn't
+		// re-paste the SESSION CONTEXT wall into the PTY. The worker
+		// has been running with its own context for a while — we're
+		// just re-grabbing the reader.
+		sess.ContextPromptSent = true
+
+		// LastActivity baseline: when daemon's worker started.
+		// attachDaemonSession sets it to "now" (the rehydrate moment),
+		// which would mask the stale-active downgrade (sessions seem
+		// "fresh" even when the underlying worker has been idle for
+		// hours). Use startedAt instead. The PTY reader will bump it
+		// to real time on the next byte emitted.
+		if j.StartedAt > 0 {
+			sess.LastActivity = time.UnixMilli(j.StartedAt)
+		}
+		// Apply Mongo name overlay — keyed by grimoireID first, then
+		// daemon UUID. The user's chosen name beats anything claude
+		// auto-wrote into JSONL (e.g. continuation titles).
+		if name, ok := nameOverlay[grimoireID]; ok && name != "" {
+			sess.Name = name
+		} else if name, ok := nameOverlay[j.SessionID]; ok && name != "" {
+			sess.Name = name
+		}
+
+		m.mu.Lock()
+		m.sessions[grimoireID] = sess
+		m.mu.Unlock()
+		rehydrated++
+	}
+
+	logger.Info("rehydrate from daemon complete",
+		slog.Int("rehydrated", rehydrated),
+		slog.Int("skipped", skipped),
+		slog.Int("total_workers", len(jobs)),
+	)
+}
+
+// resolveJSONLByShort scans the cwd's sanitized projects/ directory
+// for a JSONL whose filename starts with `short` (8-char prefix from
+// the daemon's `grimoire-resume-<short>` worker name). Returns the
+// full UUID basename or "". Used by rehydrate to map a recycled
+// worker UUID back to its canonical transcript on disk.
+//
+// Multi-match resolution: when more than one JSONL starts with the
+// short (collision is statistically possible after a few thousand
+// sessions), the most-recently-modified wins.
+func resolveJSONLByShort(cwd, short string, logger *slog.Logger) string {
+	if cwd == "" || short == "" {
+		return ""
+	}
+	root, err := discovery.ProjectsRoot()
+	if err != nil {
+		return ""
+	}
+	dir := root + "/" + discovery.SanitizeCwd(cwd)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var newest string
+	var newestMtime time.Time
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, short) {
+			continue
+		}
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		if strings.Contains(name, ".archive.") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMtime) {
+			newestMtime = info.ModTime()
+			newest = strings.TrimSuffix(name, ".jsonl")
+		}
+	}
+	if newest != "" {
+		logger.Debug("resolveJSONLByShort: hit",
+			slog.String("short", short),
+			slog.String("cwd", cwd),
+			slog.String("uuid", newest),
+		)
+	}
+	return newest
 }
 
 // GetSessionManager returns the global session manager instance
@@ -276,32 +529,68 @@ func (m *SessionManager) GetOrResume(grimoireID string, resumeFromUUID string, w
 		return nil, fmt.Errorf("resume needs both resumeFromUUID and workingDir")
 	}
 
-	// Fast path: already in memory.
+	// Fast path: already in memory AND has a live PTY. ShutdownWorker
+	// keeps the entry but nulls PTY/Cmd/DaemonShort to mark "killed
+	// worker, awaiting respawn"; returning that without re-attach
+	// gives the caller a dead session whose writes fail silently.
 	m.mu.RLock()
 	if session, ok := m.sessions[grimoireID]; ok {
+		alive := session.PTY != nil
 		m.mu.RUnlock()
-		// Self-heal: earlier code paths stuffed the structured
-		// "grimoire-resume-<short>" token into session.Name, which
-		// shows up in Sidebar as gibberish. If we land on a fast-path
-		// session that still has that token, refresh from the resume
-		// caller's nicer name (or leave alone if no better option).
-		if strings.HasPrefix(session.Name, "grimoire-resume-") || strings.HasPrefix(session.Name, "grimoire-fork-") {
-			if sessionName != "" && !strings.HasPrefix(sessionName, "grimoire-") {
-				session.Name = sessionName
+		if alive {
+			// Self-heal: earlier code paths stuffed the structured
+			// "grimoire-resume-<short>" token into session.Name, which
+			// shows up in Sidebar as gibberish. If we land on a fast-path
+			// session that still has that token, refresh from the resume
+			// caller's nicer name (or leave alone if no better option).
+			if strings.HasPrefix(session.Name, "grimoire-resume-") || strings.HasPrefix(session.Name, "grimoire-fork-") {
+				if sessionName != "" && !strings.HasPrefix(sessionName, "grimoire-") {
+					session.Name = sessionName
+				}
 			}
+			session.UpdateActivity()
+			return session, nil
 		}
-		session.UpdateActivity()
-		return session, nil
+		// PTY is nil → entry is in "killed worker, awaiting respawn"
+		// state (e.g. post-compact ShutdownWorker). Fall through and
+		// dispatch a fresh worker, then REPLACE the stub entry below.
+		m.logger.Info("GetOrResume: stub entry detected (post-shutdown), respawning",
+			slog.String("grimoire_id", grimoireID),
+			slog.String("resume_from", resumeFromUUID),
+		)
+	} else {
+		m.mu.RUnlock()
 	}
-	m.mu.RUnlock()
 
 	newSession, err := startDaemonSessionResume(grimoireID, resumeFromUUID, workingDir, m.mongoURI, m.mongoDatabase, m.logger, sessionName, fork)
 	if err != nil {
 		return nil, fmt.Errorf("daemon resume: %w", err)
 	}
 
+	// Mongo name overlay wins over JSONL ai-title / claude's
+	// auto-generated "This session is being continued..." title.
+	// Same path GetOrCreate uses — kept in sync so compact+restart
+	// (which goes through this resume path) preserves the user's name.
+	if m.storage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if overlay, err := m.storage.ListNameOverrides(ctx); err == nil {
+			if name, ok := overlay[grimoireID]; ok && name != "" {
+				newSession.Name = name
+			} else if newSession.DaemonUUID != "" {
+				if name, ok := overlay[newSession.DaemonUUID]; ok && name != "" {
+					newSession.Name = name
+				}
+			}
+		}
+		cancel()
+	}
+
 	m.mu.Lock()
-	if existing, raced := m.sessions[grimoireID]; raced {
+	// Replace any stub (post-ShutdownWorker) entry with the freshly
+	// spawned session. The raced-create branch (another GetOr* call
+	// raced us and won) checks for an entry with a live PTY — if
+	// theirs is also a stub, we still prefer the fresh one.
+	if existing, raced := m.sessions[grimoireID]; raced && existing.PTY != nil {
 		m.mu.Unlock()
 		go shutdownSession(newSession, m.logger)
 		return existing, nil
@@ -409,6 +698,31 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 			if jobs, err := client.ListSessions(); err == nil {
 				for _, j := range jobs {
 					if j.SessionID == sessionID {
+						// Worker is a resume/fork child? Then its session
+						// UUID (= sessionID we got here) is NOT the
+						// canonical grimoire identity — the canonical
+						// JSONL UUID is encoded in the worker's name.
+						// Redirect to that canonical: if manager already
+						// has an entry there, REUSE it (avoids
+						// double-entry like "Bonding" + "This session is
+						// being continued..." dup).
+						if strings.HasPrefix(j.Name, "grimoire-resume-") || strings.HasPrefix(j.Name, "grimoire-fork-") {
+							short := strings.TrimPrefix(j.Name, "grimoire-resume-")
+							short = strings.TrimPrefix(short, "grimoire-fork-")
+							if canonical := resolveJSONLByShort(j.Cwd, short, m.logger); canonical != "" {
+								m.mu.RLock()
+								if existing, ok := m.sessions[canonical]; ok && existing.PTY != nil {
+									m.mu.RUnlock()
+									m.logger.Info("smart-attach: redirecting worker UUID to canonical grimoire id",
+										slog.String("requested_id", sessionID),
+										slog.String("canonical_id", canonical),
+										slog.String("worker_name", j.Name),
+									)
+									return existing, nil
+								}
+								m.mu.RUnlock()
+							}
+						}
 						newSession, spawnErr = startDaemonSessionAttach(sessionID, sessionID, m.logger)
 						break
 					}
@@ -483,6 +797,22 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 	} else {
 		newSession.Name = "Terminal Session"
 	}
+	// Mongo name overlay wins over JSONL ai-title / DB-stored name —
+	// it's the user's explicit choice. Check by grimoireID AND
+	// DaemonUUID (resume sessions get overlaid under canonical).
+	if m.storage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if overlay, err := m.storage.ListNameOverrides(ctx); err == nil {
+			if name, ok := overlay[sessionID]; ok && name != "" {
+				newSession.Name = name
+			} else if newSession.DaemonUUID != "" {
+				if name, ok := overlay[newSession.DaemonUUID]; ok && name != "" {
+					newSession.Name = name
+				}
+			}
+		}
+		cancel()
+	}
 
 	if mcpConfigPath != "" {
 		newSession.MCPConfigPath = mcpConfigPath
@@ -549,6 +879,42 @@ func (m *SessionManager) Get(sessionID string) (*ClaudeSession, error) {
 }
 
 // Close closes a specific session
+// ShutdownWorker kills the live daemon/subprocess worker for a session
+// but PRESERVES the manager entry's metadata (ID, DaemonUUID,
+// WorkingDir, Name). Callers that intend a "restart in place" — like
+// the Compact endpoint — use this so a subsequent restart can read
+// DaemonUUID + WorkingDir to spawn a fresh worker on the correct
+// transcript. Using Close() instead would destroy the entry and force
+// restart down the dangerous newest-jsonl-in-cwd fallback path.
+//
+// After ShutdownWorker: session.PTY is nil, DaemonShort is cleared,
+// status is "stopped". The entry can be re-attached / resumed by the
+// next user action.
+func (m *SessionManager) ShutdownWorker(sessionID string) error {
+	m.mu.Lock()
+	session, exists := m.sessions[sessionID]
+	m.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	if err := shutdownSession(session, m.logger); err != nil {
+		return fmt.Errorf("failed to shutdown worker: %w", err)
+	}
+
+	// Clear live-process fields, but keep DaemonUUID + WorkingDir +
+	// Name + ID so the entry is recognizable on the next restart.
+	m.mu.Lock()
+	session.PTY = nil
+	session.Cmd = nil
+	session.DaemonShort = ""
+	// DaemonClient may still be needed for status checks, leave intact.
+	m.mu.Unlock()
+
+	return nil
+}
+
 func (m *SessionManager) Close(sessionID string) error {
 	// Hold lock only for map operation — release before slow ops.
 	m.mu.Lock()
@@ -774,6 +1140,23 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 				out.State = rec.State
 				out.Detail = rec.Detail
 				out.Needs = rec.Needs
+				// Daemon doesn't proactively reset tempo when a worker
+				// stops emitting — it keeps the last reported value
+				// until the next status signal. For long-idle workers
+				// the sidebar shows stale "active/working" forever.
+				// Override: if there has been no PTY activity for the
+				// last 30s and daemon still says active, downgrade to
+				// idle so the badge reflects reality.
+				if (out.Tempo == "active" || out.State == "running") &&
+					!session.LastActivity.IsZero() &&
+					time.Since(session.LastActivity) > 30*time.Second {
+					out.Tempo = "idle"
+					if out.State == "running" {
+						// Keep state="running" — process is alive — but
+						// flip tempo so the pill renders as "ready"
+						// instead of "working".
+					}
+				}
 			} else {
 				out.Tempo = "idle"
 				out.State = "running"
@@ -800,15 +1183,17 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			if known[j.SessionID] {
 				continue
 			}
-			name := j.Name
-			if strings.HasPrefix(name, "grimoire-resume-") {
-				// Pull the readable name from the parent historical
-				// JSONL. parentShort is encoded right in the name.
-				parentShort := strings.TrimPrefix(name, "grimoire-resume-")
-				if friendly := lookupHistoricalNameByShort(parentShort); friendly != "" {
-					name = friendly
-				}
+			// SKIP continuation-children entirely — they belong to a
+			// chain whose canonical entry is (or should be) already in
+			// manager. Surfacing them here is the persistent dup bug:
+			// "Bonding + TestFlight deploy" + "This session is being
+			// continued from a previous conversation..." for the
+			// SAME conversation. Same logic as RehydrateFromDaemon
+			// skip — kept in sync intentionally.
+			if strings.HasPrefix(j.Name, "grimoire-resume-") || strings.HasPrefix(j.Name, "grimoire-fork-") {
+				continue
 			}
+			name := j.Name
 			sessions = append(sessions, &models.ClaudeSession{
 				ID:           j.SessionID,
 				Name:         name,

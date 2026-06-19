@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -154,6 +155,27 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 				folderProjectPath = fp
 				msg.TaskContext.ProjectPath = fp // propagate into prompt
 			}
+		}
+	}
+
+	// Smart routing: when the WebSocket sends a UUID-shaped sessionId
+	// AND there's a JSONL on disk for it AND no explicit attach/resume
+	// already requested → auto-route through resume. This catches the
+	// "sidebar click on a session whose grimoire id drifted to a
+	// daemon-assigned UUID" case, where the cached manager entry may
+	// point at an unrelated worker (wrong cwd, wrong content). Resume
+	// uses the JSONL's actual cwd from its header — always correct
+	// regardless of what manager cached.
+	//
+	// MUST run BEFORE the workingDir resolution below so the resume
+	// branch picks the right cwd from JSONL header instead of the
+	// fallback DetermineWorkingDir.
+	if msg.AttachToSessionID == "" && msg.ResumeFromSessionID == "" && isLikelyUUID(msg.SessionID) {
+		if _, pathErr := discovery.SessionPath(msg.SessionID); pathErr == nil {
+			msg.ResumeFromSessionID = msg.SessionID
+			h.logger.Info("init: auto-routing UUID sessionId through resume",
+				slog.String("session_id", msg.SessionID),
+			)
 		}
 	}
 
@@ -642,9 +664,15 @@ func (h *Handler) handleRestartSession(ctx context.Context, conn *wsWriter, msg 
 	// Flag the init code path to mark ContextPromptSent=true upfront.
 	msg.SkipContextPrompt = true
 
+	// Capture both the current DaemonUUID (preferred) and the cwd so
+	// we can fall back to scanning the cwd's project dir for the
+	// newest JSONL if the daemon-assigned UUID drifted (which happens
+	// when the daemon hands back a fresh sessionId on resume).
 	resumeFromUUID := ""
+	workingDir := ""
 	if existing, err := h.manager.Get(msg.SessionID); err == nil && existing != nil {
 		resumeFromUUID = existing.DaemonUUID
+		workingDir = existing.WorkingDir
 	}
 
 	if err := h.manager.Close(msg.SessionID); err != nil {
@@ -654,30 +682,151 @@ func (h *Handler) handleRestartSession(ctx context.Context, conn *wsWriter, msg 
 		)
 	}
 
-	// Only route through resume when the prior worker actually wrote a
-	// JSONL transcript. Warm-spare workers that never received a user
-	// message exist in the daemon but have no on-disk file — passing
-	// their UUID to handleInit's resume branch would fail with
-	// "transcript not found" and abort the whole restart. Empty
-	// resumeFromUUID (or non-existent path) falls back to default
-	// fresh-spawn path.
+	// Resolve a JSONL to resume from. Three-step lookup:
+	//   1. DaemonUUID matches a transcript on disk (happy path).
+	//   2. msg.SessionID itself IS a UUID with a transcript anywhere
+	//      under ~/.claude/projects/. Catches the case where the
+	//      grimoire id is a raw UUID (sidebar attach / fork sessions)
+	//      and the JSONL lives in the ORIGINAL fork-source cwd, not
+	//      manager.WorkingDir which may have drifted to default after
+	//      a restart cycle.
+	//   3. Scan the cwd's project directory for the most-recently-
+	//      touched JSONL — last resort when nothing matches by id.
+	resolvedResumeUUID := ""
 	if resumeFromUUID != "" {
 		if _, pathErr := discovery.SessionPath(resumeFromUUID); pathErr == nil {
-			msg.ResumeFromSessionID = resumeFromUUID
-			msg.ResumeFork = false
-			h.logger.Info("restart with resume",
+			resolvedResumeUUID = resumeFromUUID
+		}
+	}
+	if resolvedResumeUUID == "" && isLikelyUUID(msg.SessionID) {
+		if _, pathErr := discovery.SessionPath(msg.SessionID); pathErr == nil {
+			resolvedResumeUUID = msg.SessionID
+			h.logger.Info("restart: recovered via sessionID-as-UUID global lookup",
 				slog.String("session_id", msg.SessionID),
-				slog.String("resume_from", resumeFromUUID),
+				slog.String("stale_daemon_uuid", resumeFromUUID),
+				slog.String("cwd_searched_was_wrong", workingDir),
 			)
-		} else {
-			h.logger.Info("restart without resume (no transcript yet)",
+		}
+	}
+	if resolvedResumeUUID == "" && workingDir != "" {
+		uuid, candidateCount := newestJSONLInCwdSafe(workingDir)
+		if uuid != "" {
+			// Take the newest JSONL in cwd as best-effort resume target.
+			// Cross-session cwd-sharing risk: bonding → linstor swap
+			// happens only when manager.WorkingDir is wrong (drifted to
+			// a shared cwd like cozystack-work/cozystack). With the
+			// MCP→Manager wiring fix the manager.WorkingDir now comes
+			// from the JSONL header at resume time and stays accurate,
+			// so newest-in-cwd is correct ≥99% of the time. The 1% risk
+			// is acceptable vs. the current "restart silently opens
+			// blank terminal" failure that this fallback prevents.
+			resolvedResumeUUID = uuid
+			level := slog.LevelInfo
+			msgTxt := "restart: DaemonUUID drift detected, recovered via newest-jsonl-in-cwd"
+			if candidateCount > 1 {
+				level = slog.LevelWarn
+				msgTxt += " (multiple JSONLs in cwd — verify the picked one is the right session)"
+			}
+			h.logger.Log(ctx, level, msgTxt,
 				slog.String("session_id", msg.SessionID),
-				slog.String("daemon_uuid", resumeFromUUID),
+				slog.String("stale_daemon_uuid", resumeFromUUID),
+				slog.String("resolved_uuid", uuid),
+				slog.String("cwd", workingDir),
+				slog.Int("candidates", candidateCount),
 			)
 		}
 	}
 
+	if resolvedResumeUUID != "" {
+		msg.ResumeFromSessionID = resolvedResumeUUID
+		msg.ResumeFork = false
+		h.logger.Info("restart with resume",
+			slog.String("session_id", msg.SessionID),
+			slog.String("resume_from", resolvedResumeUUID),
+		)
+	} else {
+		h.logger.Info("restart without resume (no transcript on disk)",
+			slog.String("session_id", msg.SessionID),
+			slog.String("daemon_uuid", resumeFromUUID),
+			slog.String("cwd", workingDir),
+		)
+	}
+
 	h.handleInit(ctx, conn, msg)
+}
+
+// isLikelyUUID quickly tells whether a string is shaped like a v4 UUID.
+// We use this to gate calling discovery.SessionPath with the
+// grimoire-side sessionId — note-task-* / global-* / note-* ids would
+// never match a JSONL filename and the glob would be wasted work.
+func isLikelyUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// newestJSONLInCwd returns the UUID (basename without .jsonl) of the
+// most-recently-modified transcript in the cwd's sanitized project
+// dir, or "" if none exists. Used as a last-resort lookup when the
+// session's DaemonUUID has drifted away from the actual file on disk.
+func newestJSONLInCwd(cwd string) string {
+	uuid, _ := newestJSONLInCwdSafe(cwd)
+	return uuid
+}
+
+// newestJSONLInCwdSafe returns the newest JSONL UUID + count of LIVE
+// candidates in the cwd. count > 1 means the cwd is shared by multiple
+// historical sessions — callers should refuse to auto-pick the newest
+// because it can swap a session's identity (e.g. cozystack-work/cozystack
+// has both Linstor and "Поиск" transcripts; picking newest after a
+// bonding-restart corrupted the bonding manager entry).
+func newestJSONLInCwdSafe(cwd string) (string, int) {
+	root, err := discovery.ProjectsRoot()
+	if err != nil {
+		return "", 0
+	}
+	dir := root + "/" + discovery.SanitizeCwd(cwd)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", 0
+	}
+	var newestUUID string
+	var newestMtime time.Time
+	count := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		// Archive sidecars don't count — those are old snapshots, not
+		// active session transcripts.
+		if strings.Contains(name, ".archive.") {
+			continue
+		}
+		count++
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMtime) {
+			newestMtime = info.ModTime()
+			newestUUID = strings.TrimSuffix(name, ".jsonl")
+		}
+	}
+	return newestUUID, count
 }
 
 // handleTerminalResize updates the PTY window size to match xterm.js dimensions

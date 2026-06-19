@@ -348,6 +348,23 @@ func listSessionsByCwd(cwd string, overlay NameOverlay, managedLive map[string]b
 			if info.Name != "" {
 				name = info.Name
 			}
+		} else if strings.HasPrefix(r.Name, "grimoire-resume-") || strings.HasPrefix(r.Name, "grimoire-fork-") {
+			// Worker is a continuation child whose session UUID
+			// (r.SessionID) doesn't match any managed entry, but the
+			// CANONICAL parent in the worker's name does. Resolve via
+			// disk lookup and rewrite so the row maps to the parent's
+			// grimoire identity instead of appearing as a separate
+			// "···<short>" duplicate next to the canonical entry.
+			short := strings.TrimPrefix(r.Name, "grimoire-resume-")
+			short = strings.TrimPrefix(short, "grimoire-fork-")
+			if canonical := resolveJSONLByShortForListing(r.Cwd, short); canonical != "" {
+				if info, ok := managedInfo[canonical]; ok {
+					rowID = info.GrimoireID
+					if info.Name != "" {
+						name = info.Name
+					}
+				}
+			}
 		}
 		// Second-pass dedup: after possibly rewriting rowID to a
 		// grimoireID, ensure we don't add a row that the historical
@@ -454,4 +471,44 @@ func listLiveByCwd(cwd string) ([]daemon.Record, error) {
 		}
 	}
 	return out, nil
+}
+
+// resolveJSONLByShortForListing mirrors manager.resolveJSONLByShort —
+// duplicated here to avoid the package cycle (manager already imports
+// listing's providers). Given a daemon worker's "grimoire-resume-<short>"
+// name component, returns the full UUID of the on-disk JSONL whose
+// filename starts with <short>. Returns "" if no match in cwd.
+func resolveJSONLByShortForListing(cwd, short string) string {
+	if cwd == "" || short == "" {
+		return ""
+	}
+	root, err := discovery.ProjectsRoot()
+	if err != nil {
+		return ""
+	}
+	dir := root + "/" + discovery.SanitizeCwd(cwd)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var newest string
+	var newestMtime time.Time
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, short) || !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		if strings.Contains(name, ".archive.") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMtime) {
+			newestMtime = info.ModTime()
+			newest = strings.TrimSuffix(name, ".jsonl")
+		}
+	}
+	return newest
 }

@@ -3,6 +3,7 @@ package discovery
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -82,7 +83,7 @@ func TestImportTranscript_GeneratesUUIDForNonUUIDFilename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	if !uuidRe.MatchString(res.SessionID) {
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(res.SessionID) {
 		t.Errorf("expected generated UUID, got %q", res.SessionID)
 	}
 }

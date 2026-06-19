@@ -259,42 +259,66 @@ func startDaemonSessionResume(
 		displayName = daemonName // last-ditch fallback
 	}
 
-	// Reuse an already-resumed daemon worker if one exists. After a
-	// backend restart our manager.sessions map is empty, but the
-	// daemon may still be hosting the resumed session from a previous
-	// click. Without this check, each click would spawn a fresh
-	// --resume → new daemon UUID → "spam new sessions" complaint.
+	// Reuse an already-live daemon worker if one is bound to the
+	// resume-target session UUID. Two cases this covers:
+	//   (a) After a backend restart our manager.sessions is empty but
+	//       the daemon still hosts a worker named "grimoire-resume-<X>".
+	//   (b) The TARGET session itself is still alive in the daemon
+	//       (e.g. another grimoire ChatPanel is attached). claude
+	//       --resume <X> would refuse with "currently running as bg"
+	//       in this case — we must reattach instead of redispatching.
 	//
-	// Match by name pattern: startDaemonSessionResume names children
-	// "grimoire-resume-<original-short>", so we can find them by their
-	// expected name. Skip for fork — forks intentionally create new.
+	// Skip for fork — forks intentionally create a new session UUID
+	// so collision with the original is fine.
 	if !fork {
 		expectedChildName := fmt.Sprintf("grimoire-resume-%s", resumeFromUUID[:8])
 		jobs, _ := client.ListSessions()
 		for i := range jobs {
-			if jobs[i].Name != expectedChildName {
+			j := jobs[i]
+			// Skip terminal-state workers — they can't be attached to.
+			if j.State == "failed" || j.State == "stopped" || j.State == "done" {
 				continue
 			}
-			if jobs[i].State == "failed" || jobs[i].State == "stopped" || jobs[i].State == "done" {
-				continue // terminal — don't re-attach, spawn fresh below
+			// Match by either: the structured grimoire name we use for
+			// resume children, OR the live session UUID itself
+			// (catches case b above where the target session is held
+			// by some other worker).
+			matchesName := j.Name == expectedChildName
+			matchesUUID := j.SessionID == resumeFromUUID
+			if !matchesName && !matchesUUID {
+				continue
 			}
-			logger.Info("reusing existing resumed daemon session",
+			logger.Info("reusing live daemon worker for resume target",
 				slog.String("grimoire_id", grimoireID),
 				slog.String("resume_from", resumeFromUUID),
-				slog.String("daemon_short", jobs[i].Short),
-				slog.String("daemon_name", jobs[i].Name),
+				slog.String("daemon_short", j.Short),
+				slog.String("daemon_session_id", j.SessionID),
+				slog.String("daemon_name", j.Name),
 				slog.String("display_name", displayName),
+				slog.Bool("matched_by_name", matchesName),
+				slog.Bool("matched_by_uuid", matchesUUID),
 			)
-			rec := jobs[i]
 			// Pass the readable displayName (not daemon's structured
 			// name) so the in-manager session shows the right label.
-			sess, err := attachDaemonSession(client, grimoireID, displayName, rec, rec.Cwd, mcpConfigPath, false, logger)
+			sess, err := attachDaemonSession(client, grimoireID, displayName, j, j.Cwd, mcpConfigPath, false, logger)
 			if err == nil && sess != nil {
-				// Reusing live resume-child — already showed context
-				// in its first spawn; don't re-paste.
+				// Reusing a live worker — context is already painted
+				// in its PTY; don't re-paste a "SESSION CONTEXT" wall.
 				sess.ContextPromptSent = true
+				return sess, nil
 			}
-			return sess, err
+			// Attach failed — most commonly ENOJOB because op:list
+			// reported a worker that exited between our list and our
+			// attach (zombie). Fall through to fresh dispatch below
+			// instead of failing the whole resume. The user's intent
+			// was "give me the session", and the JSONL is still on
+			// disk, so we can still satisfy it via a cold spawn.
+			logger.Warn("reuse-attach failed, falling through to fresh dispatch",
+				slog.String("daemon_short", j.Short),
+				slog.String("daemon_session_id", j.SessionID),
+				slog.Any("error", err),
+			)
+			break // exit the loop so we drop to fresh-dispatch below
 		}
 	}
 
@@ -363,9 +387,22 @@ func startDaemonSessionResume(
 	// bytes "rescue" it. Short wait → smaller dump → cleaner paint.
 	time.Sleep(400 * time.Millisecond)
 
+	// For non-fork resume, claude --resume <X> appends to the ORIGINAL
+	// X.jsonl — the session UUID does NOT change. But the daemon's
+	// op:dispatch reply sometimes hands back a fresh daemon-assigned
+	// UUID in `sessionId` that confuses our identity tracking. Force
+	// rec.SessionID to the resumed-from UUID so the next restart can
+	// still find X.jsonl via discovery.SessionPath. Without this, the
+	// SECOND restart fails with "no transcript yet" and falls through
+	// to fresh-spawn → empty terminal, even though X.jsonl is right
+	// there on disk.
+	canonicalUUID := disp.SessionID
+	if !fork && resumeFromUUID != "" {
+		canonicalUUID = resumeFromUUID
+	}
 	rec := daemon.Record{
 		Short:     disp.Short,
-		SessionID: disp.SessionID,
+		SessionID: canonicalUUID,
 		Cwd:       workingDir,
 		Name:      displayName,
 	}

@@ -18,6 +18,43 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 )
 
+// newestJSONLInCwdAPI returns the UUID of the most recently modified
+// transcript in the cwd's sanitized project dir, or "" if none. Used
+// as a last-resort path resolver in CompactSession when the session's
+// id doesn't directly match a JSONL filename.
+func newestJSONLInCwdAPI(cwd string) string {
+	root, err := discovery.ProjectsRoot()
+	if err != nil {
+		return ""
+	}
+	dir := root + "/" + discovery.SanitizeCwd(cwd)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var newestUUID string
+	var newestMtime time.Time
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		// Skip archive sidecars — only count the live transcripts.
+		if strings.Contains(name, ".archive.") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMtime) {
+			newestMtime = info.ModTime()
+			newestUUID = strings.TrimSuffix(name, ".jsonl")
+		}
+	}
+	return newestUUID
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -446,10 +483,14 @@ func (h *Handler) CompactSession(w http.ResponseWriter, r *http.Request) {
 
 	// Body optional — all fields have safe defaults.
 	var body struct {
-		KeepRecentToolResults   int   `json:"keep_recent_tool_results"`
-		MaxStubBytes            int   `json:"max_stub_bytes"`
-		DropToolUseResultMirror *bool `json:"drop_tool_use_result_mirror"`
-		GenerateLedger          *bool `json:"generate_ledger"`
+		KeepRecentToolResults    int   `json:"keep_recent_tool_results"`
+		MaxStubBytes             int   `json:"max_stub_bytes"`
+		DropToolUseResultMirror  *bool `json:"drop_tool_use_result_mirror"`
+		GenerateLedger           *bool `json:"generate_ledger"`
+		DropFileHistorySnapshots *bool `json:"drop_file_history_snapshots"`
+		DropMetaSidecar          *bool `json:"drop_meta_sidecar"`
+		DropThinking             *bool `json:"drop_thinking"`
+		KeepRecentAttachments    int   `json:"keep_recent_attachments"`
 	}
 	if r.Body != nil && r.ContentLength != 0 {
 		_ = json.NewDecoder(r.Body).Decode(&body) // best-effort
@@ -462,8 +503,58 @@ func (h *Handler) CompactSession(w http.ResponseWriter, r *http.Request) {
 	if body.GenerateLedger != nil {
 		genLedger = *body.GenerateLedger
 	}
+	// New aggressive-but-safe drops — all default true. These remove
+	// content claude does NOT consume on --resume (file-history is
+	// rebuilt from disk; meta sidecar is grimoire-side; thinking is
+	// internal scratchpad). Override via JSON body if you need to keep
+	// any category.
+	dropFileHistory := true
+	if body.DropFileHistorySnapshots != nil {
+		dropFileHistory = *body.DropFileHistorySnapshots
+	}
+	dropMeta := true
+	if body.DropMetaSidecar != nil {
+		dropMeta = *body.DropMetaSidecar
+	}
+	dropThinking := true
+	if body.DropThinking != nil {
+		dropThinking = *body.DropThinking
+	}
 
+	// Resolve transcript path with three-step lookup so compact works
+	// even when the UI sends a worker UUID (drift after resume cycles)
+	// instead of the canonical JSONL UUID:
+	//   1. SessionPath(sessionID) — happy path (sessionID == JSONL).
+	//   2. Manager.Get(sessionID).DaemonUUID — for resume sessions we
+	//      pin DaemonUUID to the resume-source UUID, which IS the
+	//      JSONL.
+	//   3. newestJSONLInCwd(workingDir) — last resort.
 	path, err := discovery.SessionPath(sessionID)
+	if err != nil && h.sessionManager != nil {
+		if sess, getErr := h.sessionManager.Get(sessionID); getErr == nil && sess != nil {
+			if sess.DaemonUUID != "" && sess.DaemonUUID != sessionID {
+				if p, e := discovery.SessionPath(sess.DaemonUUID); e == nil {
+					path = p
+					err = nil
+					h.logger.Info("compact: resolved via DaemonUUID",
+						"session_id", sessionID,
+						"resolved_uuid", sess.DaemonUUID)
+				}
+			}
+			if err != nil && sess.WorkingDir != "" {
+				if uuid := newestJSONLInCwdAPI(sess.WorkingDir); uuid != "" {
+					if p, e := discovery.SessionPath(uuid); e == nil {
+						path = p
+						err = nil
+						h.logger.Info("compact: resolved via newest-jsonl-in-cwd",
+							"session_id", sessionID,
+							"resolved_uuid", uuid,
+							"cwd", sess.WorkingDir)
+					}
+				}
+			}
+		}
+	}
 	if err != nil {
 		http.Error(w, "transcript not found", http.StatusNotFound)
 		return
@@ -475,16 +566,27 @@ func (h *Handler) CompactSession(w http.ResponseWriter, r *http.Request) {
 	// expected to re-attach (the Sidebar Compact action dispatches a
 	// claude-session-restart-request) which spawns a fresh worker that
 	// --resume's from the now-compacted transcript.
+	//
+	// We use ShutdownWorker (NOT Close) so the manager entry KEEPS its
+	// DaemonUUID + WorkingDir metadata. Without this, the immediate
+	// restart_session that ChatPanel fires post-compact arrives at
+	// handleRestartSession with an empty existing.DaemonUUID and ""
+	// workingDir → no resume target → fresh empty terminal (the user's
+	// "after compact I see new session" bug).
 	if h.sessionManager != nil {
-		if err := h.sessionManager.Close(sessionID); err != nil {
-			h.logger.Debug("close worker before compact", "session_id", sessionID, "error", err)
+		if err := h.sessionManager.ShutdownWorker(sessionID); err != nil {
+			h.logger.Debug("shutdown worker before compact", "session_id", sessionID, "error", err)
 		}
 	}
 
 	opts := compact.Options{
-		KeepRecentToolResults:   body.KeepRecentToolResults,
-		MaxStubBytes:            body.MaxStubBytes,
-		DropToolUseResultMirror: dropMirror,
+		KeepRecentToolResults:    body.KeepRecentToolResults,
+		MaxStubBytes:             body.MaxStubBytes,
+		DropToolUseResultMirror:  dropMirror,
+		DropFileHistorySnapshots: dropFileHistory,
+		DropMetaSidecar:          dropMeta,
+		DropThinking:             dropThinking,
+		KeepRecentAttachments:    body.KeepRecentAttachments,
 	}
 
 	var ledgerSink io.Writer

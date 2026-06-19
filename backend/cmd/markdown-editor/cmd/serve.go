@@ -117,6 +117,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		// typed into a spawned session. Without this they accumulate
 		// in the sidebar as "···<short>" placeholders forever.
 		go claude.SweepOrphanWorkers(logger)
+		// Rehydrate manager.sessions from daemon's live worker list.
+		// For grimoire-resume-<short> / grimoire-fork-<short> workers,
+		// the grimoireID is resolved to the CANONICAL JSONL UUID via
+		// disk lookup — so MCP/UI subsequently resuming the same
+		// canonical UUID hits the cached entry instead of creating a
+		// duplicate manager row under the worker's continuation UUID.
+		go manager.RehydrateFromDaemon(logger)
 	}
 
 	// Setup task scheduler
@@ -158,7 +165,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// WebSocket upgrade (http.Hijack) breaks if ResponseWriter is wrapped by compress.
 
 	// Create MCP server
-	mcpServer := CreateMCPServerWithSkills(store, sessionStorage, logger, cfg, skillSyncer, skillSettings)
+	mcpServer := CreateMCPServerWithSkills(store, sessionStorage, logger, cfg, skillSyncer, skillSettings, manager)
 	mcpHTTPServer := server.NewStreamableHTTPServer(mcpServer)
 
 	// Routes

@@ -47,6 +47,13 @@ func resolveSessionID(ctx context.Context, argsMap map[string]interface{}) strin
 	return sessionIDFromCtx(ctx)
 }
 
+// daemonGenUUIDForMCP returns a UUID-shaped string for fresh
+// MCP-spawned sessions. We use uuid.New() to keep it simple — same
+// helper the rest of the codebase uses.
+func daemonGenUUIDForMCP() string {
+	return uuid.New().String()
+}
+
 type MCPContext struct {
 	store          *storage.MongoStorage
 	sessionStorage *storage.SessionStorage
@@ -55,6 +62,13 @@ type MCPContext struct {
 	config         *config.Config
 	skills         *skills.Syncer
 	skillSettings  *skills.SettingsStore
+	// sessionManager is the live SessionManager singleton, set when
+	// MCP runs in-process alongside the HTTP server (serve mode).
+	// start_session uses this to register the dispatched session in
+	// manager.sessions so the sidebar sees it immediately AND so
+	// later WS init for that id hits the cached entry instead of
+	// fresh-spawning another worker with the wrong cwd.
+	sessionManager *claude.SessionManager
 }
 
 var mcpCmd = &cobra.Command{
@@ -66,11 +80,14 @@ var mcpCmd = &cobra.Command{
 
 // CreateMCPServer создаёт и настраивает MCP сервер
 func CreateMCPServer(store *storage.MongoStorage, sessionStorage *storage.SessionStorage, logger *slog.Logger, cfg *config.Config) *server.MCPServer {
-	return CreateMCPServerWithSkills(store, sessionStorage, logger, cfg, nil, nil)
+	return CreateMCPServerWithSkills(store, sessionStorage, logger, cfg, nil, nil, nil)
 }
 
 // CreateMCPServerWithSkills creates the MCP server with an optional skills
-// syncer + settings store so skill tools can be registered.
+// syncer + settings store so skill tools can be registered. The optional
+// sessionManager lets start_session register dispatched sessions in the
+// live manager so they appear in the sidebar immediately and so later
+// WS-init hits the cached entry rather than fresh-spawning a duplicate.
 func CreateMCPServerWithSkills(
 	store *storage.MongoStorage,
 	sessionStorage *storage.SessionStorage,
@@ -78,6 +95,7 @@ func CreateMCPServerWithSkills(
 	cfg *config.Config,
 	skillsSyncer *skills.Syncer,
 	skillsSettings *skills.SettingsStore,
+	sessionManager *claude.SessionManager,
 ) *server.MCPServer {
 	mcpCtx := &MCPContext{
 		store:          store,
@@ -87,6 +105,7 @@ func CreateMCPServerWithSkills(
 		config:         cfg,
 		skills:         skillsSyncer,
 		skillSettings:  skillsSettings,
+		sessionManager: sessionManager,
 	}
 
 	// Create MCP server
@@ -2287,26 +2306,72 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: cwd is required for new sessions")}}, nil
 			}
 
-			client := &daemon.Client{Logger: mcpCtx.logger}
-			opts := daemon.DispatchOpts{
-				Cwd:  cwd,
-				Name: name,
-			}
+			// Route through SessionManager so the dispatched session
+			// is registered in m.sessions with correct DaemonUUID +
+			// WorkingDir. Without this, MCP-spawned sessions appear in
+			// the sidebar but clicking them fresh-spawns a NEW worker
+			// (because handleInit's manager.GetOrCreate misses → falls
+			// to startDaemonSession → no JSONL for the daemon-assigned
+			// UUID → wrong cwd).
 			mode := "new"
-			if resumeFrom != "" {
-				opts.ResumeSessionID = resumeFrom
-				opts.Fork = fork
-				if fork {
-					mode = "fork"
+			var (
+				disp    daemon.DispatchResult
+				sess    *claude.ClaudeSession
+				usedMgr bool
+			)
+			if mcpCtx.sessionManager != nil {
+				usedMgr = true
+				// Use grimoire-side ID = daemon-assigned UUID for new
+				// sessions; for resume we still let the manager assign
+				// its own grimoire id (it'll equal the resume target).
+				if resumeFrom != "" {
+					if fork {
+						mode = "fork"
+					} else {
+						mode = "resume"
+					}
+					grimoireID := resumeFrom
+					var mgrErr error
+					sess, mgrErr = mcpCtx.sessionManager.GetOrResume(grimoireID, resumeFrom, cwd, name, fork)
+					if mgrErr != nil {
+						return nil, fmt.Errorf("manager resume: %w", mgrErr)
+					}
 				} else {
-					mode = "resume"
+					mode = "new"
+					grimoireID := daemonGenUUIDForMCP() // helper below
+					var mgrErr error
+					sess, mgrErr = mcpCtx.sessionManager.GetOrCreate(grimoireID, false, cwd, name, prompt)
+					if mgrErr != nil {
+						return nil, fmt.Errorf("manager create: %w", mgrErr)
+					}
 				}
+				// Fill in disp so the reply is consistent with the
+				// pre-manager dispatch shape.
+				disp.SessionID = sess.ID
+				disp.Short = sess.DaemonShort
+				disp.Via = "manager"
 			} else {
-				opts.Prompt = prompt
-			}
-			disp, err := client.Dispatch(opts)
-			if err != nil {
-				return nil, fmt.Errorf("daemon dispatch: %w", err)
+				// Fallback: bare daemon.Dispatch (no sessionManager
+				// available — e.g. MCP running standalone outside the
+				// HTTP server).
+				client := &daemon.Client{Logger: mcpCtx.logger}
+				opts := daemon.DispatchOpts{Cwd: cwd, Name: name}
+				if resumeFrom != "" {
+					opts.ResumeSessionID = resumeFrom
+					opts.Fork = fork
+					if fork {
+						mode = "fork"
+					} else {
+						mode = "resume"
+					}
+				} else {
+					opts.Prompt = prompt
+				}
+				var dispErr error
+				disp, dispErr = client.Dispatch(opts)
+				if dispErr != nil {
+					return nil, fmt.Errorf("daemon dispatch: %w", dispErr)
+				}
 			}
 			// Persist user-given name to overlay so it shows in the
 			// sidebar instead of the daemon's structured token.
@@ -2318,6 +2383,9 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				mode, name, cwd, disp.SessionID, disp.Short, disp.Via)
 			if resumeFrom != "" {
 				fmt.Fprintf(&sb, "  resume_from: %s\n", resumeFrom)
+			}
+			if !usedMgr {
+				sb.WriteString("\n[warn] session manager not available — entry will not appear in sidebar until WS init")
 			}
 			sb.WriteString("\nWill appear in sidebar within a few seconds.")
 			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
