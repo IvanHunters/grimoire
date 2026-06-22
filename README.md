@@ -158,6 +158,32 @@ When a Claude terminal session starts, the backend writes `.claude/mcp_servers.j
 
 Claude CLI picks this up automatically and gets access to all 66 tools.
 
+#### Registering globally for the Claude CLI
+
+To use these tools in any Claude Code session (not just terminals spawned
+from grimoire), register the MCP server with the Claude CLI directly:
+
+```bash
+claude mcp add --scope user markdown-editor \
+  --env MONGODB_URI=mongodb://localhost:27017 \
+  --env MONGODB_DATABASE=markdown_editor \
+  -- /path/to/markdown-editor mcp
+```
+
+Replace `/path/to/markdown-editor` with the absolute path of the built
+backend binary (from `cd backend && go build -o markdown-editor ./cmd/markdown-editor`
+that's `$(pwd)/backend/markdown-editor`).
+
+Verify it loaded:
+
+```bash
+claude mcp list
+```
+
+You should see `markdown-editor` in the list. Inside any Claude Code
+session, the 66 note / session / task tools are now available as
+`mcp__markdown-editor__*`.
+
 ### Event Bus
 
 MCP operations (note create/update/delete) publish events that flow to all connected WebSocket clients, keeping the frontend in sync without polling:
