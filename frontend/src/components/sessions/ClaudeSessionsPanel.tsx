@@ -133,19 +133,23 @@ export function ClaudeSessionsPanel({
         // grimoire id IS keyed differently so the join may miss; that's
         // fine, the row still renders with the name and click works.
         const liveSessions = grimoireSessions.map((s) => {
-          // ClaudeSession from backend has .id (grimoire id). The
-          // models layer doesn't expose daemon UUID, so we fall back to
-          // a name-match against by-project when the grimoire id
-          // itself isn't a UUID.
+          // ClaudeSession from backend already carries tempo/state/detail/
+          // needs from ListActiveSessions. We ONLY override those fields
+          // when a by-project match is found AND its live data is
+          // non-empty — otherwise the override would clobber valid backend
+          // values with `undefined` (which is what happened for
+          // note-task-* sessions where by-project doesn't surface a row
+          // keyed by the grimoire id).
           const match = Object.values(byUuid).find((b) =>
             b.daemonShort && b.name === s.name && !!b.live
           )
+          if (!match || !match.live) return s
           return {
             ...s,
-            tempo: match?.live?.tempo,
-            state: match?.live?.state,
-            detail: match?.live?.detail,
-            needs: match?.live?.needs,
+            tempo: match.live.tempo ?? s.tempo,
+            state: match.live.state ?? s.state,
+            detail: match.live.detail ?? s.detail,
+            needs: match.live.needs ?? s.needs,
           }
         })
         setSessions(liveSessions)
@@ -313,10 +317,94 @@ export function ClaudeSessionsPanel({
     })
   }
 
-  // Order known ids first (in saved sequence), then any newcomers.
+  // Three-tier sort:
+  //   0. NEEDS-YOU   — session is blocked waiting on user input (highest priority)
+  //   1. HAS-STATUS  — any known state/tempo (running/working/done/active/idle/...)
+  //   2. NO-STATUS   — session backend hasn't reported status yet
+  // Within each tier, sort by lastActivity DESC (newest first).
+  // No-status tier additionally respects user's saved drag order so old
+  // sessions don't reshuffle on every poll.
+  // needsYou MUST match the pill label logic so sort tier and visible
+  // badge agree. Pill: tempo='active' beats state='blocked' → "working".
+  // So a session is "needs you" ONLY when tempo isn't actively
+  // generating: tempo=blocked OR (state=blocked AND tempo != active).
+  const needsYou = (s: ClaudeSession) => {
+    if (s.tempo === 'active') return false // pill says "working" — match it
+    if (s.tempo === 'blocked') return true
+    if (s.state === 'blocked') return true
+    const needsField = (s as ClaudeSession & { needs?: string }).needs
+    return typeof needsField === 'string' && needsField.trim() !== ''
+  }
+  const isWorking = (s: ClaudeSession) => {
+    if (needsYou(s)) return false
+    return s.tempo === 'active'
+  }
+  const isReady = (s: ClaudeSession) => {
+    if (needsYou(s) || isWorking(s)) return false
+    const st = (s.state || '').trim()
+    return st === 'done' || st === 'running' || st === 'working' || st === 'ready'
+  }
+  const hasStatus = (s: ClaudeSession) => {
+    // "everything else with status" — failed/stopped/unknown-but-set.
+    if (needsYou(s) || isWorking(s) || isReady(s)) return false
+    const st = (s.state || '').trim()
+    const tp = (s.tempo || '').trim()
+    if (!st && !tp) return false
+    if (st === 'unknown' && (!tp || tp === 'unknown')) return false
+    return true
+  }
+  // Bucket lastActivity into 60-second windows so continuously-emitting
+  // sessions don't reshuffle on every 3s poll. Two sessions whose activity
+  // is within the same 60s bucket are tied; we tiebreak by createdAt
+  // (stable across polls). The visible result: a freshly-active session
+  // appears near the top once and stays there until another session
+  // gets a notably more recent burst (>60s newer).
+  const BUCKET_MS = 60_000
+  const ts = (d?: string) => (d ? new Date(d).getTime() : 0)
+  const byActivityDesc = (a: ClaudeSession, b: ClaudeSession) => {
+    const ba = Math.floor(ts(a.lastActivity) / BUCKET_MS)
+    const bb = Math.floor(ts(b.lastActivity) / BUCKET_MS)
+    if (ba !== bb) return bb - ba // newer bucket first
+    // Tiebreak by createdAt (older first → stable). a/b's createdAt may
+    // be missing for daemon-rehydrated sessions — fall back to id for
+    // determinism.
+    const ca = ts(a.createdAt)
+    const cb = ts(b.createdAt)
+    if (ca !== cb) return ca - cb
+    return a.id < b.id ? -1 : 1
+  }
+  // needs-you tier: sort by ACTUAL lastActivity (no bucket smoothing).
+  // When a session becomes blocked-waiting, the user wants it visible
+  // immediately at #1 — even if another needs-you session got blocked
+  // 30 seconds earlier. Stability concerns from byActivityDesc don't
+  // apply here because needs-you events are rare (one per turn, not
+  // every PTY byte).
+  const byLastActivityRaw = (a: ClaudeSession, b: ClaudeSession) =>
+    ts(b.lastActivity) - ts(a.lastActivity)
+  // Priority tiers (top → bottom in sidebar):
+  //   1. NEEDS YOU — blocked / awaiting user input
+  //   2. WORKING   — tempo=active, claude is generating
+  //   3. READY     — done/running/working but idle (no active turn)
+  //   4. OTHER     — failed / stopped / unknown-but-set status
+  //   5. NO-STATUS — manual drag-order preserved + tail of newcomers
+  // Within each tier sort by lastActivity desc (most recent first).
+  const tierNeedsYou = sessions.filter(needsYou).sort(byLastActivityRaw)
+  const tierWorking = sessions.filter(isWorking).sort(byActivityDesc)
+  const tierReady = sessions.filter(isReady).sort(byActivityDesc)
+  const tierOther = sessions.filter(hasStatus).sort(byActivityDesc)
+  const tierNoStatus = sessions.filter(
+    (s) => !needsYou(s) && !isWorking(s) && !isReady(s) && !hasStatus(s),
+  )
+  const orderedNoStatus: ClaudeSession[] = [
+    ...(order.map((id) => tierNoStatus.find((s) => s.id === id)).filter(Boolean) as ClaudeSession[]),
+    ...tierNoStatus.filter((s) => !order.includes(s.id)),
+  ]
   const orderedSessions: ClaudeSession[] = [
-    ...(order.map((id) => sessions.find((s) => s.id === id)).filter(Boolean) as ClaudeSession[]),
-    ...sessions.filter((s) => !order.includes(s.id)),
+    ...tierNeedsYou,
+    ...tierWorking,
+    ...tierReady,
+    ...tierOther,
+    ...orderedNoStatus,
   ]
 
   const handleDragStart = (id: string) => setDragId(id)

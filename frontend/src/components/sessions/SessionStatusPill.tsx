@@ -23,6 +23,12 @@ export function SessionStatusPill({ state, tempo, detail, needs }: SessionStatus
   if (!state && !tempo) return null
   let color = 'bg-slate-500'
   let label = ''
+  // Priority order matches ChatPanel header badge (badgeMeta) so the
+  // sidebar pill and terminal header NEVER show contradictory labels
+  // for the same session. tempo=active wins over state=blocked because
+  // claude's "state" field can lag — once claude is actually emitting
+  // tokens (tempo=active), it CAN'T be waiting for user input even if
+  // the lifecycle state still reads "blocked" from a moment ago.
   if (state === 'failed') {
     color = 'bg-rose-500'
     label = 'failed'

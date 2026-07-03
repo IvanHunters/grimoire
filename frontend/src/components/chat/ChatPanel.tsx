@@ -371,29 +371,35 @@ function ChatPanel({
         </div>
 
         <div className="flex items-center gap-1.5 md:gap-0.5 flex-shrink-0">
+          {/* Repaint + Kill are desktop-only in the toolbar — on mobile
+              they collapse into the kebab menu so the header doesn't
+              overflow the narrow viewport (the user reported "верхних
+              кнопок не видно совсем"). */}
           <button
             onClick={handleRepaint}
-            className="terminal-btn"
+            className="terminal-btn hidden md:inline-flex"
             title="Repaint (Ctrl+L into claude, fixes garbled display)"
           >
             <RotateCcw className="w-3 h-3" />
           </button>
           {/* Kebab trigger. The dropdown itself is rendered via portal
               into document.body (see below) so it isn't clipped by
-              xterm's stacking context. */}
+              xterm's stacking context. On mobile this is the primary
+              access point for ALL toolbar actions. */}
           <div className="relative" ref={kebabRef}>
             <button
               ref={kebabBtnRef}
               onClick={() => setKebabOpen(v => !v)}
               className={`terminal-btn ${kebabOpen ? 'bg-white/5 text-slate-300' : ''}`}
               title="More actions"
+              aria-label="Open actions menu"
             >
               <MoreVertical className="w-3 h-3" />
             </button>
           </div>
           <button
             onClick={handleKill}
-            className="terminal-btn terminal-btn-kill"
+            className="terminal-btn terminal-btn-kill hidden md:inline-flex"
             title="Kill Session"
           >
             <Trash2 className="w-3 h-3" />
@@ -485,9 +491,21 @@ function ChatPanel({
       {kebabOpen && kebabPos && createPortal(
         <div
           data-chat-kebab-dropdown
-          className="fixed z-[100] min-w-[160px] bg-[#0a0b10] border border-white/[0.09] rounded shadow-2xl py-1"
+          className="fixed z-[100] min-w-[180px] bg-[#0a0b10] border border-white/[0.09] rounded shadow-2xl py-1"
           style={{ top: kebabPos.top, right: kebabPos.right }}
         >
+          {/* Mobile-only entries — duplicate Repaint and Kill which are
+              hidden from the header toolbar on narrow viewports. The
+              md:hidden wrapper ensures these only appear on mobile (on
+              desktop the same actions live in the always-visible toolbar
+              right next to the kebab). */}
+          <button
+            onClick={() => { setKebabOpen(false); handleRepaint() }}
+            className="md:hidden w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <RotateCcw className="w-3 h-3 text-cyan-400/80" />
+            Repaint
+          </button>
           <button
             onClick={() => { setKebabOpen(false); handleRestart() }}
             disabled={restarting}
@@ -527,6 +545,18 @@ function ChatPanel({
           >
             <Archive className={`w-3 h-3 text-emerald-400/80 ${compacting ? 'animate-pulse' : ''}`} />
             {compacting ? 'Compacting…' : 'Compact'}
+          </button>
+          {/* Mobile-only Kill (destructive). Separator + red color cue
+              so the user doesn't tap it by accident when scanning the
+              menu. Desktop access stays via the standalone toolbar
+              button next to the kebab. */}
+          <div className="md:hidden h-px bg-white/[0.06] my-1" />
+          <button
+            onClick={() => { setKebabOpen(false); handleKill() }}
+            className="md:hidden w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-rose-300 hover:bg-rose-500/10 transition-colors"
+          >
+            <Trash2 className="w-3 h-3 text-rose-400/80" />
+            Kill session
           </button>
         </div>,
         document.body,
@@ -692,11 +722,6 @@ function BlockedBanner({ status }: { status: SessionStatus | null }) {
 }
 
 function badgeMeta(s: SessionStatus): { color: string; label: string } {
-  // Identical logic to sidebar's SessionStatusPill. tempo wins over
-  // state because daemon's phase ("state") flips on lifecycle
-  // events and can lag — when claude is actively emitting output
-  // (tempo=active), it CAN'T be waiting for user input even if
-  // state still says "blocked" from a moment ago.
   if (s.state === 'failed') return { color: '#ef4444', label: 'failed' }
   if (s.state === 'stopped') return { color: '#6b7280', label: 'stopped' }
   if (s.tempo === 'active') return { color: '#22d3ee', label: 'working' }
