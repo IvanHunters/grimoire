@@ -113,8 +113,20 @@ func (a *AttachConn) Read(p []byte) (int, error) {
 //
 // To submit a user message, write the text followed by "\r" — matches our
 // WebSocket terminal_input handler in handler.go.
+//
+// A 5-second write deadline is applied so a frozen daemon (paused
+// process, hung kernel buffer) returns net.ErrDeadlineExceeded instead
+// of blocking the caller forever — which used to deadlock the PTY
+// reader goroutine when SendMessage held the session mutex during a
+// stalled write.
 func (a *AttachConn) Write(p []byte) (int, error) {
-	return a.conn.Write(p)
+	_ = a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	n, err := a.conn.Write(p)
+	// Clear the deadline so subsequent writes start fresh — without
+	// this a slow successful write would leave the deadline in the
+	// past and the next call would fail immediately.
+	_ = a.conn.SetWriteDeadline(time.Time{})
+	return n, err
 }
 
 // Resize tells the daemon the attacher's PTY dimensions changed. Send this

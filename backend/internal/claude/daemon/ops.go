@@ -127,6 +127,9 @@ func (c *Client) Dispatch(opts DispatchOpts) (DispatchResult, error) {
 		"d":         spec,
 		"timeoutMs": 5000,
 	}
+	if key, err := readControlKey(); err == nil && key != "" {
+		req["auth"] = key
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return DispatchResult{}, fmt.Errorf("marshal dispatch: %w", err)
@@ -220,6 +223,9 @@ func (c *Client) Has(short string) (HasReply, error) {
 // delivers the text to the session's stdin layer.
 func (c *Client) Reply(short, text string) error {
 	payload := map[string]any{"proto": 1, "op": "reply", "short": short, "text": text}
+	if key, err := readControlKey(); err == nil && key != "" {
+		payload["auth"] = key
+	}
 	body, _ := json.Marshal(payload)
 	line, err := c.request(string(body))
 	if err != nil {
@@ -251,4 +257,33 @@ func genUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// readControlKey returns the daemon control key from ~/.claude/daemon/control.key.
+// Since claude 2.1.16x the daemon requires this key in the "auth" field of
+// dispatch/reply/permission-response requests (EAUTH otherwise). Returns ""
+// with no error when the file is absent (older daemon versions that don't
+// need auth) — callers should omit the field in that case.
+func readControlKey() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", nil
+	}
+	path := filepath.Join(home, ".claude", "daemon", "control.key")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read control.key: %w", err)
+	}
+	if len(b) > 4096 {
+		return "", nil
+	}
+	// daemon strips whitespace; trim newline and surrounding spaces
+	key := string(b)
+	for len(key) > 0 && (key[len(key)-1] == '\n' || key[len(key)-1] == '\r' || key[len(key)-1] == ' ' || key[len(key)-1] == '\t') {
+		key = key[:len(key)-1]
+	}
+	return key, nil
 }

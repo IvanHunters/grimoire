@@ -11,7 +11,7 @@ up: ## Start backend and frontend (accessible from local network)
 backend: ## Start backend on 0.0.0.0:8080 (kills existing)
 	@lsof -ti :8080 | xargs kill -9 2>/dev/null || true
 	@sleep 0.5
-	@cd backend && ALLOWED_ORIGINS='*' nohup go run cmd/markdown-editor/main.go serve > $(BACKEND_LOG) 2>&1 &
+	@cd backend && ALLOWED_ORIGINS='*' USE_DAEMON_BACKEND=1 nohup go run cmd/markdown-editor/main.go serve > $(BACKEND_LOG) 2>&1 &
 	@echo "Backend starting on :8080 (logs: $(BACKEND_LOG))"
 	@sleep 3
 	@curl --silent --max-time 2 http://localhost:8080/health > /dev/null && \

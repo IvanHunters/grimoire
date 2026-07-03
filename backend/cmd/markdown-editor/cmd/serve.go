@@ -129,6 +129,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Setup task scheduler
 	sched := scheduler.New(store, cfg.MongoDBURI, cfg.MongoDBDatabase, logger)
 	schedCtx, schedCancel := context.WithCancel(context.Background())
+	// Defer cancel so error returns below (skills setup, etc.) don't
+	// leak the scheduler context. The graceful-shutdown path below also
+	// calls schedCancel; cancel is idempotent.
+	defer schedCancel()
 	go sched.Start(schedCtx)
 
 	// Setup skills syncer: mirror ~/.claude/skills/ into Mongo and propagate edits to disk.

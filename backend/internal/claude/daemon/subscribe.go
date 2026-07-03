@@ -27,8 +27,15 @@ func (c *Client) Subscribe(ctx context.Context, short string, tail int, onFrame 
 	if err != nil {
 		return fmt.Errorf("dial daemon: %w", err)
 	}
+	// Derive a sub-context so the watcher goroutine exits on EVERY
+	// return path — without this, when the daemon closes the socket
+	// first (sc.Scan returns false on EOF), this function returns and
+	// leaves the `<-ctx.Done()` goroutine parked forever waiting for a
+	// ctx that may never cancel.
+	subCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	go func() {
-		<-ctx.Done()
+		<-subCtx.Done()
 		_ = conn.Close()
 	}()
 	defer conn.Close()
