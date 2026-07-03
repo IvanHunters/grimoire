@@ -57,7 +57,7 @@ func TestImportTranscript_FallsBackToImportedBucket(t *testing.T) {
 	}
 }
 
-func TestImportTranscript_PreservesUUIDFromFilename(t *testing.T) {
+func TestImportTranscript_AssignsFreshUUIDEvenForUUIDFilename(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CLAUDE_PROJECTS_DIR", root)
 
@@ -68,8 +68,15 @@ func TestImportTranscript_PreservesUUIDFromFilename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	if res.SessionID != uuid {
-		t.Errorf("expected sessionId from filename, got %q", res.SessionID)
+	// Imports MUST get a fresh UUID, never the source filename's UUID:
+	// re-importing the same file (or importing a transcript that already
+	// has a live native session with that UUID) used to overwrite live
+	// state. Fresh UUID is the safety guarantee.
+	if res.SessionID == uuid {
+		t.Errorf("expected fresh UUID, got source filename's UUID %q", res.SessionID)
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(res.SessionID) {
+		t.Errorf("expected canonical UUID, got %q", res.SessionID)
 	}
 }
 
@@ -113,7 +120,7 @@ func TestImportTranscript_RejectsMetadataOnly(t *testing.T) {
 	}
 }
 
-func TestImportTranscript_HandlesCollisionWithSuffix(t *testing.T) {
+func TestImportTranscript_ReimportProducesDistinctSessions(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CLAUDE_PROJECTS_DIR", root)
 
@@ -128,10 +135,13 @@ func TestImportTranscript_HandlesCollisionWithSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second import: %v", err)
 	}
+	// Each import gets a fresh UUID, so paths must differ even when the
+	// source filename is identical — re-importing must not clobber the
+	// earlier copy.
 	if res1.Path == res2.Path {
-		t.Errorf("expected unique paths on collision, both went to %s", res1.Path)
+		t.Errorf("expected distinct paths for re-imports, both went to %s", res1.Path)
 	}
-	if !strings.HasSuffix(res2.Path, "-2.jsonl") {
-		t.Errorf("expected -2 suffix on collision, got %s", res2.Path)
+	if res1.SessionID == res2.SessionID {
+		t.Errorf("expected distinct session ids, both got %s", res1.SessionID)
 	}
 }

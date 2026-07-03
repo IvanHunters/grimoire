@@ -151,7 +151,7 @@ func startDaemonSession(
 	pendingAttachDims.mu.Lock()
 	dCols, dRows := 80, 24
 	if v, ok := pendingAttachDims.m[sessionID]; ok {
-		dCols, dRows = v[0], v[1]
+		dCols, dRows = v.cols, v.rows
 	}
 	pendingAttachDims.mu.Unlock()
 	opts := daemon.DispatchOpts{
@@ -275,8 +275,13 @@ func startDaemonSessionResume(
 		jobs, _ := client.ListSessions()
 		for i := range jobs {
 			j := jobs[i]
-			// Skip terminal-state workers — they can't be attached to.
-			if j.State == "failed" || j.State == "stopped" || j.State == "done" {
+			// Skip only TRULY dead workers. "done" means the previous
+			// prompt finished but the bg PTY is still alive and ready
+			// for a new prompt — attach is exactly the right move
+			// there. Without this, we'd fall through to `claude --resume`
+			// which fails on bg-template sessions with "currently
+			// running as a background agent (bg)".
+			if j.State == "failed" || j.State == "stopped" {
 				continue
 			}
 			// Match by either: the structured grimoire name we use for
@@ -325,7 +330,7 @@ func startDaemonSessionResume(
 	pendingAttachDims.mu.Lock()
 	rCols, rRows := 80, 24
 	if v, ok := pendingAttachDims.m[grimoireID]; ok {
-		rCols, rRows = v[0], v[1]
+		rCols, rRows = v.cols, v.rows
 	}
 	pendingAttachDims.mu.Unlock()
 	opts := daemon.DispatchOpts{
@@ -529,19 +534,44 @@ func findExistingDaemonSession(client *daemon.Client, workingDir, displayName st
 // from the start, instead of using the static 80x24 default. We use a
 // package-level map keyed by sessionID to avoid threading cols/rows
 // through every manager/startDaemon* signature.
+type pendingDimsEntry struct {
+	cols, rows int
+	stored     time.Time
+}
+
 var pendingAttachDims = struct {
 	mu sync.Mutex
-	m  map[string][2]int
-}{m: map[string][2]int{}}
+	m  map[string]pendingDimsEntry
+}{m: map[string]pendingDimsEntry{}}
+
+// pendingDimsTTL bounds how long a stashed (cols, rows) hint is kept
+// when nothing ever consumes it. Without this, every WS connect that
+// stashed dims but failed to proceed to attach (network drop between
+// init and op:attach, frontend bail-out) would leak the entry forever.
+const pendingDimsTTL = 60 * time.Second
+
+// gcPendingDims drops entries older than pendingDimsTTL. Called
+// opportunistically from SetPendingDims so the cleanup amortises over
+// normal traffic — no background goroutine needed.
+func gcPendingDims(now time.Time) {
+	for id, v := range pendingAttachDims.m {
+		if now.Sub(v.stored) > pendingDimsTTL {
+			delete(pendingAttachDims.m, id)
+		}
+	}
+}
 
 // SetPendingDims stores cols/rows for the next session creation
-// keyed by grimoireID. Cleared by ConsumePendingDims after use.
+// keyed by grimoireID. Cleared by ConsumePendingDims after use, or
+// by the gcPendingDims sweep after pendingDimsTTL if never consumed.
 func SetPendingDims(sessionID string, cols, rows int) {
 	if cols <= 0 || rows <= 0 {
 		return
 	}
+	now := time.Now()
 	pendingAttachDims.mu.Lock()
-	pendingAttachDims.m[sessionID] = [2]int{cols, rows}
+	gcPendingDims(now)
+	pendingAttachDims.m[sessionID] = pendingDimsEntry{cols: cols, rows: rows, stored: now}
 	pendingAttachDims.mu.Unlock()
 }
 
@@ -553,7 +583,7 @@ func ConsumePendingDims(sessionID string) (cols, rows int) {
 	defer pendingAttachDims.mu.Unlock()
 	if v, ok := pendingAttachDims.m[sessionID]; ok {
 		delete(pendingAttachDims.m, sessionID)
-		return v[0], v[1]
+		return v.cols, v.rows
 	}
 	return 80, 24
 }

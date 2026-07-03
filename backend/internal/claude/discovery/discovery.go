@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -53,6 +54,48 @@ func ProjectsRoot() (string, error) {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
 	return filepath.Join(home, ".claude", "projects"), nil
+}
+
+// NewestJSONLInCwd returns the UUID (basename without .jsonl) of the
+// most recently modified transcript in the cwd's sanitized project
+// dir, along with the total count of LIVE candidates (archive sidecars
+// excluded). A count > 1 means multiple historical sessions share the
+// cwd — callers should refuse to auto-pick "the newest" in that case
+// because it can swap a session's identity after restart.
+//
+// Returns ("", 0) on any I/O error or when no JSONL files exist.
+func NewestJSONLInCwd(cwd string) (string, int) {
+	root, err := ProjectsRoot()
+	if err != nil {
+		return "", 0
+	}
+	dir := filepath.Join(root, SanitizeCwd(cwd))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", 0
+	}
+	var newestUUID string
+	var newestMtime time.Time
+	count := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".jsonl") {
+			continue
+		}
+		if strings.Contains(name, ".archive.") {
+			continue
+		}
+		count++
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMtime) {
+			newestMtime = info.ModTime()
+			newestUUID = strings.TrimSuffix(name, ".jsonl")
+		}
+	}
+	return newestUUID, count
 }
 
 // SanitizeCwd encodes an absolute path the same way claude does for its
@@ -136,6 +179,18 @@ func scanRoot(root, subFilter string, onSkip func(string, error)) ([]Session, er
 	return sessions, nil
 }
 
+// headerCacheEntry caches a parsed Session keyed by mtime+size.
+// Invalidated when the file grows or is rewritten — claude only
+// changes ai-title via NEW ai-title events appended to the JSONL,
+// which bumps mtime + size, so the cache is automatically correct.
+type headerCacheEntry struct {
+	mtime   time.Time
+	size    int64
+	session Session
+}
+
+var headerCache sync.Map // map[path]headerCacheEntry
+
 // ReadHeader reads just enough of a JSONL transcript to populate a Session.
 // It scans up to maxHeaderLines events looking for the first user message,
 // ai-title, and cwd-bearing event. Cheap (one mmap-equivalent + a few
@@ -149,12 +204,23 @@ func scanRoot(root, subFilter string, onSkip func(string, error)) ([]Session, er
 // maxHeaderLines is generous (250) because slash-command sessions can
 // have 40+ tool_use+tool_result lines before any ai-title appears.
 // Scanning 250 short JSONL lines is still cheap (~few ms per file).
+//
+// Cached by (path, mtime, size). Most transcripts are immutable
+// (closed sessions never change), so on the second call the function
+// just stat's and returns the cached Session. Sidebar polling avoids
+// re-parsing the same 1000 files every 3 seconds.
 func ReadHeader(path string) (Session, error) {
 	const maxHeaderLines = 250
 
 	stat, err := os.Stat(path)
 	if err != nil {
 		return Session{}, fmt.Errorf("stat: %w", err)
+	}
+	if v, ok := headerCache.Load(path); ok {
+		entry := v.(headerCacheEntry)
+		if entry.mtime.Equal(stat.ModTime()) && entry.size == stat.Size() {
+			return entry.session, nil
+		}
 	}
 	sessionID := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 
@@ -195,6 +261,11 @@ func ReadHeader(path string) (Session, error) {
 	if s.Name == "" {
 		s.Name = "(unnamed)"
 	}
+	headerCache.Store(path, headerCacheEntry{
+		mtime:   stat.ModTime(),
+		size:    stat.Size(),
+		session: s,
+	})
 	return s, nil
 }
 

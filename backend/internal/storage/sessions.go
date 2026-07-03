@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
@@ -14,14 +15,35 @@ import (
 
 const sessionsCollection = "sessions"
 
+// nameOverrideCacheTTL is the lifetime of the in-memory ListNameOverrides
+// result. Sidebar polling + every GetOrCreate/GetOrResume hits this
+// function, so without a cache it's a Mongo collection scan per few
+// hundred ms. Invalidated by UpsertSessionName / UpdateSessionName so
+// renames remain instant.
+const nameOverrideCacheTTL = 5 * time.Second
+
 // SessionStorage handles session persistence
 type SessionStorage struct {
 	db *mongo.Database
+
+	overlayMu     sync.RWMutex
+	overlayCache  map[string]string
+	overlayLoaded time.Time
 }
 
 // NewSessionStorage creates a new session storage
 func NewSessionStorage(db *mongo.Database) *SessionStorage {
 	return &SessionStorage{db: db}
+}
+
+// invalidateOverlay forces the next ListNameOverrides call to refresh
+// from Mongo. Called from name-write paths so a rename shows up
+// immediately in the sidebar instead of after up-to-TTL latency.
+func (s *SessionStorage) invalidateOverlay() {
+	s.overlayMu.Lock()
+	s.overlayCache = nil
+	s.overlayLoaded = time.Time{}
+	s.overlayMu.Unlock()
 }
 
 // SaveSession saves or updates a session in MongoDB
@@ -134,6 +156,7 @@ func (s *SessionStorage) UpdateSessionName(ctx context.Context, sessionID string
 	if res.MatchedCount == 0 {
 		return fmt.Errorf("session not found in database: %s", sessionID)
 	}
+	s.invalidateOverlay()
 
 	return nil
 }
@@ -162,6 +185,9 @@ func (s *SessionStorage) UpsertSessionName(ctx context.Context, sessionID string
 		},
 		opts,
 	)
+	if err == nil {
+		s.invalidateOverlay()
+	}
 	return err
 }
 
@@ -169,7 +195,26 @@ func (s *SessionStorage) UpsertSessionName(ctx context.Context, sessionID string
 // name from Mongo. Used as an overlay when listing sessions so renames
 // stick across daemon restarts and survive even if the JSONL ai-title
 // says something else.
+//
+// Cached in-memory with nameOverrideCacheTTL. Renames invalidate via
+// UpsertSessionName / UpdateSessionName so the user sees their change
+// instantly rather than waiting for TTL to expire.
 func (s *SessionStorage) ListNameOverrides(ctx context.Context) (map[string]string, error) {
+	s.overlayMu.RLock()
+	if s.overlayCache != nil && time.Since(s.overlayLoaded) < nameOverrideCacheTTL {
+		// Copy under RLock; map is treated as read-only by callers but
+		// we don't want them to mutate our cache by reference.
+		out := make(map[string]string, len(s.overlayCache))
+		for k, v := range s.overlayCache {
+			out[k] = v
+		}
+		s.overlayMu.RUnlock()
+		return out, nil
+	}
+	s.overlayMu.RUnlock()
+
+	// Cache miss / expired — fetch from Mongo. Hold Lock around the
+	// final store so concurrent readers see consistent state.
 	collection := s.db.Collection(sessionsCollection)
 	cur, err := collection.Find(ctx, bson.M{}, options.Find().SetProjection(bson.M{"_id": 1, "name": 1}))
 	if err != nil {
@@ -177,7 +222,7 @@ func (s *SessionStorage) ListNameOverrides(ctx context.Context) (map[string]stri
 	}
 	defer cur.Close(ctx)
 
-	out := make(map[string]string)
+	fresh := make(map[string]string)
 	for cur.Next(ctx) {
 		var row struct {
 			ID   string `bson:"_id"`
@@ -197,7 +242,17 @@ func (s *SessionStorage) ListNameOverrides(ctx context.Context) (map[string]stri
 			strings.HasPrefix(row.Name, "grimoire-") {
 			continue
 		}
-		out[row.ID] = row.Name
+		fresh[row.ID] = row.Name
+	}
+	s.overlayMu.Lock()
+	s.overlayCache = fresh
+	s.overlayLoaded = time.Now()
+	s.overlayMu.Unlock()
+
+	// Return a defensive copy so callers can't mutate the cache.
+	out := make(map[string]string, len(fresh))
+	for k, v := range fresh {
+		out[k] = v
 	}
 	return out, nil
 }

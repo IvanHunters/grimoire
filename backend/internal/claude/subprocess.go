@@ -37,7 +37,22 @@ func startPTYReader(session *ClaudeSession, logger *slog.Logger) {
 		slog.String("session_id", session.ID),
 		slog.Bool("daemon_backed", session.IsDaemonBacked()),
 	)
-	defer session.CloseAllSubscriptions()
+	defer func() {
+		session.CloseAllSubscriptions()
+		// Clear PTY so future GetOrAttach/GetOrResume can detect the
+		// dead state and re-spawn instead of handing the caller a stub
+		// entry whose reader is gone. Without this, when a supervisor
+		// dies (OOM, hung-kill from clearStaleDaemonLock, etc.), all
+		// subsequent WS reconnects get a "live"-looking session that
+		// silently swallows every input/output — the browser appears
+		// frozen and only "restart session" fixes it.
+		session.ClearPTY()
+		// Signal ShutdownWorker (and any other waiter) that the reader
+		// has fully exited and PTY/Cmd are safe to nil. Without this,
+		// ShutdownWorker could clear session.PTY while this goroutine
+		// was still mid-read, producing a nil-deref panic.
+		session.SignalReaderDone()
+	}()
 	buf := make([]byte, 4096)
 
 	for {
@@ -149,6 +164,10 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 	// Start PTY reader goroutine (runs once for the session lifetime)
 	go startPTYReader(session, logger)
 
+	// Pre-allocate the procExit channel so a fast shutdown path that
+	// races the goroutine startup still sees a live (un-closed) chan.
+	_ = session.ProcExitSignal()
+
 	// Start background goroutine to wait for process exit
 	// This prevents zombie processes
 	go func() {
@@ -162,6 +181,10 @@ func startClaudeSubprocess(sessionID string, dangerousMode bool, workingDir stri
 				slog.String("session_id", sessionID),
 			)
 		}
+		// Signal exit BEFORE closing subscribers — race-free replacement
+		// for reading cmd.ProcessState. shutdownSubprocessSession uses
+		// IsProcessDone() to decide whether to escalate signals.
+		session.SignalProcExit()
 		// Close all subscriber channels when process exits.
 		session.CloseAllSubscriptions()
 	}()
@@ -204,13 +227,20 @@ func detachSession(session *ClaudeSession, logger *slog.Logger) error {
 }
 
 func shutdownSubprocessSession(session *ClaudeSession, logger *slog.Logger) error {
+	// Snapshot PTY into a local — the reader's defer can clear
+	// session.PTY (via ClearPTY) at any moment after we observe it
+	// non-nil. Subsequent calls on session.PTY would nil-deref panic
+	// without this snapshot.
+	pty := session.PTY
 	// Step 1: Send Ctrl+D (EOF) to PTY
-	if session.PTY != nil {
-		_, _ = session.PTY.Write([]byte{4}) // ASCII 4 = Ctrl+D
+	if pty != nil {
+		_, _ = pty.Write([]byte{4}) // ASCII 4 = Ctrl+D
 		time.Sleep(2 * time.Second)
 
-		// Check if process exited
-		if session.Cmd != nil && (session.Cmd.ProcessState == nil || !session.Cmd.ProcessState.Exited()) {
+		// Check if process exited. IsProcessDone is a non-blocking
+		// channel check that's race-free against cmd.Wait writing
+		// ProcessState.
+		if session.Cmd != nil && !session.IsProcessDone() {
 			// Step 2: Send SIGTERM
 			logger.Info("sending SIGTERM to claude subprocess",
 				slog.String("session_id", session.ID),
@@ -221,7 +251,7 @@ func shutdownSubprocessSession(session *ClaudeSession, logger *slog.Logger) erro
 			time.Sleep(3 * time.Second)
 
 			// Check again
-			if session.Cmd.ProcessState == nil || !session.Cmd.ProcessState.Exited() {
+			if !session.IsProcessDone() {
 				// Step 3: Send SIGKILL
 				logger.Warn("force killing claude subprocess",
 					slog.String("session_id", session.ID),
@@ -233,7 +263,7 @@ func shutdownSubprocessSession(session *ClaudeSession, logger *slog.Logger) erro
 		}
 
 		// Close PTY
-		if err := session.PTY.Close(); err != nil {
+		if err := pty.Close(); err != nil {
 			logger.Error("failed to close PTY", slog.Any("error", err))
 		}
 	}
@@ -253,8 +283,10 @@ func shutdownSubprocessSession(session *ClaudeSession, logger *slog.Logger) erro
 // backend restart doesn't take user's live conversations with it).
 func shutdownDaemonSession(session *ClaudeSession, logger *slog.Logger, killWorker bool) error {
 	// 1. Close our local attach (detach from the daemon-hosted PTY).
-	if session.PTY != nil {
-		if err := session.PTY.Close(); err != nil {
+	// Snapshot PTY first — the reader's defer can ClearPTY() at any
+	// moment after we observe it non-nil.
+	if pty := session.PTY; pty != nil {
+		if err := pty.Close(); err != nil {
 			logger.Debug("attach close error (often expected at shutdown)",
 				slog.String("session_id", session.ID),
 				slog.Any("error", err),

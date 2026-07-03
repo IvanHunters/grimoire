@@ -245,6 +245,9 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 	// Track attachment lines so we can keep only the last N.
 	var attachmentLines []int
 
+	// Pass 1: parse all lines, decide whole-line drops, collect
+	// attachment line indices. Don't collect tool_use/tool_result refs
+	// yet — they'd go stale after DropThinking reshapes content arrays.
 	for i, line := range lines {
 		var m map[string]any
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
@@ -268,23 +271,6 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 			// KeepRecentAttachments after we've seen them all.
 			attachmentLines = append(attachmentLines, i)
 		}
-
-		for bi, b := range messageContent(m) {
-			switch b["type"] {
-			case "tool_use":
-				stats.ToolUses++
-				useRefs = append(useRefs, blockRef{
-					line: i, idx: bi,
-					alreadyEvicted: inputAlreadyEvicted(b),
-				})
-			case "tool_result":
-				stats.ToolResults++
-				resultRefs = append(resultRefs, blockRef{
-					line: i, idx: bi,
-					alreadyEvicted: resultAlreadyEvicted(b),
-				})
-			}
-		}
 	}
 
 	// Attachment retention: drop everything older than the last N.
@@ -299,19 +285,17 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 	}
 
 	// Build the ledger BEFORE eviction so it sees real payloads.
+	// Built from current `parsed[]` — thinking blocks are still present
+	// so the ledger captures reasoning narratives.
 	ledger := buildLedger(parsed, lines)
-
-	// Recency window — apply to non-evicted refs only. Already-evicted
-	// blocks don't count as "kept" capacity: we don't want a session
-	// with a long history of mostly-stubs to push the last few real
-	// payloads out of the keep window.
-	useCutoff := computeCutoff(useRefs, opts.KeepRecentToolUses)
-	resultCutoff := computeCutoff(resultRefs, opts.KeepRecentToolResults)
 
 	dirty := make(map[int]bool)
 
-	// Strip `thinking` blocks from message content arrays. Mark line
-	// dirty so it re-serialises without them.
+	// Pass 2: strip `thinking` blocks from message content arrays.
+	// MUST run BEFORE collecting tool_use/tool_result refs — otherwise
+	// the refs' .idx positions go stale (content array shrinks after
+	// strip) and the eviction loop indexes out of range. Mark line
+	// dirty so it re-serialises without thinking.
 	if opts.DropThinking {
 		for i, m := range parsed {
 			if m == nil || dropLine[i] {
@@ -346,6 +330,38 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 			}
 		}
 	}
+
+	// Pass 3: collect tool_use/tool_result refs with FINAL positions
+	// (post-thinking-strip). Skip drop'd lines — they won't be written
+	// anyway, no point evicting their content.
+	for i, m := range parsed {
+		if m == nil || dropLine[i] {
+			continue
+		}
+		for bi, b := range messageContent(m) {
+			switch b["type"] {
+			case "tool_use":
+				stats.ToolUses++
+				useRefs = append(useRefs, blockRef{
+					line: i, idx: bi,
+					alreadyEvicted: inputAlreadyEvicted(b),
+				})
+			case "tool_result":
+				stats.ToolResults++
+				resultRefs = append(resultRefs, blockRef{
+					line: i, idx: bi,
+					alreadyEvicted: resultAlreadyEvicted(b),
+				})
+			}
+		}
+	}
+
+	// Recency window — apply to non-evicted refs only. Already-evicted
+	// blocks don't count as "kept" capacity: we don't want a session
+	// with a long history of mostly-stubs to push the last few real
+	// payloads out of the keep window.
+	useCutoff := computeCutoff(useRefs, opts.KeepRecentToolUses)
+	resultCutoff := computeCutoff(resultRefs, opts.KeepRecentToolResults)
 
 	for i, ref := range useRefs {
 		if ref.alreadyEvicted {
@@ -403,7 +419,10 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 		out = append(out, string(buf))
 	}
 
-	// Archive + atomic write.
+	// Archive + atomic write. If the atomic write fails, the archive
+	// is rolled back so the user doesn't accumulate `*.archive.<ts>.jsonl`
+	// sidecars across repeated compact failures (each new attempt
+	// would otherwise leave another archive behind).
 	archivePath := sourcePath + ".archive." + time.Now().UTC().Format("20060102T150405Z") + ".jsonl"
 	if err := copyFile(sourcePath, archivePath); err != nil {
 		return nil, fmt.Errorf("archive: %w", err)
@@ -411,6 +430,7 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 	stats.ArchivePath = archivePath
 
 	if err := writeLines(sourcePath, out); err != nil {
+		_ = os.Remove(archivePath)
 		return nil, fmt.Errorf("write compacted: %w", err)
 	}
 
@@ -652,6 +672,13 @@ func buildLedger(parsed []map[string]any, rawLines []string) string {
 
 	type useRef struct{ ts, name, target string }
 	uses := make(map[string]useRef)
+	// entryIdxByID maps a tool_use's id directly to its index in
+	// entries[]. Replaces the previous O(n) backward scan that matched
+	// by (name, target, ts) tuple — that was both O(n×m) overall AND
+	// occasionally wrong when two different tool_use calls shared the
+	// same name/target/ts (e.g. parallel Read of the same file). The
+	// id is unique per call, so this is both faster and correct.
+	entryIdxByID := make(map[string]int)
 
 	for i, m := range parsed {
 		if m == nil {
@@ -680,19 +707,18 @@ func buildLedger(parsed []map[string]any, rawLines []string) string {
 					ts: ts, kind: classifyTool(name), tool: name,
 					target: target, detail: shortInput(name, input), tailLine: i,
 				})
+				if id != "" {
+					entryIdxByID[id] = len(entries) - 1
+				}
 			case "tool_result":
 				id, _ := b["tool_use_id"].(string)
-				use, ok := uses[id]
-				if !ok {
+				if _, ok := uses[id]; !ok {
 					continue
 				}
 				_, tail := summariseContent(b["content"], 240)
 				tail = sanitiseTail(tail)
-				for j := len(entries) - 1; j >= 0; j-- {
-					if entries[j].tool == use.name && entries[j].target == use.target && entries[j].ts == use.ts {
-						entries[j].detail = mergeDetail(entries[j].detail, tail)
-						break
-					}
+				if idx, ok := entryIdxByID[id]; ok && idx < len(entries) {
+					entries[idx].detail = mergeDetail(entries[idx].detail, tail)
 				}
 			}
 		}
@@ -941,35 +967,51 @@ func readLines(path string) ([]string, error) {
 	return lines, nil
 }
 
-func writeLines(path string, lines []string) error {
+// writeLines writes the file atomically via a .tmp + rename pattern.
+// On ANY failure (write, flush, close) the orphan .tmp is removed so
+// repeated failed compacts don't pile up <jsonl>.tmp siblings on disk.
+func writeLines(path string, lines []string) (err error) {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
+	// Named-return + deferred cleanup: any error path (incl. panic in
+	// the loop) leaves the .tmp removed. Rename success clears err so
+	// the cleanup is a no-op.
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp)
+		}
+	}()
 	w := bufio.NewWriter(f)
 	for _, l := range lines {
-		if _, err := w.WriteString(l); err != nil {
-			f.Close()
+		if _, err = w.WriteString(l); err != nil {
+			_ = f.Close()
 			return err
 		}
-		if err := w.WriteByte('\n'); err != nil {
-			f.Close()
+		if err = w.WriteByte('\n'); err != nil {
+			_ = f.Close()
 			return err
 		}
 	}
-	if err := w.Flush(); err != nil {
-		f.Close()
+	if err = w.Flush(); err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if err = f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	err = os.Rename(tmp, path)
+	return err
 }
 
-func copyFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+// copyFile copies src → dst atomically wrt error handling. On any
+// failure path (open, copy, close) the partial destination is removed
+// so a failed archive doesn't leave a half-written .archive.<ts>.jsonl
+// on disk that would later confuse listing or compaction.
+func copyFile(src, dst string) (err error) {
+	if err = os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
 	in, err := os.Open(src)
@@ -981,7 +1023,16 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	// Named-return ensures close-error is captured, partial dst is
+	// removed on any failure.
+	defer func() {
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = os.Remove(dst)
+		}
+	}()
 	_, err = io.Copy(out, in)
 	return err
 }

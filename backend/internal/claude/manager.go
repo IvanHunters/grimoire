@@ -16,15 +16,91 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/models"
 )
 
+// histNameCache caches the result of lookupHistoricalNameByShort.
+// Sidebar polls /api/sessions every 3s; without this every poll did
+// filepath.Glob + ReadHeader per session — multi-millisecond syscall
+// storm. JSONL ai-titles are effectively immutable once set, so a
+// 30s TTL is safe; rename via UpsertSessionName flows through Mongo
+// overlay (different code path) and is not affected.
+type histNameCacheEntry struct {
+	name      string
+	cachedAt  time.Time
+}
+
+var (
+	histNameCache   sync.Map // map[prefix8]histNameCacheEntry
+	histNameCacheTTL = 30 * time.Second
+)
+
+// jsonlMtimeCache caches discovery.SessionPath + os.Stat results per
+// daemon UUID. ListActiveSessions stat's every daemon-backed session's
+// JSONL on every poll to compute "stale" tempo override; without cache
+// that's N syscalls every 3s.
+type jsonlMtimeCacheEntry struct {
+	mtime    time.Time
+	cachedAt time.Time
+	ok       bool // false ⇒ SessionPath miss; don't re-glob for 10s
+}
+
+var (
+	jsonlMtimeCache   sync.Map // map[uuid]jsonlMtimeCacheEntry
+	jsonlMtimeCacheTTL = 10 * time.Second
+)
+
+// daemonJobsCache caches a recent op:list response across SessionStatus
+// calls. Sidebar polling fans out N=open-sessions calls every few
+// seconds — without this, every poll opens a unix socket, sends an
+// op:list, and parses the daemon's full job listing. Cache TTL is
+// short (~1s) so a job finishing remains visible quickly.
+type daemonJobsCacheEntry struct {
+	jobs    []daemon.Record
+	fetched time.Time
+}
+
+var (
+	daemonJobsCacheMu  sync.Mutex
+	daemonJobsCacheVal daemonJobsCacheEntry
+	daemonJobsCacheTTL = 1 * time.Second
+)
+
+// listSessionsCached returns the daemon's op:list result, refreshing
+// from the daemon only when the cached snapshot is older than
+// daemonJobsCacheTTL. A single inflight refresh is serialised by the
+// mutex so a burst of N concurrent SessionStatus callers triggers
+// exactly one op:list.
+func listSessionsCached(client *daemon.Client) ([]daemon.Record, error) {
+	daemonJobsCacheMu.Lock()
+	defer daemonJobsCacheMu.Unlock()
+	if time.Since(daemonJobsCacheVal.fetched) < daemonJobsCacheTTL && daemonJobsCacheVal.jobs != nil {
+		return daemonJobsCacheVal.jobs, nil
+	}
+	jobs, err := client.ListSessions()
+	if err != nil {
+		return nil, err
+	}
+	daemonJobsCacheVal = daemonJobsCacheEntry{jobs: jobs, fetched: time.Now()}
+	return jobs, nil
+}
+
 // lookupHistoricalNameByShort scans every JSONL filename for one
 // starting with `prefix` and returns its display name (ai-title or
-// first-prompt fallback). Used to translate "grimoire-resume-<short>"
-// daemon names back into human-readable labels for listing endpoints.
-// Returns "" if nothing matches; caller falls back gracefully.
+// first-prompt fallback). Cached for histNameCacheTTL.
 func lookupHistoricalNameByShort(prefix string) string {
 	if len(prefix) != 8 {
 		return ""
 	}
+	if v, ok := histNameCache.Load(prefix); ok {
+		entry := v.(histNameCacheEntry)
+		if time.Since(entry.cachedAt) < histNameCacheTTL {
+			return entry.name
+		}
+	}
+	name := lookupHistoricalNameByShortUncached(prefix)
+	histNameCache.Store(prefix, histNameCacheEntry{name: name, cachedAt: time.Now()})
+	return name
+}
+
+func lookupHistoricalNameByShortUncached(prefix string) string {
 	root, err := discovery.ProjectsRoot()
 	if err != nil {
 		return ""
@@ -38,6 +114,32 @@ func lookupHistoricalNameByShort(prefix string) string {
 		return ""
 	}
 	return hdr.Name
+}
+
+// jsonlMtimeFor returns the JSONL mtime for the given daemon UUID,
+// using a short TTL cache. ok=false means the JSONL doesn't exist
+// (or path lookup failed); callers should treat that as "no stale
+// timer running" rather than retry.
+func jsonlMtimeFor(daemonUUID string) (mtime time.Time, ok bool) {
+	if daemonUUID == "" {
+		return time.Time{}, false
+	}
+	if v, ok := jsonlMtimeCache.Load(daemonUUID); ok {
+		entry := v.(jsonlMtimeCacheEntry)
+		if time.Since(entry.cachedAt) < jsonlMtimeCacheTTL {
+			return entry.mtime, entry.ok
+		}
+	}
+	var entry jsonlMtimeCacheEntry
+	entry.cachedAt = time.Now()
+	if path, err := discovery.SessionPath(daemonUUID); err == nil {
+		if info, statErr := os.Stat(path); statErr == nil {
+			entry.mtime = info.ModTime()
+			entry.ok = true
+		}
+	}
+	jsonlMtimeCache.Store(daemonUUID, entry)
+	return entry.mtime, entry.ok
 }
 
 // isUUIDLike reports whether s has the canonical 8-4-4-4-12 UUID shape.
@@ -479,14 +581,28 @@ func (m *SessionManager) GetOrAttach(grimoireID string, daemonSessionUUID string
 		return nil, fmt.Errorf("attach needs daemonSessionUUID")
 	}
 
-	// If we already have this session in our map, return it.
+	// Fast path: entry in manager AND its PTY is still live. PTY==nil
+	// means startPTYReader exited (daemon supervisor killed / network
+	// broke / worker died) and the manager entry is a stub — re-attach
+	// instead of handing the caller a zombie session whose subscribers
+	// never receive PTY output. Without this check the browser appears
+	// frozen after every daemon-restart cycle and only "restart
+	// session" fixes it.
 	m.mu.RLock()
 	if session, ok := m.sessions[grimoireID]; ok {
+		alive := session.PTY != nil
 		m.mu.RUnlock()
-		session.UpdateActivity()
-		return session, nil
+		if alive {
+			session.UpdateActivity()
+			return session, nil
+		}
+		m.logger.Info("GetOrAttach: stub entry detected (PTY nil), re-attaching",
+			slog.String("grimoire_id", grimoireID),
+			slog.String("daemon_uuid", daemonSessionUUID),
+		)
+	} else {
+		m.mu.RUnlock()
 	}
-	m.mu.RUnlock()
 
 	newSession, err := startDaemonSessionAttach(grimoireID, daemonSessionUUID, m.logger)
 	if err != nil {
@@ -494,9 +610,16 @@ func (m *SessionManager) GetOrAttach(grimoireID string, daemonSessionUUID string
 	}
 
 	m.mu.Lock()
-	if existing, raced := m.sessions[grimoireID]; raced {
+	if existing, raced := m.sessions[grimoireID]; raced && existing.PTY != nil {
 		m.mu.Unlock()
-		go shutdownSession(newSession, m.logger)
+		// Race-loser path: both attaches target the same daemon worker
+		// (same UUID), they only differ in AttachConn. shutdownSession
+		// would op:kill the shared worker and tear down the race-winner's
+		// session too — use detachSession so only our local AttachConn
+		// is closed. PTY!=nil check ensures we only defer to the existing
+		// entry when it's actually alive — if it's a stub we WANT to
+		// replace it with our fresh attach.
+		go detachSession(newSession, m.logger)
 		return existing, nil
 	}
 	m.sessions[grimoireID] = newSession
@@ -543,9 +666,10 @@ func (m *SessionManager) GetOrResume(grimoireID string, resumeFromUUID string, w
 			// shows up in Sidebar as gibberish. If we land on a fast-path
 			// session that still has that token, refresh from the resume
 			// caller's nicer name (or leave alone if no better option).
-			if strings.HasPrefix(session.Name, "grimoire-resume-") || strings.HasPrefix(session.Name, "grimoire-fork-") {
+			current := session.GetName()
+			if strings.HasPrefix(current, "grimoire-resume-") || strings.HasPrefix(current, "grimoire-fork-") {
 				if sessionName != "" && !strings.HasPrefix(sessionName, "grimoire-") {
-					session.Name = sessionName
+					session.SetName(sessionName)
 				}
 			}
 			session.UpdateActivity()
@@ -613,7 +737,8 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 	m.mu.RUnlock()
 
 	if exists {
-		if session.DangerousMode == dangerousMode {
+		currentDangerous := session.GetDangerousMode()
+		if currentDangerous == dangerousMode {
 			session.UpdateActivity()
 			go func() {
 				if m.storage != nil {
@@ -636,10 +761,10 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 		if session.IsDaemonBacked() {
 			m.logger.Info("dangerous_mode flag changed for daemon session, syncing in-memory only",
 				slog.String("session_id", sessionID),
-				slog.Bool("was", session.DangerousMode),
+				slog.Bool("was", currentDangerous),
 				slog.Bool("now", dangerousMode),
 			)
-			session.DangerousMode = dangerousMode
+			session.SetDangerousMode(dangerousMode)
 			session.UpdateActivity()
 			go func() {
 				if m.storage != nil {
@@ -903,6 +1028,17 @@ func (m *SessionManager) ShutdownWorker(sessionID string) error {
 		return fmt.Errorf("failed to shutdown worker: %w", err)
 	}
 
+	// Wait for the PTY reader goroutine to exit before nil-ing PTY/Cmd,
+	// otherwise it can race a final Read against our clear and panic on
+	// the nil deref. Bounded by a short timeout so a stuck reader can't
+	// hang shutdown forever.
+	select {
+	case <-session.ReaderDoneSignal():
+	case <-time.After(2 * time.Second):
+		m.logger.Warn("PTY reader did not exit within timeout; clearing anyway",
+			slog.String("session_id", sessionID))
+	}
+
 	// Clear live-process fields, but keep DaemonUUID + WorkingDir +
 	// Name + ID so the entry is recognizable on the next restart.
 	m.mu.Lock()
@@ -1097,64 +1233,110 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 		}
 	}
 
+	// SNAPSHOT phase: hold m.mu.RLock for the minimum time needed to
+	// copy the per-session metadata we care about. NO filesystem or
+	// daemon I/O happens under the lock — those go in the next phase
+	// against the snapshot. Without this, sidebar polling (every 3s)
+	// held the RLock for the duration of N glob+stat+open syscalls,
+	// blocking every writer (GetOrCreate, Close, RenameSession) for
+	// hundreds of ms on a cold cache.
+	type sessSnap struct {
+		id              string
+		name            string
+		dangerousMode   bool
+		workingDir      string
+		mcpConfigPath   string
+		createdAt       time.Time
+		lastActivity    time.Time
+		daemonBacked    bool
+		daemonShort     string
+		daemonUUID      string
+		lastUserInputAt time.Time
+	}
 	m.mu.RLock()
-	sessions := make([]*models.ClaudeSession, 0, len(m.sessions))
+	snaps := make([]sessSnap, 0, len(m.sessions))
 	known := make(map[string]bool, len(m.sessions))
 	for _, session := range m.sessions {
 		known[session.ID] = true
-		// Track daemon UUID too so we don't double-list our own sessions
-		// when also pulling from the daemon below.
 		if session.DaemonUUID != "" {
 			known[session.DaemonUUID] = true
 		}
-		// Pick the most user-friendly name. Generic "Terminal Session"
-		// and "grimoire-*" tokens are useless for the UI — for
-		// UUID-style session IDs we can recover the JSONL ai-title
-		// instead. This catches sessions spawned before the resume
-		// name-lookup fix landed.
-		name := session.Name
-		if (name == "Terminal Session" || name == "" || strings.HasPrefix(name, "grimoire-")) && isUUIDLike(session.ID) {
-			if friendly := lookupHistoricalNameByShort(session.ID[:8]); friendly != "" {
-				name = friendly
+		// Read session fields under session-local lock — not m.mu —
+		// because handler-side mutations (MarkUserInput, SetName,
+		// MarkContextPromptSent) acquire only s.mu. Holding m.mu does
+		// NOT protect session fields.
+		session.mu.Lock()
+		snaps = append(snaps, sessSnap{
+			id:              session.ID,
+			name:            session.Name,
+			dangerousMode:   session.DangerousMode,
+			workingDir:      session.WorkingDir,
+			mcpConfigPath:   session.MCPConfigPath,
+			createdAt:       session.CreatedAt,
+			lastActivity:    session.LastActivity,
+			daemonBacked:    session.IsDaemonBacked(),
+			daemonShort:     session.DaemonShort,
+			daemonUUID:      session.DaemonUUID,
+			lastUserInputAt: session.LastUserInputAt,
+		})
+		session.mu.Unlock()
+	}
+	m.mu.RUnlock()
+
+	// RESOLVE phase (lock-free): translate snapshots into output rows.
+	// Uses histNameCache for ai-title lookups and jsonlMtimeCache for
+	// stat'ing JSONLs. Both are TTL'd so back-to-back polls are O(1)
+	// after warmup.
+	sessions := make([]*models.ClaudeSession, 0, len(snaps))
+	now := time.Now()
+	for _, s := range snaps {
+		name := s.name
+		isGenericName := name == "" ||
+			name == "Terminal Session" ||
+			name == "Quick Terminal" ||
+			name == "(unnamed)" ||
+			strings.HasPrefix(name, "grimoire-")
+		if isGenericName {
+			if s.daemonShort != "" {
+				if friendly := lookupHistoricalNameByShort(s.daemonShort); friendly != "" {
+					name = friendly
+				}
+			}
+			if name == s.name && isUUIDLike(s.id) {
+				if friendly := lookupHistoricalNameByShort(s.id[:8]); friendly != "" {
+					name = friendly
+				}
 			}
 		}
 		out := &models.ClaudeSession{
-			ID:            session.ID,
+			ID:            s.id,
 			Name:          name,
-			DangerousMode: session.DangerousMode,
-			WorkingDir:    session.WorkingDir,
-			MCPConfigPath: session.MCPConfigPath,
+			DangerousMode: s.dangerousMode,
+			WorkingDir:    s.workingDir,
+			MCPConfigPath: s.mcpConfigPath,
 			Status:        "active",
-			Messages:      []models.ClaudeMessage{}, // Don't include full messages in list
-			CreatedAt:     session.CreatedAt,
-			UpdatedAt:     time.Now(),
-			LastActivity:  session.LastActivity,
+			Messages:      []models.ClaudeMessage{},
+			CreatedAt:     s.createdAt,
+			UpdatedAt:     now,
+			LastActivity:  s.lastActivity,
 		}
-		// Live state for the sidebar status badge. For daemon-backed
-		// sessions we look up by short id (cheap, just hashtable). For
-		// subprocess sessions, synthesize "active" so the UI knows the
-		// PTY is alive even though we don't have richer info.
-		if session.IsDaemonBacked() {
-			if rec, ok := jobsByShort[session.DaemonShort]; ok {
+		if s.daemonBacked {
+			if rec, ok := jobsByShort[s.daemonShort]; ok {
 				out.Tempo = rec.Tempo
 				out.State = rec.State
 				out.Detail = rec.Detail
 				out.Needs = rec.Needs
-				// Daemon doesn't proactively reset tempo when a worker
-				// stops emitting — it keeps the last reported value
-				// until the next status signal. For long-idle workers
-				// the sidebar shows stale "active/working" forever.
-				// Override: if there has been no PTY activity for the
-				// last 30s and daemon still says active, downgrade to
-				// idle so the badge reflects reality.
-				if (out.Tempo == "active" || out.State == "running") &&
-					!session.LastActivity.IsZero() &&
-					time.Since(session.LastActivity) > 30*time.Second {
-					out.Tempo = "idle"
-					if out.State == "running" {
-						// Keep state="running" — process is alive — but
-						// flip tempo so the pill renders as "ready"
-						// instead of "working".
+				if out.Tempo == "active" {
+					userHasTyped := !s.lastUserInputAt.IsZero()
+					jsonlStale := false
+					if mtime, found := jsonlMtimeFor(s.daemonUUID); found {
+						jsonlStale = time.Since(mtime) > 30*time.Second
+					}
+					switch {
+					case !userHasTyped:
+						out.Tempo = "idle"
+					case jsonlStale:
+						out.Tempo = "idle"
 					}
 				}
 			} else {
@@ -1168,7 +1350,6 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 		}
 		sessions = append(sessions, out)
 	}
-	m.mu.RUnlock()
 
 	// Also include live daemon sessions not in our manager — e.g. ones
 	// kvaps spawned via `claude --bg` directly, or sessions that
@@ -1194,6 +1375,19 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 				continue
 			}
 			name := j.Name
+			// Try JSONL ai-title for daemon-only sessions (Quick Terminal
+			// tabs not in manager, kvaps-spawned workers, etc). The short
+			// id maps to the JSONL filename via lookupHistoricalNameByShort.
+			isGeneric := name == "" ||
+				name == "Terminal Session" ||
+				name == "Quick Terminal" ||
+				name == "(unnamed)" ||
+				strings.HasPrefix(name, "grimoire-")
+			if isGeneric && j.Short != "" {
+				if friendly := lookupHistoricalNameByShort(j.Short); friendly != "" {
+					name = friendly
+				}
+			}
 			sessions = append(sessions, &models.ClaudeSession{
 				ID:           j.SessionID,
 				Name:         name,
@@ -1226,6 +1420,7 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 // PTY doesn't expose richer info.
 type SessionStatus struct {
 	SessionID    string `json:"sessionId"`
+	Name         string `json:"name,omitempty"` // user-visible display name (matches listing/by-project)
 	DaemonBacked bool   `json:"daemonBacked"`
 	DaemonShort  string `json:"daemonShort,omitempty"`
 	DaemonUUID   string `json:"daemonUuid,omitempty"`
@@ -1249,24 +1444,55 @@ func (m *SessionManager) GetSessionStatus(sessionID string) (SessionStatus, erro
 	session, ok := m.sessions[sessionID]
 	m.mu.RUnlock()
 	if !ok {
+		// Try to surface the canonical display name from Mongo
+		// overlay → JSONL header → daemon prefix lookup. Without this
+		// the frontend, polling /status to refresh runtime, would lose
+		// the name when the manager-entry has been GC'd (e.g. after a
+		// recent backend restart but before rehydrate picked it up).
+		fallbackName := ""
+		if m.storage != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			if overlay, err := m.storage.ListNameOverrides(ctx); err == nil {
+				if n := overlay[sessionID]; n != "" {
+					fallbackName = n
+				}
+			}
+			cancel()
+		}
+		if fallbackName == "" && len(sessionID) >= 8 {
+			if n := lookupHistoricalNameByShort(sessionID[:8]); n != "" {
+				fallbackName = n
+			}
+		}
 		return SessionStatus{
 			SessionID: sessionID,
+			Name:      fallbackName,
 			Tempo:     "unknown",
 			State:     "unknown",
 			Detail:    "session not in memory",
 		}, nil
 	}
 
+	// Snapshot the display name under lock. Without this the status
+	// response carries no name → frontend that polls /status to refresh
+	// runtime fields ends up dropping the human title (it had no way to
+	// re-derive the canonical name from the daemon UUID alone, which can
+	// differ from the grimoireID after resume/fork).
+	name := session.GetName()
+
 	if !session.IsDaemonBacked() {
-		// Subprocess: alive if Cmd hasn't exited yet.
+		// Subprocess: alive if Cmd hasn't exited yet. Use the race-free
+		// IsProcessDone() channel check instead of cmd.ProcessState
+		// (which races against cmd.Wait writes).
 		state := "running"
 		tempo := "active"
-		if session.Cmd != nil && session.Cmd.ProcessState != nil && session.Cmd.ProcessState.Exited() {
+		if session.Cmd != nil && session.IsProcessDone() {
 			state = "done"
 			tempo = "idle"
 		}
 		return SessionStatus{
 			SessionID:    sessionID,
+			Name:         name,
 			DaemonBacked: false,
 			Tempo:        tempo,
 			State:        state,
@@ -1274,11 +1500,13 @@ func (m *SessionManager) GetSessionStatus(sessionID string) (SessionStatus, erro
 		}, nil
 	}
 
-	// Daemon-backed: ask the daemon for the live record.
-	jobs, err := session.DaemonClient.ListSessions()
+	// Daemon-backed: ask the daemon for the live record. Cached briefly
+	// to coalesce sidebar-polling bursts across N sessions.
+	jobs, err := listSessionsCached(session.DaemonClient)
 	if err != nil {
 		return SessionStatus{
 			SessionID:    sessionID,
+			Name:         name,
 			DaemonBacked: true,
 			DaemonShort:  session.DaemonShort,
 			DaemonUUID:   session.DaemonUUID,
@@ -1291,6 +1519,7 @@ func (m *SessionManager) GetSessionStatus(sessionID string) (SessionStatus, erro
 		if j.Short == session.DaemonShort {
 			return SessionStatus{
 				SessionID:    sessionID,
+				Name:         name,
 				DaemonBacked: true,
 				DaemonShort:  j.Short,
 				DaemonUUID:   j.SessionID,
@@ -1304,6 +1533,7 @@ func (m *SessionManager) GetSessionStatus(sessionID string) (SessionStatus, erro
 	// Not found in daemon list — likely removed externally.
 	return SessionStatus{
 		SessionID:    sessionID,
+		Name:         name,
 		DaemonBacked: true,
 		DaemonShort:  session.DaemonShort,
 		DaemonUUID:   session.DaemonUUID,
@@ -1313,11 +1543,15 @@ func (m *SessionManager) GetSessionStatus(sessionID string) (SessionStatus, erro
 	}, nil
 }
 
-// RenameSession updates the display name of an in-memory session
+// RenameSession updates the display name of an in-memory session.
+// Uses the session's own lock (SetName) — m.mu only protects the map
+// lookup; mutating session.Name under m.mu would race with code that
+// reads session.Name while holding only s.mu.
 func (m *SessionManager) RenameSession(sessionID string, name string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if session, ok := m.sessions[sessionID]; ok {
-		session.Name = name
+	m.mu.RLock()
+	session, ok := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if ok {
+		session.SetName(name)
 	}
 }

@@ -110,28 +110,46 @@ func ImportTranscript(reader io.Reader, suggestedName string) (ImportResult, err
 	// taken, suffix with -2, -3, … until we find a free slot.
 	destPath := uniquePath(destDir, sessionID)
 
-	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	outFile, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return ImportResult{}, fmt.Errorf("create %s: %w", destPath, err)
 	}
-	w := bufio.NewWriter(out)
+	// Success flag pattern: if anything below this point fails, the
+	// partial JSONL + its marker get removed. Without this a flush
+	// error left a half-written file on disk that listing later
+	// surfaced as a broken session.
+	success := false
+	markerPath := strings.TrimSuffix(destPath, ".jsonl") + ".imported"
+	defer func() {
+		if !success {
+			_ = os.Remove(destPath)
+			_ = os.Remove(markerPath)
+		}
+	}()
+	w := bufio.NewWriter(outFile)
 	// Find the source's original sessionId so we can rewrite every
 	// in-line reference to it. We don't trust scanner.Text earlier
 	// (it already parsed only `type` and `cwd`), so do a second pass.
 	originalID := findOriginalSessionID(lines)
 	for _, ln := range lines {
-		out := ln
+		line := ln
 		if originalID != "" && originalID != sessionID {
-			out = strings.ReplaceAll(out, originalID, sessionID)
+			line = strings.ReplaceAll(line, originalID, sessionID)
 		}
-		_, _ = w.WriteString(out)
-		_, _ = w.WriteString("\n")
+		if _, werr := w.WriteString(line); werr != nil {
+			_ = outFile.Close()
+			return ImportResult{}, fmt.Errorf("write: %w", werr)
+		}
+		if _, werr := w.WriteString("\n"); werr != nil {
+			_ = outFile.Close()
+			return ImportResult{}, fmt.Errorf("write: %w", werr)
+		}
 	}
 	if err := w.Flush(); err != nil {
-		_ = out.Close()
+		_ = outFile.Close()
 		return ImportResult{}, fmt.Errorf("flush: %w", err)
 	}
-	if err := out.Close(); err != nil {
+	if err := outFile.Close(); err != nil {
 		return ImportResult{}, fmt.Errorf("close: %w", err)
 	}
 
@@ -140,10 +158,10 @@ func ImportTranscript(reader io.Reader, suggestedName string) (ImportResult, err
 	// (i.e. the source carried a cwd field). Empty file — its
 	// existence is the signal. No error handling: failing to mark
 	// isn't fatal, listing just won't show the badge for this one.
-	markerPath := strings.TrimSuffix(destPath, ".jsonl") + ".imported"
 	if f, err := os.OpenFile(markerPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644); err == nil {
 		_ = f.Close()
 	}
+	success = true
 
 	// Derive the final sessionId from the filename — it may have been
 	// suffixed for uniqueness.
