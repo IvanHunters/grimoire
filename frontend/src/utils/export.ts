@@ -82,6 +82,65 @@ const PDF_OVERRIDE_CSS = `
   .markdown-preview tbody tr:nth-child(even) { background-color: rgba(0,0,0,0.02) !important; }
   .markdown-preview a { color: #0e7490 !important; }
   .markdown-preview a:visited { color: #6366f1 !important; }
+
+  /* Code blocks: print-friendly light theme. Default prism dark scheme
+     uses a near-black background that's unreadable on paper / monochrome
+     printers. Force a light grey panel + dark-on-light syntax tokens. */
+  .markdown-preview pre,
+  .markdown-preview pre[class*="language-"] {
+    background: #f3f4f6 !important;
+    background-color: #f3f4f6 !important;
+    color: #1f2937 !important;
+    border: 1px solid #e5e7eb !important;
+    border-radius: 6px !important;
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+  .markdown-preview pre code,
+  .markdown-preview pre[class*="language-"] code,
+  .markdown-preview pre code[class*="language-"] {
+    background: transparent !important;
+    background-color: transparent !important;
+    color: #1f2937 !important;
+    text-shadow: none !important;
+  }
+  /* Prism syntax tokens — palette tuned for paper readability. */
+  .markdown-preview pre .token.comment,
+  .markdown-preview pre .token.prolog,
+  .markdown-preview pre .token.doctype,
+  .markdown-preview pre .token.cdata { color: #6b7280 !important; font-style: italic !important; }
+  .markdown-preview pre .token.punctuation { color: #4b5563 !important; }
+  .markdown-preview pre .token.property,
+  .markdown-preview pre .token.tag,
+  .markdown-preview pre .token.boolean,
+  .markdown-preview pre .token.number,
+  .markdown-preview pre .token.constant,
+  .markdown-preview pre .token.symbol,
+  .markdown-preview pre .token.deleted { color: #b45309 !important; }
+  .markdown-preview pre .token.selector,
+  .markdown-preview pre .token.attr-name,
+  .markdown-preview pre .token.string,
+  .markdown-preview pre .token.char,
+  .markdown-preview pre .token.builtin,
+  .markdown-preview pre .token.inserted { color: #047857 !important; }
+  .markdown-preview pre .token.operator,
+  .markdown-preview pre .token.entity,
+  .markdown-preview pre .token.url,
+  .markdown-preview pre .language-css .token.string,
+  .markdown-preview pre .style .token.string { color: #4b5563 !important; }
+  .markdown-preview pre .token.atrule,
+  .markdown-preview pre .token.attr-value,
+  .markdown-preview pre .token.keyword { color: #7c3aed !important; }
+  .markdown-preview pre .token.function,
+  .markdown-preview pre .token.class-name { color: #1d4ed8 !important; }
+  .markdown-preview pre .token.regex,
+  .markdown-preview pre .token.important,
+  .markdown-preview pre .token.variable { color: #be185d !important; }
+  /* Line-number gutter ::before pseudo-element — keep grey, no shadow. */
+  .markdown-preview pre code .code-line::before {
+    color: #9ca3af !important;
+    border-right: 1px solid #e5e7eb !important;
+  }
 `
 
 /**
@@ -384,7 +443,7 @@ async function renderPortraitSegment(pdf: jsPDF, nodes: HTMLElement[]): Promise<
     // (rehype-prism, prose, etc.) the image still fits inside one page.
     clampImagesToFitPage(container)
 
-    const { breakPoints, forbiddenRanges } = collectBreakPointsAndForbidden(previewWrap, container)
+    const { breakPoints, forbiddenRanges, keepTogether } = collectBreakPointsAndForbidden(previewWrap, container)
 
     const canvas = await htmlToCanvas(container, {
       pixelRatio: PDF_RENDER_SCALE,
@@ -392,20 +451,40 @@ async function renderPortraitSegment(pdf: jsPDF, nodes: HTMLElement[]): Promise<
       cacheBust: true,
     })
 
+    // Browsers cap canvas dimensions (Chrome on macOS clamps to 16384px).
+    // When container.scrollHeight × PDF_RENDER_SCALE exceeds that ceiling
+    // html-to-image silently scales the entire image DOWN to fit instead
+    // of clipping — every canvas-y position becomes (DOM_y × effectiveScale)
+    // where effectiveScale < PDF_RENDER_SCALE. Without compensating here,
+    // breakpoints projected by PDF_RENDER_SCALE land in the WRONG canvas
+    // rows: the slicer cuts mid-content because its candidates point past
+    // the actual location of the corresponding DOM block.
+    const containerHeightDOM = container.scrollHeight
+    const effectiveScale = containerHeightDOM > 0
+      ? canvas.height / containerHeightDOM
+      : PDF_RENDER_SCALE
     const pxPerMm = canvas.width / PDF_CONTENT_WIDTH
     const contentHeightPx = PDF_CONTENT_HEIGHT * pxPerMm
-    const scaledBreaks = breakPoints.map(bp => bp * PDF_RENDER_SCALE)
+    const scaledBreaks = breakPoints.map(bp => bp * effectiveScale)
     const scaledForbidden = forbiddenRanges.map(([t, b]) =>
-      [t * PDF_RENDER_SCALE, b * PDF_RENDER_SCALE] as [number, number]
+      [t * effectiveScale, b * effectiveScale] as [number, number]
     )
-    const pageSlices = computePageSlices(scaledBreaks, contentHeightPx, canvas.height, scaledForbidden)
+    const scaledKeepTogether = keepTogether.map(([t, b]) =>
+      [t * effectiveScale, b * effectiveScale] as [number, number]
+    )
+    const pageSlices = computePageSlices(scaledBreaks, contentHeightPx, canvas.height, scaledForbidden, scaledKeepTogether)
 
-    // Extract text spans for the invisible copy-text layer. Each entry holds
-    // the text content + its bounding rect in CANVAS coordinates (i.e. already
-    // multiplied by PDF_RENDER_SCALE). We project these onto each page slice
-    // and emit invisible pdf.text() so the canvas-rendered image is backed by
-    // selectable, copyable text.
-    const textSpans = collectTextSpans(previewWrap, container)
+    // Extract text spans for the invisible copy-text layer. We pass the
+    // effectiveScale (which may differ from PDF_RENDER_SCALE when the
+    // canvas was clamped to 16384px and silently downscaled) so the spans'
+    // canvas coordinates match the actual rasterized image.
+    const textSpans = collectTextSpans(previewWrap, container, effectiveScale)
+
+    // Hyperlinks for the clickable-annotation layer. Without this the
+    // PDF's "links" are just pixel-rendered underlined text — not
+    // clickable. Per-visual-line rects via Range so wrapped link text
+    // gets clickable areas on each line.
+    const links = collectLinks(previewWrap, container, effectiveScale)
 
     for (let i = 0; i < pageSlices.length; i++) {
       pdf.addPage('a4', 'portrait')
@@ -431,6 +510,11 @@ async function renderPortraitSegment(pdf: jsPDF, nodes: HTMLElement[]): Promise<
       // corresponding PDF coordinate with renderingMode:'invisible' so the
       // visible image stays the only paint, but the text is in the PDF stream.
       paintInvisibleTextLayer(pdf, textSpans, startY, endY, pxPerMm)
+
+      // Clickable link annotations — emitted as PDF annotations (not
+      // pixels), so the link rectangles work even though the page body
+      // is a raster image. Clipped per slice for links that wrap pages.
+      paintLinkLayer(pdf, links, startY, endY, pxPerMm)
     }
 
     return pageSlices.length
@@ -521,6 +605,98 @@ function addFooters(pdf: jsPDF, note: Note, totalPages: number): void {
  * unit (image, picture, svg, mermaid diagram). computePageSlices snaps any
  * candidate that falls inside a forbidden range up to the range's top.
  */
+// A clickable rectangle for a hyperlink. PDF annotations are emitted
+// per page slice via paintLinkLayer.
+interface LinkBox {
+  url: string
+  yCanvas: number
+  xCanvas: number
+  widthCanvas: number
+  heightCanvas: number
+}
+
+/**
+ * Walk the rendered preview, find every `<a href>` and emit one LinkBox
+ * per visual line (Range.getClientRects() — handles wrapped links).
+ * Without this the PDF renders link text as part of the rasterised
+ * image only — looks like a link, but isn't actually clickable.
+ */
+function collectLinks(preview: HTMLElement, container: HTMLElement, scale: number): LinkBox[] {
+  const cr = container.getBoundingClientRect()
+  const out: LinkBox[] = []
+  preview.querySelectorAll('a[href]').forEach(node => {
+    const el = node as HTMLAnchorElement
+    const url = el.href
+    if (!url) return
+    // Skip javascript:/empty/in-page anchors — opening them from a PDF
+    // either crashes the reader or jumps inside-PDF (which we don't
+    // support, no internal page anchors).
+    if (url.startsWith('javascript:') || url.startsWith('#') || url === '') return
+    const range = document.createRange()
+    try {
+      range.selectNodeContents(el)
+    } catch {
+      return
+    }
+    const rects = Array.from(range.getClientRects())
+    if (rects.length === 0) {
+      const r = el.getBoundingClientRect()
+      if (r.width <= 0 || r.height <= 0) return
+      out.push({
+        url,
+        xCanvas: (r.left - cr.left) * scale,
+        yCanvas: (r.top - cr.top) * scale,
+        widthCanvas: r.width * scale,
+        heightCanvas: r.height * scale,
+      })
+      return
+    }
+    for (const r of rects) {
+      if (r.width <= 0 || r.height <= 0) continue
+      out.push({
+        url,
+        xCanvas: (r.left - cr.left) * scale,
+        yCanvas: (r.top - cr.top) * scale,
+        widthCanvas: r.width * scale,
+        heightCanvas: r.height * scale,
+      })
+    }
+  })
+  return out
+}
+
+/**
+ * Emit pdf.link() rectangles for every LinkBox that intersects the
+ * current page slice. The rect is clipped to the slice if a link wraps
+ * across pages.
+ */
+function paintLinkLayer(
+  pdf: jsPDF,
+  links: LinkBox[],
+  startCanvasY: number,
+  endCanvasY: number,
+  pxPerMm: number,
+): void {
+  for (const link of links) {
+    const linkBottom = link.yCanvas + link.heightCanvas
+    if (linkBottom <= startCanvasY) continue
+    if (link.yCanvas >= endCanvasY) continue
+    const clippedTop = Math.max(link.yCanvas, startCanvasY)
+    const clippedBottom = Math.min(linkBottom, endCanvasY)
+    const visibleH = clippedBottom - clippedTop
+    if (visibleH <= 0) continue
+    const xMm = PDF_MARGIN_LEFT + link.xCanvas / pxPerMm
+    const yMm = PDF_MARGIN_TOP + (clippedTop - startCanvasY) / pxPerMm
+    const wMm = link.widthCanvas / pxPerMm
+    const hMm = visibleH / pxPerMm
+    try {
+      pdf.link(xMm, yMm, wMm, hMm, { url: link.url })
+    } catch {
+      // jsPDF can choke on malformed URLs — silently skip.
+    }
+  }
+}
+
 // A single text span — text content + its rendered bounding rect in CANVAS
 // coordinates (DOM px multiplied by PDF_RENDER_SCALE).
 interface TextSpan {
@@ -564,7 +740,7 @@ const TEXT_LEAVES: ReadonlySet<string> = new Set([
  * overlay. Spans are kept per visual line (via Range.getClientRects) so
  * selection rectangles align with what the user sees on the image.
  */
-function collectTextSpans(preview: HTMLElement, container: HTMLElement): TextSpan[] {
+function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: number): TextSpan[] {
   const containerTop = container.getBoundingClientRect().top
   const containerLeft = container.getBoundingClientRect().left
   const spans: TextSpan[] = []
@@ -620,10 +796,10 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement): TextSpa
       if (r.height <= 0 || r.width <= 0) continue
       spans.push({
         text: fullText,
-        yCanvas: (r.top - containerTop) * PDF_RENDER_SCALE,
-        xCanvas: (r.left - containerLeft) * PDF_RENDER_SCALE,
-        widthCanvas: r.width * PDF_RENDER_SCALE,
-        heightCanvas: r.height * PDF_RENDER_SCALE,
+        yCanvas: (r.top - containerTop) * scale,
+        xCanvas: (r.left - containerLeft) * scale,
+        widthCanvas: r.width * scale,
+        heightCanvas: r.height * scale,
       })
       continue
     }
@@ -638,10 +814,10 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement): TextSpa
     if (first.height <= 0 || first.width <= 0) continue
     spans.push({
       text: fullText,
-      yCanvas: (first.top - containerTop) * PDF_RENDER_SCALE,
-      xCanvas: (first.left - containerLeft) * PDF_RENDER_SCALE,
-      widthCanvas: first.width * PDF_RENDER_SCALE,
-      heightCanvas: first.height * PDF_RENDER_SCALE,
+      yCanvas: (first.top - containerTop) * scale,
+      xCanvas: (first.left - containerLeft) * scale,
+      widthCanvas: first.width * scale,
+      heightCanvas: first.height * scale,
     })
   }
 
@@ -710,14 +886,121 @@ function paintInvisibleTextLayer(
 function collectBreakPointsAndForbidden(
   preview: HTMLElement,
   container: HTMLElement,
-): { breakPoints: number[]; forbiddenRanges: Array<[number, number]> } {
+): {
+  breakPoints: number[]
+  forbiddenRanges: Array<[number, number]>
+  keepTogether: Array<[number, number]>
+} {
   const containerTop = container.getBoundingClientRect().top
   const points = new Set<number>()
   points.add(0)
   const forbiddenRanges: Array<[number, number]> = []
+  // Keep-together ranges: blocks that the slicer should NOT split when they
+  // fit on a single page. The slicer snaps to the block's TOP (deferring
+  // the whole block to the next page) instead of cutting between its
+  // sub-elements. Used for tables — splitting them across pages reads as
+  // "the PDF ripped the table" even when each row is intact.
+  const keepTogether: Array<[number, number]> = []
 
   // Line height approximation for generating sub-break points inside tall blocks
   const LINE_HEIGHT_PX = 20
+
+  // Per-visual-line breakpoints for ANY text-bearing block OUTSIDE tables.
+  // Without these, a paragraph or list item taller than a page got sliced
+  // mid-line: the outer loop adds only element top/bottom, the slicer fell
+  // back to idealEnd (a hard mid-text cut). Range.getClientRects() returns
+  // one rect per wrapped visual line — we add each line's top so the slicer
+  // always has a candidate inside any long block.
+  //
+  // Table cells are intentionally EXCLUDED: line tops inside <td> would
+  // become candidates between row-top and row-bottom, and the slicer
+  // (which picks the largest candidate ≤ idealEnd) would prefer a mid-row
+  // line over the row's top — cutting a single row across two pages.
+  // Tables already get their row-tops added below as the canonical break
+  // candidates; sub-cell breaks would only ever introduce mid-row rips.
+  const TEXT_BLOCK_TAGS = 'p, li, dd, dt, blockquote, h1, h2, h3, h4, h5, h6'
+  preview.querySelectorAll(TEXT_BLOCK_TAGS).forEach(node => {
+    const el = node as HTMLElement
+    // Skip if this element lives inside a table — see comment above.
+    if (el.closest('table')) return
+    const rect = el.getBoundingClientRect()
+    // Skip single-line elements — their top is already added by the
+    // outer-children loop, no sub-breaks needed.
+    if (rect.height < LINE_HEIGHT_PX * 2) return
+    const range = document.createRange()
+    try {
+      range.selectNodeContents(el)
+    } catch {
+      return
+    }
+    const lineRects = range.getClientRects()
+    for (const r of Array.from(lineRects)) {
+      if (r.height <= 0) continue
+      const top = r.top - containerTop
+      if (top > 0) points.add(Math.round(top))
+    }
+  })
+
+  // Forbidden ranges inside table rows: even if some pre-existing
+  // candidate (e.g. an element bottom from another query) happens to
+  // fall mid-row, snap it up to the row's top. This is belt-and-braces
+  // — the breakpoint set should already exclude in-row points, but a
+  // forbidden range guarantees no rip even if a stray candidate slips in.
+  preview.querySelectorAll('tr').forEach(row => {
+    const r = row.getBoundingClientRect()
+    if (r.height <= 0) return
+    const top = r.top - containerTop
+    const bottom = r.bottom - containerTop
+    if (top <= 0 || bottom <= 0) return
+    forbiddenRanges.push([Math.round(top) + 1, Math.round(bottom) - 1])
+  })
+
+  // Keep-together: tables whose total height fits within a page should
+  // never be split. The slicer defers them to the next page if the
+  // current slice can't fit them whole. (For tables BIGGER than a page,
+  // splitting between rows is the only option — handled by the row
+  // breakpoints below.)
+  preview.querySelectorAll('table').forEach(table => {
+    const r = table.getBoundingClientRect()
+    if (r.height <= 0) return
+    const top = r.top - containerTop
+    const bottom = r.bottom - containerTop
+    if (top <= 0 || bottom <= 0) return
+    keepTogether.push([Math.round(top), Math.round(bottom)])
+  })
+
+  // Inline code chips (<code> NOT inside <pre>): rendered as boxes with
+  // a tinted background. If a page break lands inside a chip's vertical
+  // span, the visible image shows only the chip's TOP/BOTTOM half — looks
+  // like the PDF "ripped" through an UI element. Forbidden range covers
+  // the chip so any candidate inside snaps to chip-top. The chip itself
+  // is small, so deferring to the next page costs at most one line.
+  preview.querySelectorAll('code').forEach(code => {
+    if (code.closest('pre')) return
+    const r = code.getBoundingClientRect()
+    if (r.height <= 0) return
+    const top = r.top - containerTop
+    const bottom = r.bottom - containerTop
+    if (top <= 0 || bottom <= 0) return
+    // +1 epsilon at top/bottom so a candidate at the exact chip edge is
+    // still allowed (a clean break right at chip-top is fine).
+    forbiddenRanges.push([Math.round(top) + 1, Math.round(bottom) - 1])
+  })
+
+  // Per-line breakpoints + forbidden ranges for code blocks. Without
+  // these, the uniform-stride loop below (`<pre>` sub-breakpoints) lands
+  // 1-2 px off the actual line top — slicer cuts the line in half.
+  // .code-line is the rehype-prism wrapper around each visual line in a
+  // code block; querying its rect gives the EXACT y position.
+  preview.querySelectorAll('pre .code-line').forEach(line => {
+    const r = (line as HTMLElement).getBoundingClientRect()
+    if (r.height <= 0) return
+    const top = r.top - containerTop
+    const bottom = r.bottom - containerTop
+    if (top <= 0 || bottom <= 0) return
+    points.add(Math.round(top))
+    forbiddenRanges.push([Math.round(top) + 1, Math.round(bottom) - 1])
+  })
 
   // Image-aware breaks: collect top+bottom of every <img> / <picture> / <svg> /
   // .mermaid as both BREAK candidates (so the slicer prefers them over
@@ -822,6 +1105,7 @@ function collectBreakPointsAndForbidden(
   return {
     breakPoints: Array.from(points).sort((a, b) => a - b),
     forbiddenRanges,
+    keepTogether,
   }
 }
 
@@ -852,6 +1136,7 @@ function computePageSlices(
   pageHeightPx: number,
   totalHeightPx: number,
   forbiddenRanges: Array<[number, number]> = [],
+  keepTogether: Array<[number, number]> = [],
 ): Array<{ startY: number; endY: number }> {
   const slices: Array<{ startY: number; endY: number }> = []
   let currentStart = 0
@@ -885,6 +1170,20 @@ function computePageSlices(
     const snapTop = forbiddenContainingTop(bestBreak, forbiddenRanges)
     if (snapTop !== null && snapTop > currentStart) {
       bestBreak = snapTop
+    }
+
+    // Keep-together pass: if our chosen break would split a "keep-together"
+    // block (typically a table) that DOES fit on a single page, defer the
+    // whole block to the next page by snapping bestBreak up to the block's
+    // top. Blocks larger than a page are left alone — the row-level
+    // breakpoints handle those.
+    for (const [ktTop, ktBottom] of keepTogether) {
+      if (ktTop > currentStart && ktBottom > bestBreak && bestBreak > ktTop) {
+        const blockHeight = ktBottom - ktTop
+        if (blockHeight <= pageHeightPx) {
+          bestBreak = ktTop
+        }
+      }
     }
 
     slices.push({ startY: currentStart, endY: bestBreak })
