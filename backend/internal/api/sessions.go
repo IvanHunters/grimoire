@@ -21,38 +21,11 @@ import (
 // newestJSONLInCwdAPI returns the UUID of the most recently modified
 // transcript in the cwd's sanitized project dir, or "" if none. Used
 // as a last-resort path resolver in CompactSession when the session's
-// id doesn't directly match a JSONL filename.
+// id doesn't directly match a JSONL filename. Thin wrapper over
+// discovery.NewestJSONLInCwd so the implementation stays in one place.
 func newestJSONLInCwdAPI(cwd string) string {
-	root, err := discovery.ProjectsRoot()
-	if err != nil {
-		return ""
-	}
-	dir := root + "/" + discovery.SanitizeCwd(cwd)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	var newestUUID string
-	var newestMtime time.Time
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-		// Skip archive sidecars — only count the live transcripts.
-		if strings.Contains(name, ".archive.") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(newestMtime) {
-			newestMtime = info.ModTime()
-			newestUUID = strings.TrimSuffix(name, ".jsonl")
-		}
-	}
-	return newestUUID
+	uuid, _ := discovery.NewestJSONLInCwd(cwd)
+	return uuid
 }
 
 func min(a, b int) int {
@@ -203,6 +176,14 @@ func (h *Handler) ImportSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Spool files past the in-memory threshold get written to /tmp.
+	// Without RemoveAll those temp files accumulate forever — bulk
+	// imports of large transcripts would leak GBs of disk over time.
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 	if r.MultipartForm == nil || len(r.MultipartForm.File["file"]) == 0 {
 		http.Error(w, "no files provided (use field name 'file')", http.StatusBadRequest)
 		return
@@ -310,6 +291,21 @@ func (h *Handler) SessionTranscript(w http.ResponseWriter, r *http.Request) {
 		h.logger.Error("read transcript failed", "session_id", sessionID, "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
+	}
+
+	// Mongo overlay (user-chosen rename) wins over the JSONL first-prompt
+	// fallback that ReadHeader picks. Without this, TranscriptViewer shows
+	// the original first message as the title — even when the user
+	// explicitly renamed the session in the sidebar.
+	if h.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		ss := storage.NewSessionStorage(h.db)
+		if overlay, err := ss.ListNameOverrides(ctx); err == nil {
+			if n := overlay[sessionID]; n != "" {
+				tr.Header.Name = n
+			}
+		}
+		cancel()
 	}
 
 	w.Header().Set("Content-Type", "application/json")

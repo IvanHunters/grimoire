@@ -1,22 +1,108 @@
 package websocket
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/daemon"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude/discovery"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	"github.com/ivanohotnikov/markdown-editor/internal/events"
 	"github.com/ivanohotnikov/markdown-editor/internal/storage"
 )
+
+// resumeCwdFromArchive looks for *.archive.* sidecars next to the live
+// JSONL and reads cwd from the most recent one. After compact the live
+// file gets truncated and may lose its cwd-bearing header event — the
+// archive sibling still has the full history.
+func resumeCwdFromArchive(sessionUUID string) string {
+	livePath, err := discovery.SessionPath(sessionUUID)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Dir(livePath)
+	matches, err := filepath.Glob(filepath.Join(dir, sessionUUID+".jsonl.archive.*"))
+	if err != nil || len(matches) == 0 {
+		return ""
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		fi, ei := os.Stat(matches[i])
+		fj, ej := os.Stat(matches[j])
+		if ei != nil || ej != nil {
+			return false
+		}
+		return fi.ModTime().After(fj.ModTime())
+	})
+	hdr, err := discovery.ReadHeader(matches[0])
+	if err != nil {
+		return ""
+	}
+	return hdr.Cwd
+}
+
+// isStubJSONL reports whether a transcript file contains zero
+// user/assistant events — only metadata (mode, permission-mode,
+// last-prompt, queue-operation, etc.). Post-compact stubs land in this
+// state when compact aggressively trims the conversation but leaves
+// the housekeeping events behind. `claude --resume` on such a file
+// fails with "No conversation found", so we detect and route to a
+// fresh spawn instead.
+func isStubJSONL(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	// Scan generously — slash-command sessions stack up dozens of
+	// metadata lines before the first real message, and we'd rather
+	// false-negative (treat as resume-able) than false-positive.
+	const scanLimit = 400
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for i := 0; i < scanLimit && scanner.Scan(); i++ {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+			continue
+		}
+		if ev.Type == "user" || ev.Type == "assistant" {
+			return false
+		}
+	}
+	return true
+}
+
+// resumeCwdFromDaemonRoster asks the cc-daemon for the live worker
+// record matching this sessionUUID and returns its cwd. Works for
+// sessions where (a) the JSONL header is truncated AND (b) no archive
+// sidecar exists yet, but the worker is still running and the daemon
+// remembers where it was started.
+func resumeCwdFromDaemonRoster(sessionUUID string) string {
+	client := &daemon.Client{}
+	jobs, err := client.ListSessions()
+	if err != nil {
+		return ""
+	}
+	for _, j := range jobs {
+		if j.SessionID == sessionUUID && j.Cwd != "" {
+			return j.Cwd
+		}
+	}
+	return ""
+}
 
 // wsWriter serializes concurrent WebSocket writes.
 // gorilla/websocket allows one concurrent writer — without this, streamPTYOutput
@@ -171,7 +257,17 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 	// branch picks the right cwd from JSONL header instead of the
 	// fallback DetermineWorkingDir.
 	if msg.AttachToSessionID == "" && msg.ResumeFromSessionID == "" && isLikelyUUID(msg.SessionID) {
-		if _, pathErr := discovery.SessionPath(msg.SessionID); pathErr == nil {
+		// Skip auto-resume when the manager already has a live entry for
+		// this grimoireID (typical when MCP start_session was just used
+		// to set it up). Routing back through resume would re-parse the
+		// possibly-truncated post-compact JSONL header — which lacks cwd
+		// — and surface "resume target has no cwd in header" even though
+		// the worker is fine. Just hit the GetOrCreate fast-path.
+		if _, alive := h.manager.Get(msg.SessionID); alive == nil {
+			h.logger.Info("init: session already live in manager, skipping auto-resume",
+				slog.String("session_id", msg.SessionID),
+			)
+		} else if _, pathErr := discovery.SessionPath(msg.SessionID); pathErr == nil {
 			msg.ResumeFromSessionID = msg.SessionID
 			h.logger.Info("init: auto-routing UUID sessionId through resume",
 				slog.String("session_id", msg.SessionID),
@@ -201,22 +297,58 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 			return
 		}
 		header, hdrErr := discovery.ReadHeader(path)
-		if hdrErr != nil || header.Cwd == "" {
-			h.logger.Error("resume target has no cwd in header",
-				slog.String("resume_from", msg.ResumeFromSessionID),
-				slog.Any("error", hdrErr),
-			)
-			conn.WriteJSON(WSResponse{
-				Type:  "error",
-				Error: "Could not determine cwd for resume",
-			})
-			return
-		}
 		workingDir = header.Cwd
-		h.logger.Info("resume cwd resolved",
-			slog.String("resume_from", msg.ResumeFromSessionID),
-			slog.String("cwd", workingDir),
-		)
+		if hdrErr != nil || workingDir == "" {
+			// JSONL header empty (most often: compact truncated the file
+			// so the cwd-bearing event got rotated to the .archive.*
+			// sidecar). Fall back to (a) the archive sibling, then (b)
+			// daemon roster's record for this UUID. Either path beats
+			// surfacing "could not determine cwd" to the user when the
+			// information is right there in adjacent state.
+			if archiveCwd := resumeCwdFromArchive(msg.ResumeFromSessionID); archiveCwd != "" {
+				workingDir = archiveCwd
+				h.logger.Info("resume cwd resolved from archive sibling",
+					slog.String("resume_from", msg.ResumeFromSessionID),
+					slog.String("cwd", workingDir),
+				)
+			} else if rosterCwd := resumeCwdFromDaemonRoster(msg.ResumeFromSessionID); rosterCwd != "" {
+				workingDir = rosterCwd
+				h.logger.Info("resume cwd resolved from daemon roster",
+					slog.String("resume_from", msg.ResumeFromSessionID),
+					slog.String("cwd", workingDir),
+				)
+			} else {
+				h.logger.Error("resume target has no cwd in header (no archive or roster fallback)",
+					slog.String("resume_from", msg.ResumeFromSessionID),
+					slog.Any("error", hdrErr),
+				)
+				conn.WriteJSON(WSResponse{
+					Type:  "error",
+					Error: "Could not determine cwd for resume",
+				})
+				return
+			}
+		} else {
+			h.logger.Info("resume cwd resolved",
+				slog.String("resume_from", msg.ResumeFromSessionID),
+				slog.String("cwd", workingDir),
+			)
+		}
+
+		// Compact-stub guard: live JSONL may have valid header (cwd
+		// resolved above from archive/roster) but zero user/assistant
+		// events — that's a post-compact stub. `claude --resume` on
+		// such a file exits with "No conversation found" and the
+		// worker keeps respawning. Downgrade to a fresh spawn in the
+		// same cwd + same UUID — the historical archive sidecar stays
+		// on disk for investigation, conversation continues forward.
+		if isStubJSONL(path) {
+			h.logger.Info("resume target is a compact stub, downgrading to fresh spawn (same UUID)",
+				slog.String("resume_from", msg.ResumeFromSessionID),
+				slog.String("cwd", workingDir),
+			)
+			msg.ResumeFromSessionID = ""
+		}
 	} else {
 		var ddErr error
 		workingDir, ddErr = claude.DetermineWorkingDir(msg.CurrentNote, folderProjectPath, msg.SessionID)
@@ -262,6 +394,32 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 	var systemPrompt string
 	if msg.TaskContext != nil {
 		systemPrompt = buildTaskSystemPrompt(msg.TaskContext, folderProjectPath)
+	}
+
+	// Mongo overlay (= explicit user rename) wins over any other name
+	// source. Without this, opening a session via WS init / restart /
+	// MCP start_session would use the structured name passed by the
+	// caller (or empty) and the chat panel would show "(unnamed)" /
+	// the first prompt / a fork token — even though the user already
+	// renamed it. We re-check here right before spawn so the manager
+	// entry gets the canonical name and `session.GetName()` everywhere
+	// downstream returns the right string.
+	if h.sessionStorage != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		if overlay, err := h.sessionStorage.ListNameOverrides(ctx); err == nil {
+			if n := overlay[msg.SessionID]; n != "" {
+				sessionName = n
+			} else if msg.ResumeFromSessionID != "" {
+				if n := overlay[msg.ResumeFromSessionID]; n != "" {
+					sessionName = n
+				}
+			} else if msg.AttachToSessionID != "" {
+				if n := overlay[msg.AttachToSessionID]; n != "" {
+					sessionName = n
+				}
+			}
+		}
+		cancel()
 	}
 
 	// Stash frontend cols/rows for the immediate daemon Dispatch/Attach.
@@ -371,14 +529,14 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 	} else if msg.SkipContextPrompt {
 		// Handler-internal hint (e.g. from restart) says don't inject
 		// context. Mark sent so future reconnects also skip.
-		session.ContextPromptSent = true
-	} else if msg.CurrentNote != nil && !session.ContextPromptSent && msg.ResumeFromSessionID == "" {
+		session.MarkContextPromptSent()
+	} else if msg.CurrentNote != nil && !session.HasContextPromptSent() && msg.ResumeFromSessionID == "" {
 		// Send automatic context prompt — once per session lifetime,
 		// AND only on fresh spawns. When the session was resumed via
 		// `claude --bg --resume`, the JSONL already carries the prior
 		// SESSION CONTEXT in claude's model state, so re-pasting it
 		// just spams the visible terminal with duplicate text.
-		session.ContextPromptSent = true
+		session.MarkContextPromptSent()
 		var contextParts []string
 
 		contextParts = append(contextParts, "===========================================================")
@@ -594,9 +752,22 @@ func (h *Handler) handleTerminalInput(conn *websocket.Conn, msg *WSMessage) {
 		return
 	}
 
-	// Write raw input to PTY
-	_, err = session.PTY.Write([]byte(msg.Content))
-	if err != nil {
+	// Mark "real user activity" for sidebar pill heuristics. Set under
+	// session lock — direct field assignment would race with
+	// ListActiveSessions and ShutdownWorker.
+	session.MarkUserInput()
+
+	// WriteInput snapshots session.PTY under lock, returns
+	// ErrWorkerShutdown if the worker has been torn down (compact /
+	// restart), and serialises against SendMessage/Stop via writeMu.
+	// Crashes-on-nil and concurrent-write tears can no longer happen.
+	if err := session.WriteInput([]byte(msg.Content)); err != nil {
+		if claude.IsShutdownErr(err) {
+			// Worker is down — quietly drop the keystroke. ChatPanel
+			// will surface "session restarting" via its status poll;
+			// no point spamming logs.
+			return
+		}
 		h.logger.Error("failed to write to PTY", slog.Any("error", err))
 	}
 }
@@ -778,55 +949,11 @@ func isLikelyUUID(s string) bool {
 	return true
 }
 
-// newestJSONLInCwd returns the UUID (basename without .jsonl) of the
-// most-recently-modified transcript in the cwd's sanitized project
-// dir, or "" if none exists. Used as a last-resort lookup when the
-// session's DaemonUUID has drifted away from the actual file on disk.
-func newestJSONLInCwd(cwd string) string {
-	uuid, _ := newestJSONLInCwdSafe(cwd)
-	return uuid
-}
-
-// newestJSONLInCwdSafe returns the newest JSONL UUID + count of LIVE
-// candidates in the cwd. count > 1 means the cwd is shared by multiple
-// historical sessions — callers should refuse to auto-pick the newest
-// because it can swap a session's identity (e.g. cozystack-work/cozystack
-// has both Linstor and "Поиск" transcripts; picking newest after a
-// bonding-restart corrupted the bonding manager entry).
+// newestJSONLInCwdSafe is a local thin wrapper preserved for call
+// sites; the implementation lives in discovery.NewestJSONLInCwd so
+// the api/ package can share it without duplicating the I/O logic.
 func newestJSONLInCwdSafe(cwd string) (string, int) {
-	root, err := discovery.ProjectsRoot()
-	if err != nil {
-		return "", 0
-	}
-	dir := root + "/" + discovery.SanitizeCwd(cwd)
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", 0
-	}
-	var newestUUID string
-	var newestMtime time.Time
-	count := 0
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-		// Archive sidecars don't count — those are old snapshots, not
-		// active session transcripts.
-		if strings.Contains(name, ".archive.") {
-			continue
-		}
-		count++
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(newestMtime) {
-			newestMtime = info.ModTime()
-			newestUUID = strings.TrimSuffix(name, ".jsonl")
-		}
-	}
-	return newestUUID, count
+	return discovery.NewestJSONLInCwd(cwd)
 }
 
 // handleTerminalResize updates the PTY window size to match xterm.js dimensions

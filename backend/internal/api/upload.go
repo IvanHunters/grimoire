@@ -26,6 +26,15 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "File too large", http.StatusBadRequest)
 		return
 	}
+	// Clean up any spilled temp files when the handler returns; the
+	// uploaded bytes have already been copied into h.cfg.UploadsDir
+	// by the time we exit successfully, so the spool is no longer
+	// needed.
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	file, header, err := r.FormFile("file")
 	if err != nil {

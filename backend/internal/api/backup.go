@@ -98,6 +98,13 @@ func (h *Handler) ImportDB(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request too large or invalid form", http.StatusBadRequest)
 		return
 	}
+	// 64MB threshold means most ZIP backups spill to disk; clean up
+	// the temp spool on return so import retries don't accumulate.
+	defer func() {
+		if r.MultipartForm != nil {
+			_ = r.MultipartForm.RemoveAll()
+		}
+	}()
 
 	file, _, err := r.FormFile("file")
 	if err != nil {
