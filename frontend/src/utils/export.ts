@@ -822,13 +822,16 @@ const TEXT_LEAVES: ReadonlySet<string> = new Set([
  * font-metrics mismatch between the DOM font and the embedded Unicode
  * font used by jsPDF.
  *
- * Splits on runs of whitespace; each word's DOM rect comes from a Range
- * covering exactly that word's character offsets. Words that wrap onto
- * more than one line (rare — a single "word" spanning a soft-wrap only
- * happens on very narrow columns) yield one span per line rect.
+ * `lineHeightHint` overrides the per-word rect.height with the ambient
+ * paragraph line-height. Without it, inline `<code>` chip characters
+ * report a smaller height than the surrounding prose, jsPDF picks a
+ * smaller font, and the invisible-text baseline drifts up ~0.5pt —
+ * enough for viewers doing line-grouped selection to treat the chip as
+ * a separate row and skip it during a drag-select across the line.
  */
 function splitTextNodeByWords(
   textNode: Text,
+  lineHeightHint?: number,
 ): Array<{ text: string; rect: DOMRect }> {
   const text = textNode.data
   const N = text.length
@@ -836,6 +839,12 @@ function splitTextNodeByWords(
   const results: Array<{ text: string; rect: DOMRect }> = []
   const scratch = document.createRange()
   const wordRe = /\S+/g
+  const applyHint = (r: DOMRect): DOMRect => {
+    if (!lineHeightHint || lineHeightHint <= r.height) return r
+    // Extend rect downward (keep top the same, grow height) so the
+    // baseline computation lands at the ambient line's baseline.
+    return new DOMRect(r.x, r.y, r.width, lineHeightHint)
+  }
   let m: RegExpExecArray | null
   while ((m = wordRe.exec(text)) !== null) {
     const start = m.index
@@ -847,11 +856,9 @@ function splitTextNodeByWords(
     )
     if (rects.length === 0) continue
     if (rects.length === 1) {
-      results.push({ text: m[0], rect: rects[0] as DOMRect })
+      results.push({ text: m[0], rect: applyHint(rects[0] as DOMRect) })
       continue
     }
-    // Word wrapped: split the string proportionally by rect widths and
-    // assign each fragment its rect. Rare; a fallback for narrow columns.
     const totalW = rects.reduce((s, r) => s + r.width, 0)
     let charCursor = 0
     for (let i = 0; i < rects.length; i++) {
@@ -861,7 +868,7 @@ function splitTextNodeByWords(
         : Math.max(1, Math.round(m[0].length * share))
       results.push({
         text: m[0].slice(charCursor, charCursor + chars),
-        rect: rects[i] as DOMRect,
+        rect: applyHint(rects[i] as DOMRect),
       })
       charCursor += chars
     }
@@ -926,18 +933,21 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
     }
 
     // For prose leaves (p, li, h1-h6, blockquote, td, th, ...):
-    // walk descendant text nodes and split each by visual line. Multiple
-    // text nodes (e.g. text + <strong>text + text) contribute pieces to
-    // the same line; each piece gets its own span at its own DOM rect.
+    // walk descendant text nodes and split each by visual line.
     const textNodes: Text[] = []
     const inner = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
     let tn: Node | null = inner.currentNode
     while ((tn = inner.nextNode())) {
       const t = tn as Text
-      // Skip whitespace-only text nodes between inline elements.
       if (/^\s*$/.test(t.data)) continue
       textNodes.push(t)
     }
+    // Per-word rect keeps each word's invisible-text bbox exactly on
+    // the raster glyphs it corresponds to — critical for chip-style
+    // inline <code>: its characters sit on the same baseline as the
+    // surrounding prose but at a smaller character height, and moving
+    // the invisible text to the ambient prose top would drift it away
+    // from where the raster actually drew it.
     for (const t of textNodes) {
       for (const piece of splitTextNodeByWords(t)) {
         emit(piece.text, piece.rect)
@@ -988,16 +998,14 @@ function paintInvisibleTextLayer(
   }
 
   const MM_PER_PT = 0.3527777
-  // Line-height multiplier: DOM line box is ~1.5× the em size for prose
-  // (index.css :root sets line-height: 1.5) but code/heading lines are
-  // tighter (~1.2). Use a mid-range 1.35 so glyph box roughly fits the
-  // visible line without spilling into neighbours.
-  const LINE_HEIGHT_MULTIPLIER = 1.35
-  // Baseline sits ~0.78 of the font's em box from top for most fonts.
-  // With line-height 1.35, the visible line's ink is centred at
-  // top + line/2. Position baseline at top + line × 0.78 so the ink
-  // origin matches CSS text baseline for a typical line.
-  const BASELINE_RATIO = 0.78
+  // Line-height multiplier: Range.getClientRects returns the CSS line
+  // box (line-height ≈ 1.5 em for prose). fontSize = height / 1.5 gives
+  // the em size the DOM used.
+  const LINE_HEIGHT_MULTIPLIER = 1.5
+  // Baseline y from line-box top. For CSS line-height 1.5 with a font
+  // of ascent ≈ 0.75 em: baseline sits at ((1.5-1)*0.5 + 0.75) em from
+  // top = 1 em from top = 1/1.5 of the line box height = 0.667.
+  const BASELINE_RATIO = 0.667
 
   for (const span of spans) {
     if (span.yCanvas < startCanvasY || span.yCanvas >= endCanvasY) continue
@@ -1025,12 +1033,9 @@ function paintInvisibleTextLayer(
       }
     }
     try {
-      const dbg = (typeof window !== 'undefined' && (window as unknown as { __pdfDebugVisibleText?: boolean }).__pdfDebugVisibleText)
-      if (dbg) pdf.setTextColor(255, 0, 0)
       pdf.text(span.text, xMm, yBaselineMm, {
-        renderingMode: dbg ? 'fill' : 'invisible',
+        renderingMode: 'invisible',
       })
-      if (dbg) pdf.setTextColor(0, 0, 0)
     } catch {
       // Best-effort: silently drop the offending span.
     }
