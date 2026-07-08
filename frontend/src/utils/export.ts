@@ -942,15 +942,48 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       if (/^\s*$/.test(t.data)) continue
       textNodes.push(t)
     }
-    // Per-word rect keeps each word's invisible-text bbox exactly on
-    // the raster glyphs it corresponds to — critical for chip-style
-    // inline <code>: its characters sit on the same baseline as the
-    // surrounding prose but at a smaller character height, and moving
-    // the invisible text to the ambient prose top would drift it away
-    // from where the raster actually drew it.
+    // Snap every word to the containing line row. The invisible-text
+    // layer only needs correct TEXT and correct SELECTION RECTANGLE —
+    // its glyphs aren't visible, so drawing them at the prose line's
+    // baseline instead of the chip's own baseline is fine. What
+    // matters: chip words must share a y-range with the prose words on
+    // the same line, or viewers doing line-clustered drag-select will
+    // treat chips as belonging to a separate row and skip them.
+    const leafRange = document.createRange()
+    leafRange.selectNodeContents(el)
+    const leafRects = Array.from(leafRange.getClientRects())
+      .filter(r => r.width > 0 && r.height > 0)
+    const lineRows: Array<{ top: number; bottom: number }> = []
+    for (const r of leafRects) {
+      const idx = lineRows.findIndex(row => r.top < row.bottom && r.bottom > row.top)
+      if (idx === -1) lineRows.push({ top: r.top, bottom: r.bottom })
+      else {
+        lineRows[idx].top = Math.min(lineRows[idx].top, r.top)
+        lineRows[idx].bottom = Math.max(lineRows[idx].bottom, r.bottom)
+      }
+    }
+    lineRows.sort((a, b) => a.top - b.top)
+    const snapToLineRow = (wordRect: DOMRect): DOMRect => {
+      if (lineRows.length === 0) return wordRect
+      const wordMidY = wordRect.top + wordRect.height / 2
+      let containing = lineRows.find(row => row.top <= wordMidY && wordMidY <= row.bottom)
+      if (!containing) {
+        containing = lineRows[0]
+        let bestDist = Math.abs(wordMidY - (containing.top + containing.bottom) / 2)
+        for (let i = 1; i < lineRows.length; i++) {
+          const mid = (lineRows[i].top + lineRows[i].bottom) / 2
+          const d = Math.abs(wordMidY - mid)
+          if (d < bestDist) { containing = lineRows[i]; bestDist = d }
+        }
+      }
+      return new DOMRect(
+        wordRect.x, containing.top, wordRect.width,
+        containing.bottom - containing.top,
+      )
+    }
     for (const t of textNodes) {
       for (const piece of splitTextNodeByWords(t)) {
-        emit(piece.text, piece.rect)
+        emit(piece.text, snapToLineRow(piece.rect))
       }
     }
   }
@@ -1016,25 +1049,25 @@ function paintInvisibleTextLayer(
     const fontSizePt = (lineMm / LINE_HEIGHT_MULTIPLIER) / MM_PER_PT
     pdf.setFontSize(Math.max(4, Math.min(72, fontSizePt)))
     const yBaselineMm = PDF_MARGIN_TOP + yMmFromSliceTop + lineMm * BASELINE_RATIO
-    // Match the invisible text's width to the DOM rect by adjusting font
-    // size — a per-word scale keeps character advances internally
-    // consistent (no fake gaps between glyphs that pdftotext would
-    // interpret as word breaks). Cap at ±30% to avoid unreadable text
-    // shapes on outliers (e.g. a code-chip where CSS padding pads the
-    // rect much wider than the raw character run).
-    const targetWidthMm = Math.max(0, span.widthCanvas / pxPerMm)
-    let effectiveFontSizePt = fontSizePt
-    if (span.text.length > 0 && targetWidthMm > 0) {
+    // Nudge word width toward the DOM rect via charSpace. Adjusting the
+    // font size would change glyph HEIGHT and break the uniform y-band
+    // that line-clustered viewers use to include chips in a selection.
+    // charSpace only shifts x — heights stay uniform. Bound it tightly
+    // so pdftotext doesn't interpret the inter-glyph gap as a word
+    // break ("J o b s" happens above ~0.3mm).
+    let charSpaceMm = 0
+    if (span.text.length > 1) {
       const nativeWidthMm = pdf.getTextWidth(span.text)
-      if (nativeWidthMm > 0) {
-        const scale = Math.max(0.7, Math.min(1.3, targetWidthMm / nativeWidthMm))
-        effectiveFontSizePt = fontSizePt * scale
-        pdf.setFontSize(Math.max(4, Math.min(72, effectiveFontSizePt)))
+      const targetWidthMm = Math.max(0, span.widthCanvas / pxPerMm)
+      if (nativeWidthMm > 0 && targetWidthMm > 0) {
+        const raw = (targetWidthMm - nativeWidthMm) / (span.text.length - 1)
+        charSpaceMm = Math.max(-0.3, Math.min(0.15, raw))
       }
     }
     try {
       pdf.text(span.text, xMm, yBaselineMm, {
         renderingMode: 'invisible',
+        charSpace: charSpaceMm,
       })
     } catch {
       // Best-effort: silently drop the offending span.
