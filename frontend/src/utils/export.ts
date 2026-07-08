@@ -815,14 +815,95 @@ const TEXT_LEAVES: ReadonlySet<string> = new Set([
 ])
 
 /**
+ * Split a text node into per-visual-line pieces. Uses Range binary search
+ * to find the character offset at which each line ends. Returns one entry
+ * per rendered line with the substring plus the DOM rect it occupies.
+ *
+ * Why binary search: getClientRects() gives us how MANY lines exist and
+ * where each line sits, but not which characters belong to each line.
+ * A range [0..offset] whose bounding rect still starts at line i's top is
+ * still on line i; the boundary offset where the top moves to line i+1's
+ * y is the end of line i. Binary search over offset finds that boundary
+ * in log(N) rect measurements per line — far cheaper than word-walking.
+ */
+function splitTextNodeByLines(
+  textNode: Text,
+): Array<{ text: string; rect: DOMRect }> {
+  const text = textNode.data
+  const N = text.length
+  if (N === 0) return []
+  const fullRange = document.createRange()
+  fullRange.selectNodeContents(textNode)
+  const lineRects = Array.from(fullRange.getClientRects()).filter(
+    r => r.width > 0 && r.height > 0,
+  )
+  if (lineRects.length <= 1) {
+    return lineRects.map(r => ({ text, rect: r as DOMRect }))
+  }
+
+  const results: Array<{ text: string; rect: DOMRect }> = []
+  let lineStart = 0
+  const scratch = document.createRange()
+  const Y_TOL = 1 // px tolerance for line-y comparison
+
+  for (let i = 0; i < lineRects.length - 1; i++) {
+    const currentTop = lineRects[i].top
+    // Binary-search the largest offset in (lineStart, N] such that
+    // range(lineStart..offset)'s bottom stays on the current line.
+    let lo = lineStart
+    let hi = N
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1
+      scratch.setStart(textNode, lineStart)
+      scratch.setEnd(textNode, mid)
+      const r = scratch.getBoundingClientRect()
+      // A range that spans exactly the current line has top === currentTop.
+      // Adding one more character that wraps pushes top to a later line;
+      // top stays currentTop but bottom grows. So test bottom vs the NEXT
+      // line's top: if we've crossed into the next line, bottom > nextTop.
+      const nextTop = lineRects[i + 1].top
+      const stillOnLine = r.bottom <= nextTop + Y_TOL
+      if (stillOnLine) lo = mid
+      else hi = mid - 1
+    }
+    const lineEnd = lo
+    let lineText = text.slice(lineStart, lineEnd)
+    results.push({ text: lineText, rect: lineRects[i] as DOMRect })
+    // Skip whitespace between lines (soft-wrap eats trailing spaces).
+    lineStart = lineEnd
+    while (lineStart < N && /\s/.test(text[lineStart])) lineStart++
+  }
+  // Remainder is the last line.
+  results.push({
+    text: text.slice(lineStart),
+    rect: lineRects[lineRects.length - 1] as DOMRect,
+  })
+  return results
+}
+
+/**
  * Walk preview DOM and collect text spans suitable for an invisible PDF
- * overlay. Spans are kept per visual line (via Range.getClientRects) so
- * selection rectangles align with what the user sees on the image.
+ * overlay. Spans are one per VISUAL line — the substring drawn on that
+ * line, at that line's rect. Anchoring each line independently keeps
+ * PDF selection rectangles aligned with the rasterised text even though
+ * the invisible layer uses DejaVuSans (whose glyph widths differ from
+ * the DOM font).
  */
 function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: number): TextSpan[] {
   const containerTop = container.getBoundingClientRect().top
   const containerLeft = container.getBoundingClientRect().left
   const spans: TextSpan[] = []
+
+  const emit = (text: string, rect: DOMRect) => {
+    if (!text || rect.width <= 0 || rect.height <= 0) return
+    spans.push({
+      text,
+      yCanvas: (rect.top - containerTop) * scale,
+      xCanvas: (rect.left - containerLeft) * scale,
+      widthCanvas: rect.width * scale,
+      heightCanvas: rect.height * scale,
+    })
+  }
 
   // Walk all nodes; capture text-bearing leaves and any code-line spans.
   const walker = document.createTreeWalker(preview, NodeFilter.SHOW_ELEMENT)
@@ -834,13 +915,7 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
     const isCodeLine = el.classList.contains('code-line')
     if (!TEXT_LEAVES.has(tag) && !isCodeLine) continue
 
-    // .code-line is a TERMINAL leaf even though it has <span class="token">
-    // children — those are prism syntax-highlight tokens, and selecting
-    // them individually breaks user copy (spaces between tokens lose, line
-    // numbers double up). Emit one invisible-text span for the whole line.
     if (!isCodeLine) {
-      // If this element contains a TEXT_LEAVES descendant, the descendant
-      // will be visited later — skip the parent so we don't duplicate.
       let hasTextChild = false
       for (const child of Array.from(el.children)) {
         const ct = child.tagName.toLowerCase()
@@ -852,52 +927,34 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       if (hasTextChild) continue
     }
 
-    // Per-visual-line rectangles via Range so wrapped text gets one entry
-    // per line. Falls back to single bounding rect if range fails.
-    const range = document.createRange()
-    try {
-      range.selectNodeContents(el)
-    } catch {
-      continue
-    }
-    const lineRects = Array.from(range.getClientRects())
-    // Preserve indentation/whitespace inside code lines — copy of a code
-    // block with collapsed spaces is useless. For prose, collapse runs of
-    // whitespace so multi-line markdown like list items render as single
-    // logical strings on copy.
-    const fullText = isCodeLine
-      ? (el.textContent || '').replace(/\s+$/, '')
-      : (el.textContent || '').replace(/\s+/g, ' ').trim()
-    if (!fullText) continue
-
-    if (lineRects.length === 0) {
-      const r = el.getBoundingClientRect()
-      if (r.height <= 0 || r.width <= 0) continue
-      spans.push({
-        text: fullText,
-        yCanvas: (r.top - containerTop) * scale,
-        xCanvas: (r.left - containerLeft) * scale,
-        widthCanvas: r.width * scale,
-        heightCanvas: r.height * scale,
-      })
+    // .code-line: emit one span per line at the element's bounding rect
+    // (each .code-line is already one visual line — no wrapping needed).
+    if (isCodeLine) {
+      const codeText = (el.textContent || '').replace(/\s+$/, '')
+      if (!codeText) continue
+      const rect = el.getBoundingClientRect() as DOMRect
+      emit(codeText, rect)
       continue
     }
 
-    // One pdf.text() per visual line. We don't try to split the text by
-    // exact character offsets per rect (that needs binary-searching
-    // ranges); instead we attach the full element text to the FIRST line
-    // with maxWidth = first line's width. jsPDF will wrap the invisible
-    // text to match. Selection across wrapped lines stays correct because
-    // copy reads the text stream regardless of position.
-    const first = lineRects[0]
-    if (first.height <= 0 || first.width <= 0) continue
-    spans.push({
-      text: fullText,
-      yCanvas: (first.top - containerTop) * scale,
-      xCanvas: (first.left - containerLeft) * scale,
-      widthCanvas: first.width * scale,
-      heightCanvas: first.height * scale,
-    })
+    // For prose leaves (p, li, h1-h6, blockquote, td, th, ...):
+    // walk descendant text nodes and split each by visual line. Multiple
+    // text nodes (e.g. text + <strong>text + text) contribute pieces to
+    // the same line; each piece gets its own span at its own DOM rect.
+    const textNodes: Text[] = []
+    const inner = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    let tn: Node | null = inner.currentNode
+    while ((tn = inner.nextNode())) {
+      const t = tn as Text
+      // Skip whitespace-only text nodes between inline elements.
+      if (/^\s*$/.test(t.data)) continue
+      textNodes.push(t)
+    }
+    for (const t of textNodes) {
+      for (const piece of splitTextNodeByLines(t)) {
+        emit(piece.text, piece.rect)
+      }
+    }
   }
 
   return spans
@@ -943,8 +1000,16 @@ function paintInvisibleTextLayer(
   }
 
   const MM_PER_PT = 0.3527777
-  const LINE_HEIGHT_MULTIPLIER = 1.2
-  const BASELINE_RATIO = 0.80
+  // Line-height multiplier: DOM line box is ~1.5× the em size for prose
+  // (index.css :root sets line-height: 1.5) but code/heading lines are
+  // tighter (~1.2). Use a mid-range 1.35 so glyph box roughly fits the
+  // visible line without spilling into neighbours.
+  const LINE_HEIGHT_MULTIPLIER = 1.35
+  // Baseline sits ~0.78 of the font's em box from top for most fonts.
+  // With line-height 1.35, the visible line's ink is centred at
+  // top + line/2. Position baseline at top + line × 0.78 so the ink
+  // origin matches CSS text baseline for a typical line.
+  const BASELINE_RATIO = 0.78
 
   for (const span of spans) {
     if (span.yCanvas < startCanvasY || span.yCanvas >= endCanvasY) continue
@@ -952,15 +1017,12 @@ function paintInvisibleTextLayer(
     const xMm = PDF_MARGIN_LEFT + span.xCanvas / pxPerMm
     const yMmFromSliceTop = (span.yCanvas - startCanvasY) / pxPerMm
     const lineMm = span.heightCanvas / pxPerMm
-    // Set fontSize so glyph box height ≈ visible line height.
     const fontSizePt = (lineMm / LINE_HEIGHT_MULTIPLIER) / MM_PER_PT
     pdf.setFontSize(Math.max(4, Math.min(72, fontSizePt)))
     const yBaselineMm = PDF_MARGIN_TOP + yMmFromSliceTop + lineMm * BASELINE_RATIO
-    const maxWidthMm = Math.max(1, span.widthCanvas / pxPerMm)
     try {
       pdf.text(span.text, xMm, yBaselineMm, {
         renderingMode: 'invisible',
-        maxWidth: maxWidthMm,
       })
     } catch {
       // Best-effort: silently drop the offending span.
