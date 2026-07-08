@@ -790,6 +790,10 @@ interface TextSpan {
   /** Line height in canvas pixels — drives the vertical offset jsPDF
    *  uses for its text baseline. */
   heightCanvas: number
+  /** Skip charSpace stretch — set for inline code chips where the DOM
+   *  rect width would push charSpace above the pdftotext split
+   *  threshold and fragment the word into per-letter tokens. */
+  noStretch?: boolean
 }
 
 // Tags whose text content should NOT be paired with their own invisible
@@ -889,7 +893,7 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
   const containerLeft = container.getBoundingClientRect().left
   const spans: TextSpan[] = []
 
-  const emit = (text: string, rect: DOMRect) => {
+  const emit = (text: string, rect: DOMRect, noStretch = false) => {
     if (!text || rect.width <= 0 || rect.height <= 0) return
     spans.push({
       text,
@@ -897,6 +901,7 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       xCanvas: (rect.left - containerLeft) * scale,
       widthCanvas: rect.width * scale,
       heightCanvas: rect.height * scale,
+      noStretch,
     })
   }
 
@@ -909,6 +914,11 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
     if (SKIP_TEXT_OF.has(tag)) continue
     const isCodeLine = el.classList.contains('code-line')
     if (!TEXT_LEAVES.has(tag) && !isCodeLine) continue
+    // Skip Prism-syntax token spans INSIDE a code block — the enclosing
+    // .code-line already emitted the whole line as one span. Without
+    // this check every token gets a second per-word emit, causing
+    // pdftotext to see duplicated / fragmented content ("include: :").
+    if (!isCodeLine && el.closest('pre')) continue
 
     if (!isCodeLine) {
       let hasTextChild = false
@@ -922,12 +932,21 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       if (hasTextChild) continue
     }
 
-    // .code-line: emit one span per line at the element's bounding rect
-    // (each .code-line is already one visual line — no wrapping needed).
+    // .code-line: emit ONE span per whole line. Prism-syntax token spans
+    // become one continuous text run at the line's content rect. This
+    // way PDFKit / pdftotext reads "include: - project: ktzh..." as a
+    // single logical row instead of "include : - project : ktzh :" with
+    // spurious spaces before every ':' — copy-pastable as real code.
     if (isCodeLine) {
       const codeText = (el.textContent || '').replace(/\s+$/, '')
       if (!codeText) continue
-      const rect = el.getBoundingClientRect() as DOMRect
+      const codeRange = document.createRange()
+      codeRange.selectNodeContents(el)
+      const contentRects = Array.from(codeRange.getClientRects())
+        .filter(r => r.width > 0 && r.height > 0)
+      const rect = contentRects.length > 0
+        ? contentRects[0] as DOMRect
+        : el.getBoundingClientRect() as DOMRect
       emit(codeText, rect)
       continue
     }
@@ -982,8 +1001,15 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       )
     }
     for (const t of textNodes) {
+      // Chip text (inline <code> outside <pre>) uses monospace CSS which
+      // is much wider than DejaVuSans, so any charSpace stretch trips
+      // pdftotext's word-split heuristic. Mark such spans no-stretch —
+      // the invisible-text width will be narrower than the visible chip
+      // but selection at chip character positions still hits the bbox.
+      const parentEl = t.parentElement
+      const insideChip = parentEl?.closest('code') && !parentEl?.closest('pre')
       for (const piece of splitTextNodeByWords(t)) {
-        emit(piece.text, snapToLineRow(piece.rect))
+        emit(piece.text, snapToLineRow(piece.rect), Boolean(insideChip))
       }
     }
   }
@@ -1055,12 +1081,18 @@ function paintInvisibleTextLayer(
     // so pdftotext doesn't interpret the inter-glyph gap as a word
     // break ("J o b s" happens above ~0.3mm).
     let charSpaceMm = 0
-    if (span.text.length > 1) {
+    // Skip charSpace when the span is marked no-stretch (inline chip)
+    // or the required gap would exceed the pdftotext / PDFKit word-
+    // split threshold and fragment the word into per-letter tokens.
+    if (!span.noStretch && span.text.length >= 5) {
       const nativeWidthMm = pdf.getTextWidth(span.text)
       const targetWidthMm = Math.max(0, span.widthCanvas / pxPerMm)
       if (nativeWidthMm > 0 && targetWidthMm > 0) {
         const raw = (targetWidthMm - nativeWidthMm) / (span.text.length - 1)
-        charSpaceMm = Math.max(-0.3, Math.min(0.15, raw))
+        // Cap inter-char gap at ~5% of fontSize (measured in mm) —
+        // above this pdftotext starts treating gaps as word breaks.
+        const softCap = Math.min(0.2, (fontSizePt * 0.353) * 0.05)
+        charSpaceMm = Math.max(-0.3, Math.min(softCap, raw))
       }
     }
     try {
@@ -1255,6 +1287,28 @@ function collectBreakPointsAndForbidden(
     if (top <= 0 || bottom <= 0) return
     points.add(Math.round(top))
     forbiddenRanges.push([Math.round(top) + 1, Math.round(bottom) - 1])
+  })
+
+  // Whole-code-block keep-together: prefer moving the entire <pre> to
+  // the next page instead of splitting a small tail (e.g. lines 15-16
+  // stranded alone). Only applied when the block fits inside one page
+  // — larger blocks fall back to per-line splitting so we don't
+  // create tiny half-empty pages ahead of a giant block.
+  const CODE_KEEP_PADDING = 6
+  const pagePxForCode = Math.floor(PDF_CONTENT_HEIGHT * (96 / 25.4)) - 80
+  preview.querySelectorAll('pre').forEach(pre => {
+    const r = (pre as HTMLElement).getBoundingClientRect()
+    if (r.height <= 0) return
+    const top = r.top - containerTop
+    const bottom = r.bottom - containerTop
+    if (bottom <= 0) return
+    // Only keep-together if the block fits on one page.
+    if (r.height <= pagePxForCode) {
+      keepTogether.push([
+        Math.max(0, Math.round(top) - CODE_KEEP_PADDING),
+        Math.round(bottom) + CODE_KEEP_PADDING,
+      ])
+    }
   })
 
   // Image-aware breaks: collect top+bottom of every <img> / <picture> / <svg> /
