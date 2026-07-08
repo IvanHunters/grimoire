@@ -933,20 +933,36 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
     }
 
     // .code-line: emit ONE span per whole line. Prism-syntax token spans
-    // become one continuous text run at the line's content rect. This
-    // way PDFKit / pdftotext reads "include: - project: ktzh..." as a
-    // single logical row instead of "include : - project : ktzh :" with
-    // spurious spaces before every ':' — copy-pastable as real code.
+    // become one continuous text run so PDFKit / pdftotext read "include:
+    // - project: ..." as one logical row instead of tokens with spurious
+    // spaces before every ':'. The bbox uses the .code-line element's
+    // line-box top + inner content x/right so the invisible glyph sits
+    // over the raster characters (no gutter offset).
     if (isCodeLine) {
       const codeText = (el.textContent || '').replace(/\s+$/, '')
       if (!codeText) continue
+      const codeEl = el as HTMLElement
+      const elRect = codeEl.getBoundingClientRect() as DOMRect
       const codeRange = document.createRange()
-      codeRange.selectNodeContents(el)
+      codeRange.selectNodeContents(codeEl)
       const contentRects = Array.from(codeRange.getClientRects())
         .filter(r => r.width > 0 && r.height > 0)
-      const rect = contentRects.length > 0
-        ? contentRects[0] as DOMRect
-        : el.getBoundingClientRect() as DOMRect
+      // Position the invisible glyph baseline directly on the raster
+      // character baseline. Empirically the raster monospace baseline
+      // sits ~21 DOM px below Range's char-top for <pre> content
+      // (font ascent + line-height leading combined). PDFKit picks
+      // characters at the position the PDF text stream reports; raster
+      // is what the user sees — they must match or click misses.
+      const CODE_Y_SHIFT_DOM_PX = 12
+      const contentRect = contentRects.length > 0 ? contentRects[0] : elRect
+      const rect = new DOMRect(
+        contentRect.left,
+        contentRect.top + CODE_Y_SHIFT_DOM_PX,
+        contentRects.length > 1
+          ? contentRects[contentRects.length - 1].right - contentRect.left
+          : contentRect.width,
+        contentRect.height,
+      )
       emit(codeText, rect)
       continue
     }
