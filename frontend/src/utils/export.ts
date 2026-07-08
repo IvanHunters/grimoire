@@ -815,69 +815,57 @@ const TEXT_LEAVES: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Split a text node into per-visual-line pieces. Uses Range binary search
- * to find the character offset at which each line ends. Returns one entry
- * per rendered line with the substring plus the DOM rect it occupies.
+ * Split a text node into per-word pieces with each word's DOM rect.
+ * Emitting per-word (rather than per-line) invisible-text spans anchors
+ * each word's selection region at the exact position the raster draws
+ * it, so selection rectangles hit the correct word regardless of the
+ * font-metrics mismatch between the DOM font and the embedded Unicode
+ * font used by jsPDF.
  *
- * Why binary search: getClientRects() gives us how MANY lines exist and
- * where each line sits, but not which characters belong to each line.
- * A range [0..offset] whose bounding rect still starts at line i's top is
- * still on line i; the boundary offset where the top moves to line i+1's
- * y is the end of line i. Binary search over offset finds that boundary
- * in log(N) rect measurements per line — far cheaper than word-walking.
+ * Splits on runs of whitespace; each word's DOM rect comes from a Range
+ * covering exactly that word's character offsets. Words that wrap onto
+ * more than one line (rare — a single "word" spanning a soft-wrap only
+ * happens on very narrow columns) yield one span per line rect.
  */
-function splitTextNodeByLines(
+function splitTextNodeByWords(
   textNode: Text,
 ): Array<{ text: string; rect: DOMRect }> {
   const text = textNode.data
   const N = text.length
   if (N === 0) return []
-  const fullRange = document.createRange()
-  fullRange.selectNodeContents(textNode)
-  const lineRects = Array.from(fullRange.getClientRects()).filter(
-    r => r.width > 0 && r.height > 0,
-  )
-  if (lineRects.length <= 1) {
-    return lineRects.map(r => ({ text, rect: r as DOMRect }))
-  }
-
   const results: Array<{ text: string; rect: DOMRect }> = []
-  let lineStart = 0
   const scratch = document.createRange()
-  const Y_TOL = 1 // px tolerance for line-y comparison
-
-  for (let i = 0; i < lineRects.length - 1; i++) {
-    const currentTop = lineRects[i].top
-    // Binary-search the largest offset in (lineStart, N] such that
-    // range(lineStart..offset)'s bottom stays on the current line.
-    let lo = lineStart
-    let hi = N
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >> 1
-      scratch.setStart(textNode, lineStart)
-      scratch.setEnd(textNode, mid)
-      const r = scratch.getBoundingClientRect()
-      // A range that spans exactly the current line has top === currentTop.
-      // Adding one more character that wraps pushes top to a later line;
-      // top stays currentTop but bottom grows. So test bottom vs the NEXT
-      // line's top: if we've crossed into the next line, bottom > nextTop.
-      const nextTop = lineRects[i + 1].top
-      const stillOnLine = r.bottom <= nextTop + Y_TOL
-      if (stillOnLine) lo = mid
-      else hi = mid - 1
+  const wordRe = /\S+/g
+  let m: RegExpExecArray | null
+  while ((m = wordRe.exec(text)) !== null) {
+    const start = m.index
+    const end = start + m[0].length
+    scratch.setStart(textNode, start)
+    scratch.setEnd(textNode, end)
+    const rects = Array.from(scratch.getClientRects()).filter(
+      r => r.width > 0 && r.height > 0,
+    )
+    if (rects.length === 0) continue
+    if (rects.length === 1) {
+      results.push({ text: m[0], rect: rects[0] as DOMRect })
+      continue
     }
-    const lineEnd = lo
-    let lineText = text.slice(lineStart, lineEnd)
-    results.push({ text: lineText, rect: lineRects[i] as DOMRect })
-    // Skip whitespace between lines (soft-wrap eats trailing spaces).
-    lineStart = lineEnd
-    while (lineStart < N && /\s/.test(text[lineStart])) lineStart++
+    // Word wrapped: split the string proportionally by rect widths and
+    // assign each fragment its rect. Rare; a fallback for narrow columns.
+    const totalW = rects.reduce((s, r) => s + r.width, 0)
+    let charCursor = 0
+    for (let i = 0; i < rects.length; i++) {
+      const share = rects[i].width / totalW
+      const chars = i === rects.length - 1
+        ? m[0].length - charCursor
+        : Math.max(1, Math.round(m[0].length * share))
+      results.push({
+        text: m[0].slice(charCursor, charCursor + chars),
+        rect: rects[i] as DOMRect,
+      })
+      charCursor += chars
+    }
   }
-  // Remainder is the last line.
-  results.push({
-    text: text.slice(lineStart),
-    rect: lineRects[lineRects.length - 1] as DOMRect,
-  })
   return results
 }
 
@@ -951,7 +939,7 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       textNodes.push(t)
     }
     for (const t of textNodes) {
-      for (const piece of splitTextNodeByLines(t)) {
+      for (const piece of splitTextNodeByWords(t)) {
         emit(piece.text, piece.rect)
       }
     }
@@ -1020,10 +1008,29 @@ function paintInvisibleTextLayer(
     const fontSizePt = (lineMm / LINE_HEIGHT_MULTIPLIER) / MM_PER_PT
     pdf.setFontSize(Math.max(4, Math.min(72, fontSizePt)))
     const yBaselineMm = PDF_MARGIN_TOP + yMmFromSliceTop + lineMm * BASELINE_RATIO
+    // Match the invisible text's width to the DOM rect by adjusting font
+    // size — a per-word scale keeps character advances internally
+    // consistent (no fake gaps between glyphs that pdftotext would
+    // interpret as word breaks). Cap at ±30% to avoid unreadable text
+    // shapes on outliers (e.g. a code-chip where CSS padding pads the
+    // rect much wider than the raw character run).
+    const targetWidthMm = Math.max(0, span.widthCanvas / pxPerMm)
+    let effectiveFontSizePt = fontSizePt
+    if (span.text.length > 0 && targetWidthMm > 0) {
+      const nativeWidthMm = pdf.getTextWidth(span.text)
+      if (nativeWidthMm > 0) {
+        const scale = Math.max(0.7, Math.min(1.3, targetWidthMm / nativeWidthMm))
+        effectiveFontSizePt = fontSizePt * scale
+        pdf.setFontSize(Math.max(4, Math.min(72, effectiveFontSizePt)))
+      }
+    }
     try {
+      const dbg = (typeof window !== 'undefined' && (window as unknown as { __pdfDebugVisibleText?: boolean }).__pdfDebugVisibleText)
+      if (dbg) pdf.setTextColor(255, 0, 0)
       pdf.text(span.text, xMm, yBaselineMm, {
-        renderingMode: 'invisible',
+        renderingMode: dbg ? 'fill' : 'invisible',
       })
+      if (dbg) pdf.setTextColor(0, 0, 0)
     } catch {
       // Best-effort: silently drop the offending span.
     }
