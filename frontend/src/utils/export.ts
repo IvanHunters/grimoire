@@ -14,7 +14,15 @@ const PDF_MARGIN_LEFT = 15
 const PDF_MARGIN_RIGHT = 15
 const PDF_CONTENT_WIDTH = PDF_PAGE_WIDTH - PDF_MARGIN_LEFT - PDF_MARGIN_RIGHT
 const PDF_CONTENT_HEIGHT = PDF_PAGE_HEIGHT - PDF_MARGIN_TOP - PDF_MARGIN_BOTTOM
-const PDF_RENDER_SCALE = 2
+// Render pixel ratio for html-to-image. Fixed at 1 so the raster
+// canvas dimensions equal the container DOM dimensions exactly —
+// no clamping, no silent non-uniform downscale. Slice break-points
+// projected from DOM y (× 1 = same value) land at the exact raster
+// row, eliminating the mid-line/mid-heading bleed that appeared with
+// pixelRatio=2 when total content > 8192 DOM px triggered the
+// 16384-canvas cap. Trade-off: images at ~96dpi instead of ~192dpi;
+// still perfectly readable on paper and screen, and PDFs shrink ~50%.
+const PDF_RENDER_SCALE = 1
 // Container width matches content area proportionally
 const PDF_CONTAINER_WIDTH = Math.round(PDF_CONTENT_WIDTH * (96 / 25.4)) // mm to px at 96dpi
 
@@ -46,20 +54,24 @@ const PDF_OVERRIDE_CSS = `
     padding-left: 3.5em !important;
     text-indent: -3.5em !important;
   }
-  /* CRITICAL: image cap forced via !important. Without this an image
-     taller than one PDF page slices mid-pixel. We deliberately use
-     "max-height" (not "height") so portrait aspect ratio is preserved:
-     image scales down proportionally to fit. The 918px ceiling is
-     PDF_CONTENT_HEIGHT*96/25.4 minus 80px margin for surrounding <p>
-     paragraph margins + line-height. */
+  /* Image cap. Constraints:
+     - Never taller than a page (918px = PDF_CONTENT_HEIGHT@96dpi - 80px
+       wrapper margins) → forbids mid-image slice.
+     - Never taller than ~55% of a page (500px) → allows 2 screenshots
+       + surrounding text on a single page. Without this cap every full-
+       page screenshot forces "1 image per page" which leaves half-empty
+       pages when 2 come in sequence (typical for step-by-step docs).
+     Aspect ratio preserved via object-fit:contain + max-width:100%. */
   .markdown-preview img,
   .markdown-preview picture,
   .markdown-preview svg {
-    max-height: 918px !important;
+    max-height: 500px !important;
     height: auto !important;
     max-width: 100% !important;
     object-fit: contain !important;
     display: block !important;
+    margin-left: auto !important;
+    margin-right: auto !important;
   }
   /* Tighten wrapping <p> so the forbidden-zone math (which assumes
      image height + ~50px wrapper) doesn't underflow. */
@@ -155,8 +167,16 @@ const PDF_OVERRIDE_CSS = `
  * coordinates (PDF_CONTENT_HEIGHT mm @ 96dpi minus a safety margin for
  * surrounding <p> margins + line-height).
  */
+// IMAGE_MAX_PX: hard ceiling on rendered image height in container pixels.
+// Kept in sync with PDF_OVERRIDE_CSS `max-height` rule for images. A cap
+// well below full page height (~1000px content area) is deliberate — it
+// prevents one screenshot from monopolising a page and lets 2 sequential
+// images share a page with surrounding paragraphs.
+const IMAGE_MAX_PX = 500
+
 function clampImagesToFitPage(container: HTMLElement): void {
   const pageContentPx = Math.floor(PDF_CONTENT_HEIGHT * (96 / 25.4)) - 80
+  const maxHeightPx = Math.min(pageContentPx, IMAGE_MAX_PX)
   const maxWidthPx = container.clientWidth || PDF_CONTAINER_WIDTH
   container.querySelectorAll('img').forEach(node => {
     const el = node as HTMLImageElement
@@ -166,8 +186,8 @@ function clampImagesToFitPage(container: HTMLElement): void {
     const aspect = natW / natH
     let w = Math.min(maxWidthPx, natW)
     let h = w / aspect
-    if (h > pageContentPx) {
-      h = pageContentPx
+    if (h > maxHeightPx) {
+      h = maxHeightPx
       w = h * aspect
     }
     // Round down to avoid sub-pixel rounding pushing past the cap.
@@ -178,6 +198,10 @@ function clampImagesToFitPage(container: HTMLElement): void {
     el.style.maxWidth = w + 'px'
     el.style.maxHeight = h + 'px'
     el.style.display = 'block'
+    // Center the image horizontally — a screenshot cropped narrower than
+    // page width looks lop-sided flush-left.
+    el.style.marginLeft = 'auto'
+    el.style.marginRight = 'auto'
     // Tighten wrapping <p> so wrapper margins don't push the block past
     // pageContentPx and trigger the slicer's mid-image cut.
     const parent = el.parentElement
@@ -263,9 +287,10 @@ async function buildPDFContainer(note: Note, previewElement: HTMLElement): Promi
   // wrapping affordances the block fits in one page slice — leaving the
   // forbidden-zone snap as a safety net for any edge case the math misses.
   const pageContentPx = Math.floor(PDF_CONTENT_HEIGHT * (96 / 25.4)) - 80
+  const imgMaxPx = Math.min(pageContentPx, IMAGE_MAX_PX)
   clone.querySelectorAll('img, picture, svg').forEach(node => {
     const el = node as HTMLElement
-    el.style.maxHeight = pageContentPx + 'px'
+    el.style.maxHeight = imgMaxPx + 'px'
     el.style.height = 'auto'
     el.style.objectFit = 'contain'
     el.style.display = 'block'
@@ -924,9 +949,7 @@ function collectBreakPointsAndForbidden(
     // Skip if this element lives inside a table — see comment above.
     if (el.closest('table')) return
     const rect = el.getBoundingClientRect()
-    // Skip single-line elements — their top is already added by the
-    // outer-children loop, no sub-breaks needed.
-    if (rect.height < LINE_HEIGHT_PX * 2) return
+    if (rect.height <= 0) return
     const range = document.createRange()
     try {
       range.selectNodeContents(el)
@@ -937,7 +960,16 @@ function collectBreakPointsAndForbidden(
     for (const r of Array.from(lineRects)) {
       if (r.height <= 0) continue
       const top = r.top - containerTop
+      const bottom = r.bottom - containerTop
       if (top > 0) points.add(Math.round(top))
+      // Forbidden range covering each visual line's interior. Without
+      // this, the slicer can pick a candidate NEAR (but not AT) a line
+      // top and slice halfway through the text — visible as glyphs cut
+      // horizontally at page boundaries. Snapping any interior cut to
+      // line-top keeps every visual line whole.
+      if (top > 0 && bottom > top + 2) {
+        forbiddenRanges.push([Math.round(top) + 1, Math.round(bottom) - 1])
+      }
     }
   })
 
@@ -968,6 +1000,57 @@ function collectBreakPointsAndForbidden(
     if (top <= 0 || bottom <= 0) return
     keepTogether.push([Math.round(top), Math.round(bottom)])
   })
+
+  // Keep-together: multi-line <li> and <p> elements. Both often mix
+  // inline <code> chips with regular text; Range.getClientRects splits
+  // its output at chip boundaries rather than at visual-line ends, so
+  // our per-line forbidden ranges don't reliably cover a wrapping
+  // block's last visual line — the slicer then cuts the line mid-height.
+  // Marking the whole element as keep-together lets the slicer defer it
+  // to the next page cleanly. Single-line elements are skipped to avoid
+  // page-count explosion from tiny defer-cascades on lists of one-liners.
+  preview.querySelectorAll('li, p').forEach(el => {
+    const r = (el as HTMLElement).getBoundingClientRect()
+    if (r.height <= 0) return
+    const top = r.top - containerTop
+    const bottom = r.bottom - containerTop
+    if (top <= 0 || bottom <= 0) return
+    keepTogether.push([Math.round(top), Math.round(bottom)])
+  })
+
+  // Keep-together: every heading paired with the block IMMEDIATELY
+  // following it (usually the section's intro paragraph or the first
+  // screenshot). Otherwise the slicer happily leaves a section title
+  // alone at the bottom of a page, orphaned from its own content, which
+  // reads as a rip. The pair only gets deferred to the next page when
+  // it actually fits there (keep-together snap in computePageSlices
+  // guards against oversized pairs).
+  const previewChildren = Array.from(preview.children) as HTMLElement[]
+  for (let i = 0; i < previewChildren.length; i++) {
+    const c = previewChildren[i]
+    if (!/^h[1-6]$/i.test(c.tagName)) continue
+    // Find next non-heading sibling — chained headings (h2 immediately
+    // followed by h3) are collapsed together with whatever content
+    // eventually follows the LAST heading in the chain.
+    let j = i + 1
+    while (j < previewChildren.length && /^h[1-6]$/i.test(previewChildren[j].tagName)) j++
+    if (j >= previewChildren.length) break
+    const startEl = c.getBoundingClientRect()
+    const endEl = previewChildren[j].getBoundingClientRect()
+    if (startEl.height <= 0 || endEl.height <= 0) continue
+    const top = Math.round(startEl.top - containerTop)
+    const bottom = Math.round(endEl.bottom - containerTop)
+    if (top <= 0 || bottom <= 0) continue
+    // Push ktTop up by an extra margin so the keep-together defer
+    // triggers before the raster actually positions the heading. The
+    // rasteriser (html-to-image via SVG foreignObject) sometimes
+    // places heading glyphs 15-30 canvas px above where
+    // getBoundingClientRect reports the border-box top — a slice
+    // ending exactly at the reported top still bleeds a heading strip
+    // onto the previous page.
+    const HEADING_BOUNDARY_MARGIN = 25
+    keepTogether.push([Math.max(0, top - HEADING_BOUNDARY_MARGIN), bottom])
+  }
 
   // Inline code chips (<code> NOT inside <pre>): rendered as boxes with
   // a tinted background. If a page break lands inside a chip's vertical
@@ -1003,10 +1086,20 @@ function collectBreakPointsAndForbidden(
   })
 
   // Image-aware breaks: collect top+bottom of every <img> / <picture> / <svg> /
-  // .mermaid as both BREAK candidates (so the slicer prefers them over
-  // mid-image cuts) AND FORBIDDEN ranges (so a break inside the image is
-  // snapped to image-top). Without forbidden ranges, an image taller than the
-  // remaining page space could still get cut mid-pixel.
+  // .mermaid as break candidates AND forbidden ranges AND keep-together.
+  //
+  // The cushion here is critical. html-to-image renders the DOM via
+  // <foreignObject> and rasterises the resulting SVG. The rasteriser's
+  // internal layout does NOT exactly agree with our getBoundingClientRect
+  // measurements — empirically image tops in the produced canvas can sit
+  // 20-40 DOM px above where getBoundingClientRect reported them. When
+  // the slicer ends a slice EXACTLY at DOM measurement's image_top, the
+  // rasterised image actually starts ~30 canvas px earlier and a strip
+  // bleeds onto the previous page. IMAGE_BOUNDARY_PADDING adds a safety
+  // cushion above/below the image so keep-together snap always moves
+  // any break at least this much earlier, well outside the raster's
+  // actual image bounding box.
+  const IMAGE_BOUNDARY_PADDING = 12
   const imageNodes = preview.querySelectorAll('img, picture, svg, .mermaid-wrapper')
   imageNodes.forEach(node => {
     const el = node as HTMLElement
@@ -1016,9 +1109,22 @@ function collectBreakPointsAndForbidden(
     const bottom = r.bottom - containerTop
     if (top > 0) points.add(Math.round(top))
     if (bottom > 0) points.add(Math.round(bottom))
-    // Forbidden zone: avoid cutting inside the image (small epsilon at edges
-    // so adjacent break candidates at the exact boundary still match).
-    forbiddenRanges.push([Math.round(top) + 1, Math.round(bottom) - 1])
+    // Forbidden zone: avoid cutting inside the image (widened by the
+    // same padding — a stray candidate near the boundary should snap
+    // to the range's top, not fall through).
+    forbiddenRanges.push([
+      Math.max(0, Math.round(top) - IMAGE_BOUNDARY_PADDING),
+      Math.round(bottom) + IMAGE_BOUNDARY_PADDING,
+    ])
+    // Keep-together: extend by cushion above/below so slice boundaries
+    // within the padding zone still trigger the deferral snap. Any
+    // bestBreak within [top - PADDING, bottom + PADDING] gets pulled
+    // to top - PADDING → guarantees image entirely on next page with
+    // whitespace buffer.
+    keepTogether.push([
+      Math.max(0, Math.round(top) - IMAGE_BOUNDARY_PADDING),
+      Math.round(bottom) + IMAGE_BOUNDARY_PADDING,
+    ])
   })
 
   const children = preview.children
@@ -1131,6 +1237,26 @@ function forbiddenContainingTop(
  * candidate that lands inside them — the candidate snaps to the range's top
  * instead.
  */
+// Snaps a keep-together block by finding the last valid break candidate
+// AT OR BEFORE the block's top. That value is a real element boundary
+// (paragraph bottom, image top, table row edge, etc.), so the slice
+// never ends INSIDE a preceding element the way a fixed cushion would
+// (fixed cushion = ktTop - N cuts through a paragraph that lives in
+// the ktTop - N region).
+function safeSnapTarget(
+  ktTop: number,
+  currentStart: number,
+  breakPoints: number[],
+): number | null {
+  let best: number | null = null
+  for (const bp of breakPoints) {
+    if (bp > currentStart && bp <= ktTop) {
+      if (best === null || bp > best) best = bp
+    }
+  }
+  return best
+}
+
 function computePageSlices(
   breakPoints: number[],
   pageHeightPx: number,
@@ -1164,26 +1290,48 @@ function computePageSlices(
       bestBreak = idealEnd
     }
 
-    // If our chosen break lands INSIDE a forbidden image range, snap to the
-    // image's top. This leaves the image entirely on the NEXT page (where it
-    // either fits or gets handled as a full-page element on its own).
+    // If our chosen break lands INSIDE a forbidden range, snap to the
+    // range's top. A small cushion above the top is applied so raster
+    // sub-pixel bleed at the boundary doesn't leak a strip of the
+    // element onto the previous page. Cushion is small enough (5 canvas
+    // px ≈ 3 DOM px) that it doesn't waste noticeable space.
+    const FORBIDDEN_SNAP_CUSHION = 3 // canvas px (small, avoids page-count explosion)
     const snapTop = forbiddenContainingTop(bestBreak, forbiddenRanges)
-    if (snapTop !== null && snapTop > currentStart) {
-      bestBreak = snapTop
+    if (snapTop !== null && snapTop - FORBIDDEN_SNAP_CUSHION > currentStart) {
+      bestBreak = snapTop - FORBIDDEN_SNAP_CUSHION
     }
 
     // Keep-together pass: if our chosen break would split a "keep-together"
-    // block (typically a table) that DOES fit on a single page, defer the
-    // whole block to the next page by snapping bestBreak up to the block's
-    // top. Blocks larger than a page are left alone — the row-level
-    // breakpoints handle those.
+    // block (typically a table, image, or heading + next-block pair)
+    // that DOES fit on a single page, defer the whole block to the next
+    // page. The snap target is `ktTop - SLICE_END_CUSHION` (not just ktTop)
+    // because html-to-image's rasteriser positions elements slightly ABOVE
+    // where getBoundingClientRect claims — a slice ending exactly at
+    // ktTop still bleeds a strip of the block's top onto the previous
+    // page. The cushion pulls the slice end well clear of the raster's
+    // actual block-top row.
+    //
+    // The check also matches when bestBreak equals ktTop exactly (not
+    // just strictly greater), for the same reason: the boundary itself
+    // is unsafe due to the raster offset.
+    const MIN_MEANINGFUL_SLICE = 60
     for (const [ktTop, ktBottom] of keepTogether) {
-      if (ktTop > currentStart && ktBottom > bestBreak && bestBreak > ktTop) {
-        const blockHeight = ktBottom - ktTop
-        if (blockHeight <= pageHeightPx) {
-          bestBreak = ktTop
-        }
-      }
+      if (ktTop <= currentStart) continue
+      if (ktTop - currentStart < MIN_MEANINGFUL_SLICE) continue
+      if (ktBottom <= bestBreak) continue
+      if (bestBreak <= ktTop) continue
+      const blockHeight = ktBottom - ktTop
+      if (blockHeight > pageHeightPx) continue
+      // Snap to the LAST valid break candidate at or before ktTop.
+      // Using an actual candidate (a paragraph bottom, image top,
+      // etc.) guarantees the slice ends on an element boundary — no
+      // risk of a fixed cushion cutting through the element that
+      // immediately precedes the keep-together block. Fallback to
+      // ktTop - 3 (tiny buffer for sub-pixel raster boundary) if no
+      // candidate is available in the range.
+      let target = safeSnapTarget(ktTop, currentStart, breakPoints)
+      if (target === null) target = ktTop - 3
+      if (target > currentStart && target < bestBreak) bestBreak = target
     }
 
     slices.push({ startY: currentStart, endY: bestBreak })
