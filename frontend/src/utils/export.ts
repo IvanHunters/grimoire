@@ -22,9 +22,52 @@ const PDF_CONTENT_HEIGHT = PDF_PAGE_HEIGHT - PDF_MARGIN_TOP - PDF_MARGIN_BOTTOM
 // pixelRatio=2 when total content > 8192 DOM px triggered the
 // 16384-canvas cap. Trade-off: images at ~96dpi instead of ~192dpi;
 // still perfectly readable on paper and screen, and PDFs shrink ~50%.
-const PDF_RENDER_SCALE = 1
+const PDF_RENDER_SCALE = 2
 // Container width matches content area proportionally
 const PDF_CONTAINER_WIDTH = Math.round(PDF_CONTENT_WIDTH * (96 / 25.4)) // mm to px at 96dpi
+
+// Unicode font for the invisible text layer. jsPDF's default fonts
+// (Helvetica/Times/Courier) are limited to WinAnsi encoding — cyrillic
+// codepoints get replaced with garbage bytes, so pdftotext + OCR
+// selection produce unreadable output. DejaVuSans is a free Unicode
+// font with full cyrillic (and most European scripts) that we serve
+// as a static asset. It's fetched once per session and reused across
+// all subsequent PDF exports.
+const UNICODE_FONT_ID = 'DejaVuSans'
+const UNICODE_FONT_URL = '/fonts/DejaVuSans.ttf'
+let cachedFontBase64: string | null = null
+
+async function loadUnicodeFontBase64(): Promise<string | null> {
+  if (cachedFontBase64) return cachedFontBase64
+  try {
+    const res = await fetch(UNICODE_FONT_URL)
+    if (!res.ok) return null
+    const buf = await res.arrayBuffer()
+    const u8 = new Uint8Array(buf)
+    let bin = ''
+    const CHUNK = 8192
+    for (let i = 0; i < u8.length; i += CHUNK) {
+      bin += String.fromCharCode.apply(null, Array.from(u8.subarray(i, i + CHUNK)))
+    }
+    cachedFontBase64 = btoa(bin)
+    return cachedFontBase64
+  } catch {
+    return null
+  }
+}
+
+async function registerUnicodeFont(pdf: jsPDF): Promise<void> {
+  const b64 = await loadUnicodeFontBase64()
+  if (!b64) return
+  try {
+    pdf.addFileToVFS(`${UNICODE_FONT_ID}.ttf`, b64)
+    pdf.addFont(`${UNICODE_FONT_ID}.ttf`, UNICODE_FONT_ID, 'normal')
+  } catch {
+    // If registration fails, we fall back to the default font at
+    // paintInvisibleTextLayer time — cyrillic won't be searchable but
+    // rendering doesn't crash.
+  }
+}
 
 /**
  * Export note to PDF with smart page breaks
@@ -425,6 +468,7 @@ export async function exportToPDF(note: Note, previewElement: HTMLElement): Prom
     // addPage() per output page so each page has its own explicit orientation,
     // then drop the blank page 1 at the end.
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' })
+    await registerUnicodeFont(pdf)
     let pageCount = 0
 
     for (const segment of segments) {
@@ -602,14 +646,24 @@ function addFooters(pdf: jsPDF, note: Note, totalPages: number): void {
   pdf.setTextColor(160, 160, 160)
   for (let i = 1; i <= totalPages; i++) {
     pdf.setPage(i)
-    const isLandscape = pdf.getPageWidth() > pdf.getPageHeight()
     const pageW = pdf.getPageWidth()
     const pageH = pdf.getPageHeight()
     const footerY = pageH - 8
-    const leftX = isLandscape ? PDF_MARGIN_LEFT : PDF_MARGIN_LEFT
+    const leftX = PDF_MARGIN_LEFT
     const rightX = pageW - PDF_MARGIN_RIGHT
-    pdf.text(note.path, leftX, footerY)
-    pdf.text(`${i} / ${totalPages}`, pageW / 2, footerY, { align: 'center' })
+    const centerX = pageW / 2
+    const pageLabel = `${i} / ${totalPages}`
+    // Ellipsize path if it would collide with centered page number.
+    // Center label width ≈ 4mm each side at 8pt; give path a hard budget
+    // of (leftX ... centerX - 8mm) minus a 3mm safety gap.
+    const pathMaxMm = Math.max(20, centerX - leftX - 12)
+    let pathText = note.path
+    while (pathText.length > 8 && pdf.getTextWidth(pathText) > pathMaxMm) {
+      pathText = pathText.slice(0, -2)
+    }
+    if (pathText !== note.path) pathText = pathText + '…'
+    pdf.text(pathText, leftX, footerY)
+    pdf.text(pageLabel, centerX, footerY, { align: 'center' })
     pdf.text(exportDate, rightX, footerY, { align: 'right' })
   }
 }
@@ -876,7 +930,17 @@ function paintInvisibleTextLayer(
 ): void {
   const prevTextColor = pdf.getTextColor()
   const prevFontSize = pdf.getFontSize()
+  const prevFont = pdf.getFont()
   pdf.setTextColor(0, 0, 0)
+  // Switch to the embedded Unicode font so cyrillic (and any non-WinAnsi
+  // script) is encoded correctly in the PDF text stream. If registration
+  // failed at export-open time the font list won't contain UNICODE_FONT_ID
+  // and setFont throws — fall back to whatever font was active.
+  const fontList = pdf.getFontList() as Record<string, unknown>
+  const hasUnicode = Object.prototype.hasOwnProperty.call(fontList, UNICODE_FONT_ID)
+  if (hasUnicode) {
+    try { pdf.setFont(UNICODE_FONT_ID, 'normal') } catch { /* noop */ }
+  }
 
   const MM_PER_PT = 0.3527777
   const LINE_HEIGHT_MULTIPLIER = 1.2
@@ -899,13 +963,15 @@ function paintInvisibleTextLayer(
         maxWidth: maxWidthMm,
       })
     } catch {
-      // jsPDF can choke on certain glyphs (cyrillic in default font).
-      // Best-effort: silently drop that span.
+      // Best-effort: silently drop the offending span.
     }
   }
 
   pdf.setTextColor(prevTextColor)
   pdf.setFontSize(prevFontSize)
+  if (prevFont && prevFont.fontName) {
+    try { pdf.setFont(prevFont.fontName, prevFont.fontStyle || 'normal') } catch { /* noop */ }
+  }
 }
 
 function collectBreakPointsAndForbidden(
