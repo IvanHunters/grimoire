@@ -1031,14 +1031,13 @@ function paintInvisibleTextLayer(
   }
 
   const MM_PER_PT = 0.3527777
-  // Line-height multiplier: Range.getClientRects returns the CSS line
-  // box (line-height ≈ 1.5 em for prose). fontSize = height / 1.5 gives
-  // the em size the DOM used.
-  const LINE_HEIGHT_MULTIPLIER = 1.5
-  // Baseline y from line-box top. For CSS line-height 1.5 with a font
-  // of ascent ≈ 0.75 em: baseline sits at ((1.5-1)*0.5 + 0.75) em from
-  // top = 1 em from top = 1/1.5 of the line box height = 0.667.
-  const BASELINE_RATIO = 0.667
+  // Calibrated so DejaVuSans invisible glyphs match raster ink height
+  // AND per-char advance width. Multiplier 1.65 sets fontSize ≈ 0.91×
+  // raster em, compensating for DejaVuSans being ~10% wider than the
+  // DOM's Segoe UI/apple-system for cyrillic runs. Baseline 0.65 puts
+  // glyph_top just at raster char_top so highlight boxes hug ink.
+  const LINE_HEIGHT_MULTIPLIER = 1.65
+  const BASELINE_RATIO = 0.65
 
   for (const span of spans) {
     if (span.yCanvas < startCanvasY || span.yCanvas >= endCanvasY) continue
