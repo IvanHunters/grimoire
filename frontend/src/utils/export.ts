@@ -794,6 +794,11 @@ interface TextSpan {
    *  rect width would push charSpace above the pdftotext split
    *  threshold and fragment the word into per-letter tokens. */
   noStretch?: boolean
+  /** Force wide charSpace to match the DOM's monospace layout — set
+   *  for code-block lines where DejaVuSans is ~⅓ the width of the
+   *  monospace font and clicks past the natural glyph run miss the
+   *  invisible line entirely. */
+  monospaceStretch?: boolean
 }
 
 // Tags whose text content should NOT be paired with their own invisible
@@ -842,11 +847,14 @@ function splitTextNodeByWords(
   if (N === 0) return []
   const results: Array<{ text: string; rect: DOMRect }> = []
   const scratch = document.createRange()
-  const wordRe = /\S+/g
+  // Match BOTH word runs AND whitespace runs — emitting inter-word
+  // spaces as invisible-text spans fills the horizontal gaps between
+  // words in the selection highlight (Preview.app / pdf.js draw the
+  // highlight as text-object bboxes; without spaces there's a visible
+  // hairline gap between every word).
+  const wordRe = /\S+|\s+/g
   const applyHint = (r: DOMRect): DOMRect => {
     if (!lineHeightHint || lineHeightHint <= r.height) return r
-    // Extend rect downward (keep top the same, grow height) so the
-    // baseline computation lands at the ambient line's baseline.
     return new DOMRect(r.x, r.y, r.width, lineHeightHint)
   }
   let m: RegExpExecArray | null
@@ -893,7 +901,7 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
   const containerLeft = container.getBoundingClientRect().left
   const spans: TextSpan[] = []
 
-  const emit = (text: string, rect: DOMRect, noStretch = false) => {
+  const emit = (text: string, rect: DOMRect, opts: { noStretch?: boolean; monospaceStretch?: boolean } = {}) => {
     if (!text || rect.width <= 0 || rect.height <= 0) return
     spans.push({
       text,
@@ -901,7 +909,8 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       xCanvas: (rect.left - containerLeft) * scale,
       widthCanvas: rect.width * scale,
       heightCanvas: rect.height * scale,
-      noStretch,
+      noStretch: opts.noStretch,
+      monospaceStretch: opts.monospaceStretch,
     })
   }
 
@@ -1025,7 +1034,7 @@ function collectTextSpans(preview: HTMLElement, container: HTMLElement, scale: n
       const parentEl = t.parentElement
       const insideChip = parentEl?.closest('code') && !parentEl?.closest('pre')
       for (const piece of splitTextNodeByWords(t)) {
-        emit(piece.text, snapToLineRow(piece.rect), Boolean(insideChip))
+        emit(piece.text, snapToLineRow(piece.rect), { noStretch: Boolean(insideChip) })
       }
     }
   }
@@ -1097,16 +1106,11 @@ function paintInvisibleTextLayer(
     // so pdftotext doesn't interpret the inter-glyph gap as a word
     // break ("J o b s" happens above ~0.3mm).
     let charSpaceMm = 0
-    // Skip charSpace when the span is marked no-stretch (inline chip)
-    // or the required gap would exceed the pdftotext / PDFKit word-
-    // split threshold and fragment the word into per-letter tokens.
     if (!span.noStretch && span.text.length >= 5) {
       const nativeWidthMm = pdf.getTextWidth(span.text)
       const targetWidthMm = Math.max(0, span.widthCanvas / pxPerMm)
       if (nativeWidthMm > 0 && targetWidthMm > 0) {
         const raw = (targetWidthMm - nativeWidthMm) / (span.text.length - 1)
-        // Cap inter-char gap at ~5% of fontSize (measured in mm) —
-        // above this pdftotext starts treating gaps as word breaks.
         const softCap = Math.min(0.2, (fontSizePt * 0.353) * 0.05)
         charSpaceMm = Math.max(-0.3, Math.min(softCap, raw))
       }
