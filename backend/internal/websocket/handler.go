@@ -104,6 +104,60 @@ func resumeCwdFromDaemonRoster(sessionUUID string) string {
 	return ""
 }
 
+// resumeSessionLookup is the slice of SessionManager that
+// resolveResumeTarget needs. Kept as an interface so the resolution
+// logic is unit-testable without a live manager.
+type resumeSessionLookup interface {
+	Get(sessionID string) (*claude.ClaudeSession, error)
+}
+
+// resolveResumeTarget maps a resume/fork id to an actual on-disk
+// transcript UUID and a best-known cwd. The id handed in by the WS
+// "init" message is frequently a grimoire id (global-*, note-*,
+// note-task-*) rather than the daemon-assigned UUID the transcript is
+// named after, so a naive discovery.SessionPath(id) misses and forking
+// such a session used to hang on "Historical session not found".
+//
+// Returns:
+//   - uuid: an id that DOES have a transcript on disk, or "" when none
+//     exists anywhere (caller must then downgrade to a fresh spawn).
+//   - cwd: the working directory to spawn in, resolved even when the
+//     transcript itself is gone, so a downgraded fresh spawn still lands
+//     in the right place.
+//
+// Mirrors the multi-step lookup handleRestartSession already does.
+func resolveResumeTarget(resumeID string, lookup resumeSessionLookup) (uuid string, cwd string) {
+	// 1. resumeID already names a transcript (it's a raw UUID).
+	if _, err := discovery.SessionPath(resumeID); err == nil {
+		uuid = resumeID
+	}
+	// 2. Manager maps this grimoire id -> daemon UUID (+ remembers cwd).
+	if lookup != nil {
+		if sess, err := lookup.Get(resumeID); err == nil && sess != nil {
+			if cwd == "" {
+				cwd = sess.WorkingDir
+			}
+			if uuid == "" && sess.DaemonUUID != "" {
+				if _, err := discovery.SessionPath(sess.DaemonUUID); err == nil {
+					uuid = sess.DaemonUUID
+				}
+			}
+		}
+	}
+	// 3. Daemon roster still remembers the cwd of a live worker even when
+	//    the transcript header is unreadable or the file is gone.
+	if cwd == "" {
+		cwd = resumeCwdFromDaemonRoster(resumeID)
+	}
+	// 4. Last resort: newest transcript in that cwd's project dir.
+	if uuid == "" && cwd != "" {
+		if u, _ := discovery.NewestJSONLInCwd(cwd); u != "" {
+			uuid = u
+		}
+	}
+	return uuid, cwd
+}
+
 // wsWriter serializes concurrent WebSocket writes.
 // gorilla/websocket allows one concurrent writer — without this, streamPTYOutput
 // and handleEvents racing on the same conn cause random connection closes.
@@ -284,17 +338,44 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 	if msg.AttachToSessionID != "" {
 		// Cwd comes from the daemon record; no lookup needed.
 	} else if msg.ResumeFromSessionID != "" {
+		// The resume/fork id is often a grimoire id (global-*, note-*)
+		// rather than the daemon-assigned UUID the transcript is named
+		// after. Resolve it before looking on disk, the same way restart
+		// does, so forking a global-*/note-* session no longer hangs on
+		// "Historical session not found".
+		resolvedUUID, resolvedCwd := resolveResumeTarget(msg.ResumeFromSessionID, h.manager)
+		if resolvedUUID != "" && resolvedUUID != msg.ResumeFromSessionID {
+			h.logger.Info("resume target resolved grimoire id to transcript UUID",
+				slog.String("resume_from", msg.ResumeFromSessionID),
+				slog.String("resolved_uuid", resolvedUUID),
+			)
+			msg.ResumeFromSessionID = resolvedUUID
+		}
+
 		path, lookupErr := discovery.SessionPath(msg.ResumeFromSessionID)
 		if lookupErr != nil {
-			h.logger.Error("resume target not found",
+			// No transcript exists for this session anywhere under
+			// ~/.claude/projects (e.g. the main <uuid>.jsonl was never
+			// flushed or got rotated away, leaving only the
+			// subagents/tool-results sidecar dir). A fork has nothing to
+			// --resume from. Rather than strand the tab on an error that
+			// renders as an endless "loading" spinner, downgrade to a
+			// fresh spawn in the best-known cwd so it at least boots.
+			h.logger.Warn("resume target not found on disk, downgrading to fresh spawn",
 				slog.String("resume_from", msg.ResumeFromSessionID),
 				slog.Any("error", lookupErr),
 			)
-			conn.WriteJSON(WSResponse{
-				Type:  "error",
-				Error: "Historical session not found on disk",
-			})
-			return
+			workingDir = resolvedCwd
+			if workingDir == "" {
+				if wd, ddErr := claude.DetermineWorkingDir(msg.CurrentNote, folderProjectPath, msg.SessionID); ddErr == nil {
+					workingDir = wd
+				}
+			}
+			msg.ResumeFromSessionID = ""
+			msg.ResumeFork = false
+			// Skip the transcript-header resolution below — there is no
+			// transcript. Fall through to the fresh-spawn switch branch.
+			goto resumeResolved
 		}
 		header, hdrErr := discovery.ReadHeader(path)
 		workingDir = header.Cwd
@@ -362,6 +443,7 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 		}
 	}
 
+resumeResolved:
 	// Determine session name from current note or task.
 	// Only apply the note's title to genuinely note-bound sessions
 	// (sessionId starting with "note-"). For global-* tabs, daemon
