@@ -289,6 +289,15 @@ function ChatPanel({
           evicted: `${j.tool_results_evicted}/${j.tool_results}`,
           archive: j.archive_path, ledger: j.ledger_path,
         })
+        // Visible result — without this the user can't tell whether
+        // Compact did anything, which read as "compact doesn't work"
+        // (it was a silent no-op on already-compacted sessions).
+        const mb = (b: number) => `${(b / 1e6).toFixed(2)} MB`
+        if (j.no_change) {
+          alert('Nothing to compact: this session is already minimal. Its size is conversation text, not evictable tool output.')
+        } else {
+          alert(`Compacted: ${mb(j.bytes_before)} to ${mb(j.bytes_after)} (${j.tool_results_evicted}/${j.tool_results} tool results evicted).`)
+        }
       }
       // Restart via the same path the manual Restart button uses —
       // throttle is shared so a fast double-fire is safe.
