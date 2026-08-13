@@ -206,6 +206,48 @@ func TestCompact_NoEvictionWhenUnderWindow(t *testing.T) {
 	}
 }
 
+// A compact that evicts/drops nothing must be a TRUE no-op: no archive
+// sidecar created, source left byte-identical, Stats.NoChange set.
+// Regression guard for repeated "Compact" clicks piling up identical
+// multi-MB archives on an already-minimal transcript.
+func TestCompact_NoOpWhenNothingToEvict(t *testing.T) {
+	dir := t.TempDir()
+	fixture := []map[string]any{
+		{"type": "assistant", "message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "hello, nothing evictable here"},
+		}}},
+		{"type": "user", "message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "t1", "content": "small"},
+		}}},
+	}
+	path := writeFixture(t, dir, fixture)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Compact(path, Options{KeepRecentToolResults: 10}, nil)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if !res.Stats.NoChange {
+		t.Errorf("expected NoChange=true on a no-op compact")
+	}
+	if res.Stats.ArchivePath != "" {
+		t.Errorf("no-op compact must not set ArchivePath, got %q", res.Stats.ArchivePath)
+	}
+	if archives, _ := filepath.Glob(filepath.Join(dir, "*.archive.*")); len(archives) != 0 {
+		t.Errorf("no-op compact must not create archive sidecars, found %v", archives)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("no-op compact must leave source byte-identical")
+	}
+}
+
 // Write tool_use with a large `content` field must be evicted to a
 // sentinel-tagged stub, while small fields (file_path) stay verbatim.
 // This is the symmetry fix for the original gap where only tool_result

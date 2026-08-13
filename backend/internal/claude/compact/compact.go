@@ -16,10 +16,10 @@
 //     protocol stays valid on --resume).
 //   - For turns older than a recency window we replace bulky FIELDS
 //     within those blocks with sentinel-tagged stubs.
-//     • tool_result content (text, image, document) → short stub.
-//     • tool_use input fields whose value is a large string
-//       (Write.content, Edit.old_string/new_string, MultiEdit.edits)
-//       → short stub. Small fields (file_path, command head) stay.
+//   - tool_result content (text, image, document) → short stub.
+//   - tool_use input fields whose value is a large string
+//     (Write.content, Edit.old_string/new_string, MultiEdit.edits)
+//     → short stub. Small fields (file_path, command head) stay.
 //   - A ledger.md is generated WITH FULL FIDELITY from the original
 //     transcript so detail isn't lost — files on disk and git history
 //     remain the canonical source of truth.
@@ -158,23 +158,26 @@ var metaSidecarTypes = map[string]bool{
 // Stats reports what the compact pass did. Surfaced to the caller for
 // the Compact button UI.
 type Stats struct {
-	Lines                    int    `json:"lines"`
-	ToolResults              int    `json:"tool_results"`
-	ToolResultsEvicted       int    `json:"tool_results_evicted"`
-	ToolUses                 int    `json:"tool_uses"`
-	ToolUsesEvicted          int    `json:"tool_uses_evicted"`
-	BytesBefore              int64  `json:"bytes_before"`
-	BytesAfter               int64  `json:"bytes_after"`
-	ApproxTokensBefore       int    `json:"approx_tokens_before"`
-	ApproxTokensAfter        int    `json:"approx_tokens_after"`
-	ArchivePath              string `json:"archive_path"`
-	ArchivesPruned           int    `json:"archives_pruned"`
-	LedgerPath               string `json:"ledger_path,omitempty"`
-	AlreadyEvictedSkipped    int    `json:"already_evicted_skipped"`
-	FileHistorySnapshotsDropped int `json:"file_history_snapshots_dropped"`
-	MetaSidecarDropped       int    `json:"meta_sidecar_dropped"`
-	ThinkingBlocksDropped    int    `json:"thinking_blocks_dropped"`
-	AttachmentsDropped       int    `json:"attachments_dropped"`
+	Lines                       int    `json:"lines"`
+	ToolResults                 int    `json:"tool_results"`
+	ToolResultsEvicted          int    `json:"tool_results_evicted"`
+	ToolUses                    int    `json:"tool_uses"`
+	ToolUsesEvicted             int    `json:"tool_uses_evicted"`
+	BytesBefore                 int64  `json:"bytes_before"`
+	BytesAfter                  int64  `json:"bytes_after"`
+	ApproxTokensBefore          int    `json:"approx_tokens_before"`
+	ApproxTokensAfter           int    `json:"approx_tokens_after"`
+	ArchivePath                 string `json:"archive_path"`
+	ArchivesPruned              int    `json:"archives_pruned"`
+	LedgerPath                  string `json:"ledger_path,omitempty"`
+	AlreadyEvictedSkipped       int    `json:"already_evicted_skipped"`
+	FileHistorySnapshotsDropped int    `json:"file_history_snapshots_dropped"`
+	MetaSidecarDropped          int    `json:"meta_sidecar_dropped"`
+	ThinkingBlocksDropped       int    `json:"thinking_blocks_dropped"`
+	AttachmentsDropped          int    `json:"attachments_dropped"`
+	// NoChange is true when compaction evicted/dropped nothing, so the
+	// transcript was left untouched (no archive rotated, no rewrite).
+	NoChange bool `json:"no_change"`
 }
 
 // Result returned by Compact.
@@ -419,6 +422,26 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 		out = append(out, string(buf))
 	}
 
+	// No-op guard: nothing was dropped or rewritten, so `out` is
+	// byte-identical to the input. Archiving + rewriting anyway would
+	// spam an identical <path>.archive.<ts>.jsonl on every call and
+	// misreport a no-op as a successful compaction — exactly what made
+	// repeated "Compact" clicks on an already-minimal transcript pile up
+	// identical multi-MB archives. Skip all side effects, report NoChange.
+	if len(dirty) == 0 && len(dropLine) == 0 {
+		stats.BytesAfter = stats.BytesBefore
+		stats.ApproxTokensAfter = stats.ApproxTokensBefore
+		stats.NoChange = true
+		// The ledger is an independent artifact (a summary of all turns),
+		// so still emit it even when the transcript needs no rewrite.
+		if ledgerOut != nil {
+			if _, err := io.WriteString(ledgerOut, ledger); err != nil {
+				return nil, fmt.Errorf("write ledger: %w", err)
+			}
+		}
+		return &Result{Stats: stats, LedgerText: ledger}, nil
+	}
+
 	// Archive + atomic write. If the atomic write fails, the archive
 	// is rolled back so the user doesn't accumulate `*.archive.<ts>.jsonl`
 	// sidecars across repeated compact failures (each new attempt
@@ -489,6 +512,7 @@ func computeCutoff(refs []blockRef, keep int) int {
 // block. content may be:
 //   - a string (legacy / simple form)
 //   - an array of {type:"text"|"image"|"document", ...}
+//
 // Both forms get reduced to a single string stub preserving the
 // sentinel + tool_use_id + sample tail.
 func evictToolResultContent(blk map[string]any, maxTailBytes int) {
@@ -660,10 +684,10 @@ type ledgerEntry struct {
 }
 
 type turnEntry struct {
-	ts    string
-	role  string
-	text  string
-	line  int
+	ts   string
+	role string
+	text string
+	line int
 }
 
 func buildLedger(parsed []map[string]any, rawLines []string) string {
