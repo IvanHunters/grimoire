@@ -7,7 +7,38 @@ import (
 	"testing"
 
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/daemon"
 )
+
+// daemonWorkerAlive must route a cached-but-dead daemon session back to
+// resume (returns false) so a daemon respawn does not leave the terminal
+// frozen, while never destabilising a healthy session on a transient
+// liveness-check failure. Regression guard for the mass frozen-terminal
+// incident after the daemon supervisor respawned.
+func TestDaemonWorkerAlive(t *testing.T) {
+	alive := func(string) (daemon.HasReply, error) { return daemon.HasReply{Alive: true, Present: true}, nil }
+	dead := func(string) (daemon.HasReply, error) { return daemon.HasReply{Alive: false, Present: true}, nil }
+	errFn := func(string) (daemon.HasReply, error) { return daemon.HasReply{}, fmt.Errorf("daemon unreachable") }
+
+	cases := []struct {
+		name  string
+		short string
+		has   func(string) (daemon.HasReply, error)
+		want  bool
+	}{
+		{"empty short (subprocess) assumed alive without calling has", "", dead, true},
+		{"daemon reports worker alive", "abcd1234", alive, true},
+		{"daemon reports worker dead (respawn) routes to resume", "abcd1234", dead, false},
+		{"liveness check errors, assume alive (do not destabilise)", "abcd1234", errFn, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := daemonWorkerAlive(c.short, c.has); got != c.want {
+				t.Fatalf("want %v, got %v", c.want, got)
+			}
+		})
+	}
+}
 
 // fakeResumeLookup is a hand-rolled resumeSessionLookup so we can seed
 // grimoire-id -> ClaudeSession mappings without spinning up a real

@@ -317,10 +317,31 @@ func (h *Handler) handleInit(ctx context.Context, conn *wsWriter, msg *WSMessage
 		// possibly-truncated post-compact JSONL header — which lacks cwd
 		// — and surface "resume target has no cwd in header" even though
 		// the worker is fine. Just hit the GetOrCreate fast-path.
-		if _, alive := h.manager.Get(msg.SessionID); alive == nil {
-			h.logger.Info("init: session already live in manager, skipping auto-resume",
-				slog.String("session_id", msg.SessionID),
-			)
+		if sess, getErr := h.manager.Get(msg.SessionID); getErr == nil {
+			// A cached entry does NOT prove the worker is alive. When the
+			// claude daemon respawned it killed every worker while the
+			// manager kept the stale entry, so skipping auto-resume here
+			// attaches to a dead worker and the terminal freezes. Verify
+			// real liveness; if provably dead, fall through to resume so
+			// the session re-dispatches instead of freezing.
+			short := ""
+			if sess != nil {
+				short = sess.DaemonShort
+			}
+			if daemonWorkerAlive(short, (&daemon.Client{Logger: h.logger}).Has) {
+				h.logger.Info("init: session already live in manager, skipping auto-resume",
+					slog.String("session_id", msg.SessionID),
+				)
+			} else if _, pathErr := discovery.SessionPath(msg.SessionID); pathErr == nil {
+				msg.ResumeFromSessionID = msg.SessionID
+				h.logger.Info("init: cached daemon worker dead (respawn?), routing to resume",
+					slog.String("session_id", msg.SessionID),
+				)
+			} else {
+				h.logger.Info("init: cached daemon worker dead, no transcript on disk, will re-create",
+					slog.String("session_id", msg.SessionID),
+				)
+			}
 		} else if _, pathErr := discovery.SessionPath(msg.SessionID); pathErr == nil {
 			msg.ResumeFromSessionID = msg.SessionID
 			h.logger.Info("init: auto-routing UUID sessionId through resume",
@@ -1006,6 +1027,26 @@ func (h *Handler) handleRestartSession(ctx context.Context, conn *wsWriter, msg 
 	}
 
 	h.handleInit(ctx, conn, msg)
+}
+
+// daemonWorkerAlive reports whether the daemon worker behind a cached
+// manager session is actually still running. After the claude daemon
+// supervisor respawns (crash / auto-update) it kills every worker, but
+// the manager keeps the stale entry — trusting that cache makes init
+// "skip auto-resume", attach to a dead worker, and the terminal freezes
+// (resize fails "worker has been shut down"). Returns true (assume
+// alive) for subprocess sessions (empty short) or when liveness can't
+// be determined, so a transient check failure never forces a needless
+// resume on an otherwise-healthy session.
+func daemonWorkerAlive(short string, has func(string) (daemon.HasReply, error)) bool {
+	if short == "" {
+		return true
+	}
+	r, err := has(short)
+	if err != nil {
+		return true
+	}
+	return r.Alive
 }
 
 // isLikelyUUID quickly tells whether a string is shaped like a v4 UUID.
