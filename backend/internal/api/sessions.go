@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -190,9 +191,9 @@ func (h *Handler) ImportSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type fileResult struct {
-		Filename string                    `json:"filename"`
-		Result   *discovery.ImportResult   `json:"result,omitempty"`
-		Error    string                    `json:"error,omitempty"`
+		Filename string                  `json:"filename"`
+		Result   *discovery.ImportResult `json:"result,omitempty"`
+		Error    string                  `json:"error,omitempty"`
 	}
 	results := make([]fileResult, 0, len(r.MultipartForm.File["file"]))
 
@@ -361,6 +362,57 @@ func (h *Handler) ListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// transcriptTrashRoot returns the directory into which deleted session
+// transcripts are moved. It lives OUTSIDE ~/.claude/projects (as a
+// sibling), so discovery.scanRoot never re-lists a trashed session, yet
+// it is on the same filesystem so os.Rename is atomic and never fails
+// cross-device.
+func transcriptTrashRoot() (string, error) {
+	root, err := discovery.ProjectsRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(root), ".md-editor-trash"), nil
+}
+
+// moveTranscriptToTrash relocates a session's JSONL transcript and every
+// sidecar it owns — the <stem>/ dir (subagents + tool-results) and any
+// <stem>.jsonl.* siblings (.archive.* / .ledger.md) — into a fresh
+// per-delete folder under trashRoot instead of destroying them. Returns
+// the trash folder so the caller can log where the data went. A delete
+// thus becomes fully recoverable: move the folder's contents back into
+// the project dir to restore the session.
+func moveTranscriptToTrash(jsonlPath, sessionID, trashRoot string, nowNano int64) (string, error) {
+	dir := filepath.Dir(jsonlPath)
+	base := filepath.Base(jsonlPath)
+	stem := strings.TrimSuffix(base, ".jsonl")
+
+	dest := filepath.Join(trashRoot, sessionID+"-"+strconv.FormatInt(nowNano, 10))
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", err
+	}
+
+	// Main transcript — the one move that must succeed.
+	if err := os.Rename(jsonlPath, filepath.Join(dest, base)); err != nil {
+		return "", err
+	}
+
+	// Sidecar dir <stem>/ (subagents, tool-results). Best-effort.
+	sidecarDir := filepath.Join(dir, stem)
+	if info, err := os.Stat(sidecarDir); err == nil && info.IsDir() {
+		_ = os.Rename(sidecarDir, filepath.Join(dest, stem))
+	}
+
+	// Archive / ledger siblings (<stem>.jsonl.*). Best-effort.
+	if siblings, _ := filepath.Glob(filepath.Join(dir, base+".*")); len(siblings) > 0 {
+		for _, s := range siblings {
+			_ = os.Rename(s, filepath.Join(dest, filepath.Base(s)))
+		}
+	}
+
+	return dest, nil
+}
+
 // DeleteSession kills a Claude session and cleans up resources.
 //
 // Query param `transcript=true` ALSO removes the JSONL transcript from
@@ -431,17 +483,26 @@ func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Optionally delete the JSONL transcript itself. The file lives
-	// outside our app at ~/.claude/projects/, so we need discovery's
-	// SessionPath to locate it. Failure here is logged but doesn't
-	// surface 500 — the session is already gone from memory and Mongo.
+	// outside our app at ~/.claude/projects/. We do NOT os.Remove it:
+	// a single Trash click used to PERMANENTLY destroy a session's
+	// history and orphan its subagents/ sidecar dir (that is how
+	// session 3315 was lost). Instead we MOVE the transcript and all
+	// its sidecars into a trash dir outside the projects root, so an
+	// accidental delete is always recoverable. Failure here is logged
+	// but doesn't surface 500 — the session is already gone from memory
+	// and Mongo.
 	if dropTranscript {
 		if path, err := discovery.SessionPath(sessionID); err == nil {
-			if err := os.Remove(path); err != nil {
-				h.logger.Warn("remove transcript failed",
-					"session_id", sessionID, "path", path, "error", err)
+			trashRoot, trErr := transcriptTrashRoot()
+			if trErr != nil {
+				h.logger.Warn("resolve transcript trash root failed",
+					"session_id", sessionID, "error", trErr)
+			} else if dest, mvErr := moveTranscriptToTrash(path, sessionID, trashRoot, time.Now().UnixNano()); mvErr != nil {
+				h.logger.Warn("move transcript to trash failed",
+					"session_id", sessionID, "path", path, "error", mvErr)
 			} else {
-				h.logger.Info("transcript removed",
-					"session_id", sessionID, "path", path)
+				h.logger.Info("transcript moved to trash (recoverable)",
+					"session_id", sessionID, "path", path, "trash", dest)
 			}
 		} else {
 			// Path lookup failed — likely the transcript was already gone.
