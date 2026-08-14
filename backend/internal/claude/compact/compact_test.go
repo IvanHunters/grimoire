@@ -206,6 +206,66 @@ func TestCompact_NoEvictionWhenUnderWindow(t *testing.T) {
 	}
 }
 
+// Dropping a whole event that sits IN the parentUuid chain must splice
+// it out and re-point its child at the nearest surviving ancestor, not
+// leave a dangling parentUuid. A broken chain makes claude --resume lose
+// the conversation ("session started fresh"). Regression guard for the
+// incident where compacting a 35MB session dropped 115 chain links and
+// the resumed worker had no context.
+func TestCompact_ChainRepairOnDrop(t *testing.T) {
+	dir := t.TempDir()
+	fixture := []map[string]any{
+		{"type": "assistant", "uuid": "A", "message": map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "text", "text": "hi"},
+		}}},
+		// droppable meta event sitting between the two turns
+		{"type": "mode", "uuid": "M", "parentUuid": "A", "mode": "default"},
+		{"type": "user", "uuid": "U", "parentUuid": "M", "message": map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "continue"},
+		}}},
+	}
+	path := writeFixture(t, dir, fixture)
+
+	res, err := Compact(path, Options{DropMetaSidecar: true, KeepRecentToolResults: 10}, nil)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if res.Stats.MetaSidecarDropped != 1 {
+		t.Fatalf("expected 1 meta-sidecar dropped, got %d", res.Stats.MetaSidecarDropped)
+	}
+
+	lines, err := readLines(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	parentByUUID := map[string]string{}
+	for _, line := range lines {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		u, _ := m["uuid"].(string)
+		if u != "" {
+			ids[u] = true
+		}
+		if p, ok := m["parentUuid"].(string); ok {
+			parentByUUID[u] = p
+		}
+	}
+	if ids["M"] {
+		t.Fatal("meta event M must be dropped")
+	}
+	if parentByUUID["U"] != "A" {
+		t.Fatalf("U.parentUuid must be spliced to A (was M), got %q", parentByUUID["U"])
+	}
+	for u, p := range parentByUUID {
+		if p != "" && !ids[p] {
+			t.Fatalf("dangling parentUuid %q on %q (chain break)", p, u)
+		}
+	}
+}
+
 // A compact that evicts/drops nothing must be a TRUE no-op: no archive
 // sidecar created, source left byte-identical, Stats.NoChange set.
 // Regression guard for repeated "Compact" clicks piling up identical
