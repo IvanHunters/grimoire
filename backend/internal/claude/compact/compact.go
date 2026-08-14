@@ -402,6 +402,63 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 		}
 	}
 
+	// Chain repair. Dropping whole events (meta-sidecar, file-history,
+	// old attachments) orphans any SURVIVING event whose parentUuid
+	// pointed at a dropped one. claude --resume walks the parentUuid
+	// chain backward from the last leaf to reconstruct the conversation,
+	// so a dangling parentUuid truncates the resumed context — the
+	// session "starts fresh" and loses its history. Splice each dropped
+	// node out of the chain: re-point every orphaned child at the nearest
+	// surviving ancestor (or make it a root if none survive).
+	uuidToLine := make(map[string]int, len(parsed))
+	parentOf := make([]string, len(lines))
+	for i, m := range parsed {
+		if m == nil {
+			continue
+		}
+		if u, ok := m["uuid"].(string); ok && u != "" {
+			uuidToLine[u] = i
+		}
+		if p, ok := m["parentUuid"].(string); ok {
+			parentOf[i] = p
+		}
+	}
+	// nearestSurvivor walks up from a uuid past dropped nodes to the
+	// first non-dropped ancestor's uuid ("" if the chain dead-ends in
+	// drops or an unknown ancestor).
+	nearestSurvivor := func(u string) string {
+		for u != "" {
+			li, ok := uuidToLine[u]
+			if !ok {
+				return ""
+			}
+			if !dropLine[li] {
+				return u
+			}
+			u = parentOf[li]
+		}
+		return ""
+	}
+	for i := range lines {
+		if dropLine[i] || parsed[i] == nil {
+			continue
+		}
+		p := parentOf[i]
+		if p == "" {
+			continue
+		}
+		li, ok := uuidToLine[p]
+		if !ok || !dropLine[li] {
+			continue // parent survives (or is external) — nothing to fix
+		}
+		if survivor := nearestSurvivor(p); survivor != "" {
+			parsed[i]["parentUuid"] = survivor
+		} else {
+			delete(parsed[i], "parentUuid")
+		}
+		dirty[i] = true
+	}
+
 	// Render — drop entire-line removals first, then re-marshal mutated
 	// lines, leaving the rest at their original byte representation
 	// (no field-order shuffles, no whitespace drift vs archive).
