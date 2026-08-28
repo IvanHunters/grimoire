@@ -76,6 +76,13 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
       })
     : []
 
+  // A session that matches BOTH by name and by transcript content would
+  // otherwise render twice — once as a name card, once in the content
+  // hits. Drop content hits for sessions already shown as name matches
+  // so each session appears exactly once in the search results.
+  const nameMatchIds = new Set(nameMatches.map((s) => s.sessionId))
+  const contentHits = hits.filter((h) => !nameMatchIds.has(h.sessionId))
+
   useEffect(() => {
     if (!visible) return
     let cancelled = false
@@ -356,7 +363,7 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
               type at least 2 characters
             </div>
           )}
-          {query && query.trim().length >= 2 && !searching && hits.length === 0 && nameMatches.length === 0 && (
+          {query && query.trim().length >= 2 && !searching && contentHits.length === 0 && nameMatches.length === 0 && (
             <div className="px-5 py-8 text-center text-xs font-mono text-slate-500">
               no matches
             </div>
@@ -390,13 +397,13 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
             </>
           )}
 
-          {query && hits.length > 0 && (
+          {query && contentHits.length > 0 && (
             <>
               <div className="px-4 py-2 text-[10px] font-mono text-slate-500 uppercase tracking-widest border-b border-t border-white/[0.04]">
-                Content matches · {hits.length}
+                Content matches · {contentHits.length}
               </div>
               <SearchResultsBlock
-                hits={hits}
+                hits={contentHits}
                 query={query.trim()}
                 onOpenSession={onOpenSession}
                 // Pass the names we already have so the group header
