@@ -1,20 +1,19 @@
-package api
+package discovery
 
 import (
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/ivanohotnikov/markdown-editor/internal/claude/discovery"
 )
 
-// Verifies that deleting a session's transcript is a recoverable MOVE
+// Verifies that trashing a session's transcript is a recoverable MOVE
 // into a trash dir (not a destructive os.Remove), and that it carries
 // along the sidecar dir (subagents/tool-results) + archive/ledger
 // siblings so nothing is orphaned or lost. This is the regression guard
-// for the incident where a Trash click permanently destroyed session
-// 3315's history and orphaned its subagents/ sidecar.
+// for the incident where a delete permanently destroyed session 3315's
+// history and orphaned its subagents/ sidecar. Both the HTTP delete
+// handler and the MCP delete_session tool route through these functions.
 func TestMoveTranscriptToTrash(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CLAUDE_PROJECTS_DIR", root)
@@ -34,20 +33,20 @@ func TestMoveTranscriptToTrash(t *testing.T) {
 		}
 	}
 
-	trashRoot, err := transcriptTrashRoot()
+	trashRoot, err := TrashRoot()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Trash must live OUTSIDE the projects root, else scanRoot re-lists
+	// Trash must live OUTSIDE the projects root, else ScanAll re-lists
 	// the deleted session and it reappears in the sidebar.
 	if strings.HasPrefix(filepath.Clean(trashRoot)+string(os.PathSeparator), filepath.Clean(root)+string(os.PathSeparator)) {
 		t.Fatalf("trash root %q must not be inside projects root %q", trashRoot, root)
 	}
 
-	dest, err := moveTranscriptToTrash(jsonl, uuid, trashRoot, 1735689600000000000)
+	dest, err := MoveTranscriptToTrash(jsonl, uuid, trashRoot, 1735689600000000000)
 	if err != nil {
-		t.Fatalf("moveTranscriptToTrash: %v", err)
+		t.Fatalf("MoveTranscriptToTrash: %v", err)
 	}
 
 	// Originals are gone from the live project dir.
@@ -73,7 +72,7 @@ func TestMoveTranscriptToTrash(t *testing.T) {
 	}
 
 	// SessionPath no longer resolves it (removed from the live listing).
-	if _, err := discovery.SessionPath(uuid); err == nil {
+	if _, err := SessionPath(uuid); err == nil {
 		t.Fatal("expected SessionPath to miss after trashing")
 	}
 }

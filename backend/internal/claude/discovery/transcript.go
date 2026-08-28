@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -258,4 +259,59 @@ func SessionPath(sessionID string) (string, error) {
 		return "", fmt.Errorf("no transcript found for session %s", sessionID)
 	}
 	return matches[0], nil
+}
+
+// TrashRoot returns the directory into which deleted session transcripts
+// are moved. It lives OUTSIDE ~/.claude/projects (as a sibling), so
+// ScanAll never re-lists a trashed session, yet it is on the same
+// filesystem so os.Rename is atomic and never fails cross-device.
+func TrashRoot() (string, error) {
+	root, err := ProjectsRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(root), ".md-editor-trash"), nil
+}
+
+// MoveTranscriptToTrash relocates a session's JSONL transcript and every
+// sidecar it owns — the <stem>/ dir (subagents + tool-results) and any
+// <stem>.jsonl.* siblings (.archive.* / .ledger.md) — into a fresh
+// per-delete folder under trashRoot instead of destroying them. Returns
+// the trash folder so the caller can log where the data went. A delete
+// thus becomes fully recoverable: move the folder's contents back into
+// the project dir to restore the session.
+//
+// This is the single shared implementation used by BOTH the HTTP delete
+// handler and the MCP delete_session tool, so no delete path ever
+// destroys history with a bare os.Remove (that is how session 3315 was
+// lost).
+func MoveTranscriptToTrash(jsonlPath, sessionID, trashRoot string, nowNano int64) (string, error) {
+	dir := filepath.Dir(jsonlPath)
+	base := filepath.Base(jsonlPath)
+	stem := strings.TrimSuffix(base, ".jsonl")
+
+	dest := filepath.Join(trashRoot, sessionID+"-"+strconv.FormatInt(nowNano, 10))
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", err
+	}
+
+	// Main transcript — the one move that must succeed.
+	if err := os.Rename(jsonlPath, filepath.Join(dest, base)); err != nil {
+		return "", err
+	}
+
+	// Sidecar dir <stem>/ (subagents, tool-results). Best-effort.
+	sidecarDir := filepath.Join(dir, stem)
+	if info, err := os.Stat(sidecarDir); err == nil && info.IsDir() {
+		_ = os.Rename(sidecarDir, filepath.Join(dest, stem))
+	}
+
+	// Archive / ledger siblings (<stem>.jsonl.*). Best-effort.
+	if siblings, _ := filepath.Glob(filepath.Join(dir, base+".*")); len(siblings) > 0 {
+		for _, s := range siblings {
+			_ = os.Rename(s, filepath.Join(dest, filepath.Base(s)))
+		}
+	}
+
+	return dest, nil
 }
