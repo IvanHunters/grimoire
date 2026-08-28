@@ -12,6 +12,16 @@ import (
 // once daemon — and verifies each returns a session of the right shape.
 // Skips when claude isn't installed.
 func TestBackendsSmoke(t *testing.T) {
+	// This is a LIVE integration smoke test: it spawns real `claude`
+	// workers, and the daemon path registers one on the shared per-user
+	// daemon (cc-daemon-<uid>). A routine `go test ./...` must not do
+	// that — a leaked or slow-to-die worker surfaces as a stray
+	// "smoke-daemon-*" session in the developer's real session list.
+	// Gate behind an explicit opt-in so only someone deliberately
+	// exercising the backends pays that cost.
+	if os.Getenv("RUN_DAEMON_SMOKE") != "1" {
+		t.Skip("live backend smoke test; set RUN_DAEMON_SMOKE=1 to run (spawns real claude workers)")
+	}
 	if _, err := os.Stat("/opt/homebrew/bin/claude"); err != nil {
 		t.Skip("claude CLI not found, skipping smoke test")
 	}
