@@ -1885,7 +1885,7 @@ func normalizeTitle(title string) string {
 func contains(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(s) > len(substr) &&
 		(s[:len(substr)] == substr || s[len(s)-len(substr):] == substr ||
-		findSubstring(s, substr) >= 0))
+			findSubstring(s, substr) >= 0))
 }
 
 func findSubstring(s, substr string) int {
@@ -2104,7 +2104,6 @@ Example: create_note("path": "%s/architecture.md", "content": "...")`,
 		},
 	)
 }
-
 
 // registerSessionTools registers Claude-facing MCP tools for managing
 // daemon-backed sessions. All legacy Mongo-message-history and session-notes
@@ -2416,10 +2415,63 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 		},
 	)
 
-	// delete_session — kill daemon worker + JSONL + overlay. Destructive.
+	// kill_session — stop the live daemon worker WITHOUT touching the
+	// transcript. This is the safe "stop" (like Claude Code's Ctrl+X):
+	// the JSONL history stays on disk and the session remains fully
+	// resumable via `claude --resume <id>`. Use this to free a stuck or
+	// runaway worker; use delete_session only when you actually want the
+	// session gone.
+	s.AddTool(
+		mcp.NewTool("kill_session",
+			mcp.WithDescription("Stop a session's live worker process WITHOUT deleting anything. The JSONL transcript stays on disk and the session remains resumable. This is the safe 'stop' — use it to kill a stuck/runaway worker. To actually remove a session, use delete_session instead."),
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Full session UUID whose worker to stop")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]interface{})
+			sessionID, _ := argsMap["session_id"].(string)
+			if sessionID == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
+			}
+
+			killed := false
+			client := &daemon.Client{Logger: mcpCtx.logger}
+			if jobs, err := client.ListSessions(); err == nil {
+				for _, j := range jobs {
+					if j.SessionID == sessionID {
+						if err := client.Remove(j.Short); err == nil {
+							killed = true
+						}
+						break
+					}
+				}
+			}
+
+			// Reflect the stop in Mongo but KEEP the record — mark it
+			// terminated, don't delete it, so the sidebar shows it as a
+			// stopped-but-resumable session rather than dropping it.
+			if mcpCtx.sessionStorage != nil {
+				if err := mcpCtx.sessionStorage.UpdateSessionStatus(ctx, sessionID, "terminated"); err != nil {
+					mcpCtx.logger.Warn("kill_session: update status (non-fatal)",
+						slog.String("session_id", sessionID), slog.Any("error", err))
+				}
+			}
+
+			if !killed {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
+					fmt.Sprintf("No live worker found for %s — nothing to kill. The transcript (if any) is untouched and still resumable.", sessionID))}}, nil
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
+				fmt.Sprintf("Killed worker for session %s\n  transcript preserved: yes (resume with `claude --resume %s`)", sessionID, sessionID))}}, nil
+		},
+	)
+
+	// delete_session — kill daemon worker + MOVE the JSONL transcript
+	// (and its sidecars) into the recoverable .md-editor-trash. This is
+	// NOT a destructive os.Remove: an accidental delete can be restored
+	// by moving the trash folder's contents back into the project dir.
 	s.AddTool(
 		mcp.NewTool("delete_session",
-			mcp.WithDescription("Delete a session permanently. Kills the daemon worker if live AND removes the JSONL transcript. No undo — use search_sessions to confirm the UUID first."),
+			mcp.WithDescription("Delete a session. Kills the daemon worker if live AND moves the JSONL transcript (with its subagent/archive/ledger sidecars) into a recoverable trash dir — it is NOT permanently destroyed. Use search_sessions to confirm the UUID first."),
 			mcp.WithString("session_id", mcp.Required(), mcp.Description("Full session UUID to delete")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2442,11 +2494,22 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				}
 			}
 
+			// Move the transcript (and every sidecar it owns) into the
+			// recoverable trash instead of os.Remove. Same code path the
+			// HTTP delete handler uses, so no delete route ever destroys
+			// history outright (that is how session 3315 was lost).
 			path, err := discovery.SessionPath(sessionID)
-			transcriptRemoved := false
+			transcriptTrashed := false
+			trashDest := ""
 			if err == nil && path != "" {
-				if rmErr := osRemove(path); rmErr == nil {
-					transcriptRemoved = true
+				if trashRoot, trErr := discovery.TrashRoot(); trErr == nil {
+					if dest, mvErr := discovery.MoveTranscriptToTrash(path, sessionID, trashRoot, time.Now().UnixNano()); mvErr == nil {
+						transcriptTrashed = true
+						trashDest = dest
+					} else {
+						mcpCtx.logger.Warn("move transcript to trash failed",
+							slog.String("session_id", sessionID), slog.String("path", path), slog.Any("error", mvErr))
+					}
 				}
 			}
 
@@ -2457,13 +2520,15 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				}
 			}
 
-			if !killed && !transcriptRemoved && !dbCleared {
+			if !killed && !transcriptTrashed && !dbCleared {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Nothing to delete — session not found in daemon, on disk, or in Mongo")}}, nil
 			}
-			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
-				fmt.Sprintf("Deleted session %s\n  daemon worker killed: %v\n  transcript removed: %v\n  mongo record cleared: %v",
-					sessionID, killed, transcriptRemoved, dbCleared),
-			)}}, nil
+			msg := fmt.Sprintf("Deleted session %s\n  daemon worker killed: %v\n  transcript moved to trash (recoverable): %v\n  mongo record cleared: %v",
+				sessionID, killed, transcriptTrashed, dbCleared)
+			if trashDest != "" {
+				msg += "\n  trash: " + trashDest
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(msg)}}, nil
 		},
 	)
 
@@ -2536,11 +2601,6 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 		},
 	)
 }
-
-// osRemove is a tiny wrapper kept here so tests can stub out filesystem
-// access without pulling os into the test surface. Production just
-// proxies to os.Remove.
-func osRemove(path string) error { return os.Remove(path) }
 
 // humanBytes formats a byte count as a short human string: 432 B,
 // 18 KB, 3.4 MB, 1.2 GB. One decimal for KB+, none for bytes.
