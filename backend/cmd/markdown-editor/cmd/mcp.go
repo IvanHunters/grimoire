@@ -2433,34 +2433,14 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
 			}
 
-			killed := false
-			matchedShort := ""
-			client := &daemon.Client{Logger: mcpCtx.logger}
-			if jobs, err := client.ListSessions(); err == nil {
-				for _, j := range jobs {
-					// Match the worker either by its own SessionID, or by
-					// the "grimoire-resume-<short8>" name pattern used when
-					// the live worker is a resume-child of a historical
-					// parent (the id the caller passes). Without the second
-					// branch, kill_session silently misses resumed sessions
-					// — same matching delete_session already does.
-					match := j.SessionID == sessionID ||
-						(strings.HasPrefix(j.Name, "grimoire-resume-") &&
-							strings.TrimPrefix(j.Name, "grimoire-resume-") == sessionID[:min(8, len(sessionID))])
-					if match {
-						if err := client.Remove(j.Short); err == nil {
-							killed = true
-							matchedShort = j.Short
-						}
-						break
-					}
-				}
-			}
+			killed, matchedShort := killLiveWorker(mcpCtx, sessionID)
 
 			// Only touch Mongo when we actually killed something. Marking a
 			// historical (never-live) session "terminated" would be a lie.
 			// We KEEP the record — mark terminated, don't delete it — so the
-			// sidebar shows a stopped-but-resumable session.
+			// sidebar shows a stopped-but-resumable session. (The manager
+			// path already does this for manager-tracked sessions; this
+			// covers the direct-daemon path.)
 			if killed && mcpCtx.sessionStorage != nil {
 				if err := mcpCtx.sessionStorage.UpdateSessionStatus(ctx, sessionID, "terminated"); err != nil {
 					mcpCtx.logger.Warn("kill_session: update status (non-fatal)",
@@ -2472,8 +2452,12 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
 					fmt.Sprintf("No live worker running for %s — nothing to kill (already stopped / historical). The transcript is intact and resumable. To remove it from the session list, use delete_session (moves it to recoverable trash).", sessionID))}}, nil
 			}
+			workerLabel := "worker"
+			if matchedShort != "" {
+				workerLabel = "worker " + matchedShort
+			}
 			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
-				fmt.Sprintf("Killed worker %s for session %s\n  transcript preserved: yes (resume with `claude --resume %s`)", matchedShort, sessionID, sessionID))}}, nil
+				fmt.Sprintf("Killed %s for session %s\n  transcript preserved: yes (resume with `claude --resume %s`)", workerLabel, sessionID, sessionID))}}, nil
 		},
 	)
 
@@ -2493,18 +2477,7 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
 			}
 
-			killed := false
-			client := &daemon.Client{Logger: mcpCtx.logger}
-			if jobs, err := client.ListSessions(); err == nil {
-				for _, j := range jobs {
-					if j.SessionID == sessionID {
-						if err := client.Remove(j.Short); err == nil {
-							killed = true
-						}
-						break
-					}
-				}
-			}
+			killed, _ := killLiveWorker(mcpCtx, sessionID)
 
 			// Move the transcript (and every sidecar it owns) into the
 			// recoverable trash instead of os.Remove. Same code path the
@@ -2612,6 +2585,44 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(sb.String())}}, nil
 		},
 	)
+}
+
+// killLiveWorker stops a session's live daemon worker, if one exists.
+// It first asks the SessionManager, which knows the grimoireID → daemon
+// worker mapping for manager-tracked sessions (global-* quick terminals,
+// note-* chats, resume children) whose live worker's own SessionID does
+// NOT equal the id the caller passes — a raw daemon SessionID scan misses
+// all of those (that is why deleting a quick terminal only cleared Mongo
+// but left the shell running). It then falls back to a direct daemon scan
+// for external/orphan workers the manager does not track (kvaps-spawned,
+// cross-restart orphans, resume children by name). The transcript is
+// never touched. Returns whether a worker was killed and, when known, the
+// daemon short id.
+func killLiveWorker(mcpCtx *MCPContext, sessionID string) (bool, string) {
+	// 1. Manager path — resolves grimoireID → daemon worker and kills it.
+	if mcpCtx.sessionManager != nil {
+		if err := mcpCtx.sessionManager.Close(sessionID); err == nil {
+			return true, ""
+		}
+	}
+	// 2. Direct daemon scan for workers the manager does not track.
+	client := &daemon.Client{Logger: mcpCtx.logger}
+	jobs, err := client.ListSessions()
+	if err != nil {
+		return false, ""
+	}
+	for _, j := range jobs {
+		match := j.SessionID == sessionID ||
+			(strings.HasPrefix(j.Name, "grimoire-resume-") &&
+				strings.TrimPrefix(j.Name, "grimoire-resume-") == sessionID[:min(8, len(sessionID))])
+		if match {
+			if err := client.Remove(j.Short); err == nil {
+				return true, j.Short
+			}
+			return false, ""
+		}
+	}
+	return false, ""
 }
 
 // humanBytes formats a byte count as a short human string: 432 B,
