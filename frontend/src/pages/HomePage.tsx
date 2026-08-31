@@ -395,7 +395,7 @@ function HomePage() {
             setAttachSessionName(name)
           }}
           onSessionDeleted={handleSessionDeleted}
-          activeSessionId={showChatPanel && chatNoteId ? `note-${chatNoteId}` : undefined}
+          activeSessionId={attachSessionId ?? (showChatPanel && chatNoteId ? `note-${chatNoteId}` : undefined)}
           mobileOpen={mobileSidebarOpen}
           onMobileClose={() => setMobileSidebarOpen(false)}
         />
