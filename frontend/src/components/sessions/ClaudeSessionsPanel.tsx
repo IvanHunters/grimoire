@@ -40,6 +40,23 @@ export interface ClaudeSessionsPanelProps {
 const LS_COLLAPSED = 'claude-sessions-collapsed'
 const LS_HEIGHT = 'claude-sessions-height'
 const LS_ORDER = 'session-order' // shared with all sidebars
+const LS_GLOBAL_TABS = 'global-terminal-tabs' // Quick Terminal open tabs
+
+// readOpenTabIds returns the set of session ids currently open as Quick
+// Terminal tabs, so the sidebar can highlight what's open — not just the
+// attached chat. Mirrors the shape GlobalTerminalPanel persists.
+function readOpenTabIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(LS_GLOBAL_TABS)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Array<{ sessionId: string }>
+      if (Array.isArray(parsed)) return new Set(parsed.map((t) => t.sessionId))
+    }
+  } catch {
+    /* malformed localStorage — treat as no open tabs */
+  }
+  return new Set()
+}
 
 export function ClaudeSessionsPanel({
   isMobile,
@@ -71,6 +88,22 @@ export function ClaudeSessionsPanel({
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  // Session ids currently open as Quick Terminal tabs — drives the
+  // "open" highlight alongside activeSessionId (the attached chat). Kept
+  // fresh via the tabs-changed event, cross-window storage events, and a
+  // slow poll (opening a tab doesn't always dispatch an event).
+  const [openTabIds, setOpenTabIds] = useState<Set<string>>(() => readOpenTabIds())
+  useEffect(() => {
+    const refresh = () => setOpenTabIds(readOpenTabIds())
+    window.addEventListener('global-terminal-tabs-changed', refresh)
+    window.addEventListener('storage', refresh)
+    const poll = window.setInterval(refresh, 3000)
+    return () => {
+      window.removeEventListener('global-terminal-tabs-changed', refresh)
+      window.removeEventListener('storage', refresh)
+      window.clearInterval(poll)
+    }
+  }, [])
   const [contextMenu, setContextMenu] = useState<{ visible: boolean; x: number; y: number; items: ContextMenuItem[] }>({
     visible: false, x: 0, y: 0, items: [],
   })
@@ -526,7 +559,10 @@ export function ClaudeSessionsPanel({
                     sessionName = session.id.slice(0, 16)
                   }
 
-                  const isActive = activeSessionId === session.id
+                  // Highlight anything currently open: the attached chat
+                  // (activeSessionId) OR a session open as a Quick
+                  // Terminal tab. "Что открыто, то и подсвечиваем."
+                  const isActive = activeSessionId === session.id || openTabIds.has(session.id)
                   const isRenaming = renamingId === session.id
                   return (
                     <div key={session.id}>
