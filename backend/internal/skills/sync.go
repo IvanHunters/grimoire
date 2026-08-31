@@ -220,6 +220,19 @@ func (s *Syncer) importSkill(ctx context.Context, name string) error {
 		if absPath == skillDir {
 			return nil
 		}
+		// Skip dependency / build / VCS directories wholesale. A skill
+		// with a Python venv or npm deps otherwise makes the sync walk
+		// thousands of vendored files (e.g. .venv/.../site-packages),
+		// creating a note per file and hammering Mongo until it times out
+		// ("refresh skill failed ... context deadline exceeded").
+		if d.IsDir() {
+			switch d.Name() {
+			case ".venv", "venv", "node_modules", ".git", "__pycache__",
+				".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+				"dist", "build", ".next", ".gradle", "target", "vendor":
+				return filepath.SkipDir
+			}
+		}
 		rel, _ := filepath.Rel(skillDir, absPath)
 		rel = filepath.ToSlash(rel)
 		notePath := folderPath + "/" + rel
