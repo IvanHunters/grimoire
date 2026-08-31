@@ -4,6 +4,7 @@ import { X, RotateCcw, Trash2 } from 'lucide-react'
 import { TerminalChat, type TerminalChatHandle } from './TerminalChat'
 import { sessionsAPI, type SessionStatus } from '../../api/sessions'
 import { useSessionStatus } from '../../hooks/useSessionStatus'
+import { markSessionOpen, markSessionClosed } from '../../utils/openSessions'
 
 interface GlobalTab {
   sessionId: string
@@ -72,6 +73,22 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
     enabled: visible && !!activeSessionId,
     intervalMs: 2000,
   })
+  // Publish the ACTIVE tab's session as "open" so the sidebar highlights
+  // exactly the terminal the user is looking at — following tab switches,
+  // and clearing when the panel is hidden or the page reloads (this store
+  // is in-memory, not localStorage). We publish both the tab's own id and
+  // its resolved daemon UUID so the highlight matches whichever id the
+  // deduped sidebar row carries.
+  const activeUuid = activeStatus?.daemonUuid
+  useEffect(() => {
+    if (!visible || !activeSessionId) return
+    markSessionOpen(activeSessionId)
+    if (activeUuid) markSessionOpen(activeUuid)
+    return () => {
+      markSessionClosed(activeSessionId)
+      if (activeUuid) markSessionClosed(activeUuid)
+    }
+  }, [visible, activeSessionId, activeUuid])
   // Defer mounting terminals until panel is first opened — prevents phantom WS sessions on load
   const [everOpened, setEverOpened] = useState(false)
   useEffect(() => { if (visible) setEverOpened(true) }, [visible])
