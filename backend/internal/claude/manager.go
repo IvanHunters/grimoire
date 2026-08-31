@@ -1248,9 +1248,11 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	var jobsByShort map[string]daemon.Record
 	var jobsByUUID map[string]daemon.Record
 	var jobs []daemon.Record
+	daemonReachable := false
 	if useDaemonBackend() {
 		client := &daemon.Client{}
 		if list, err := client.ListSessions(); err == nil {
+			daemonReachable = true
 			jobs = list
 			jobsByShort = make(map[string]daemon.Record, len(list))
 			jobsByUUID = make(map[string]daemon.Record, len(list))
@@ -1318,6 +1320,19 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	sessions := make([]*models.ClaudeSession, 0, len(snaps))
 	now := time.Now()
 	for _, s := range snaps {
+		// Drop entries whose daemon worker is gone. The manager keeps a
+		// session in its map until Close, but a worker can die out-of-band
+		// (killed via daemon op:kill, crashed, or swept), leaving a stale
+		// entry that surfaced as a duplicate "active" row in the sidebar.
+		// Only filter when the daemon list was actually fetched — on a
+		// daemon RPC failure we keep everything rather than blank the list.
+		if daemonReachable && s.daemonBacked {
+			_, byShort := jobsByShort[s.daemonShort]
+			_, byUUID := jobsByUUID[s.daemonUUID]
+			if !byShort && !byUUID {
+				continue
+			}
+		}
 		name := s.name
 		isGenericName := name == "" ||
 			name == "Terminal Session" ||
