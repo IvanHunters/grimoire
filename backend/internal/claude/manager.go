@@ -1318,6 +1318,12 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	// stat'ing JSONLs. Both are TTL'd so back-to-back polls are O(1)
 	// after warmup.
 	sessions := make([]*models.ClaudeSession, 0, len(snaps))
+	// seenUUID maps a live daemon worker's UUID to its index in `sessions`.
+	// One worker can be registered in the manager under BOTH its grimoire
+	// handle (e.g. "global-qz7pow") and its own UUID, which otherwise
+	// surfaced as two identical "active" rows in the sidebar. Dedupe to one
+	// row per worker.
+	seenUUID := make(map[string]int)
 	now := time.Now()
 	for _, s := range snaps {
 		// Drop entries whose daemon worker is gone. The manager keeps a
@@ -1390,6 +1396,18 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 		} else {
 			out.Tempo = "active"
 			out.State = "running"
+		}
+		// Dedupe by daemon worker UUID: if this worker already has a row,
+		// keep only one. Prefer the canonical entry whose ID is the UUID
+		// itself over a grimoire handle ("global-*"/"note-*") alias.
+		if s.daemonBacked && s.daemonUUID != "" {
+			if idx, ok := seenUUID[s.daemonUUID]; ok {
+				if s.id == s.daemonUUID {
+					sessions[idx] = out
+				}
+				continue
+			}
+			seenUUID[s.daemonUUID] = len(sessions)
 		}
 		sessions = append(sessions, out)
 	}
