@@ -23,12 +23,12 @@ import (
 // 30s TTL is safe; rename via UpsertSessionName flows through Mongo
 // overlay (different code path) and is not affected.
 type histNameCacheEntry struct {
-	name      string
-	cachedAt  time.Time
+	name     string
+	cachedAt time.Time
 }
 
 var (
-	histNameCache   sync.Map // map[prefix8]histNameCacheEntry
+	histNameCache    sync.Map // map[prefix8]histNameCacheEntry
 	histNameCacheTTL = 30 * time.Second
 )
 
@@ -43,7 +43,7 @@ type jsonlMtimeCacheEntry struct {
 }
 
 var (
-	jsonlMtimeCache   sync.Map // map[uuid]jsonlMtimeCacheEntry
+	jsonlMtimeCache    sync.Map // map[uuid]jsonlMtimeCacheEntry
 	jsonlMtimeCacheTTL = 10 * time.Second
 )
 
@@ -573,6 +573,23 @@ func GetSessionManager(logger *slog.Logger, storage SessionStorage, mongoURI str
 // Returns a clear error when the session isn't found in the daemon's
 // live registry (caller should fall back to GetOrResume in that case).
 // Only works with USE_DAEMON_BACKEND=1.
+// lookupLiveAttach returns the cached session for grimoireID only when it
+// is alive (PTY present) AND bound to the requested daemon worker. The
+// UUID check is essential: quick terminals share one cwd
+// (~/.markdown-editor/sessions/default) and collide on grimoireID, so a
+// bare grimoireID hit could hand back a DIFFERENT worker's live PTY —
+// that is why clicking session A opened session B's conversation. Returns
+// nil when there is no usable cached entry (missing, dead PTY, or a
+// different UUID), signalling the caller to do a fresh daemon attach.
+func (m *SessionManager) lookupLiveAttach(grimoireID, daemonSessionUUID string) *ClaudeSession {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if s, ok := m.sessions[grimoireID]; ok && s.PTY != nil && s.DaemonUUID == daemonSessionUUID {
+		return s
+	}
+	return nil
+}
+
 func (m *SessionManager) GetOrAttach(grimoireID string, daemonSessionUUID string) (*ClaudeSession, error) {
 	if !useDaemonBackend() {
 		return nil, fmt.Errorf("attach requires USE_DAEMON_BACKEND=1")
@@ -588,20 +605,9 @@ func (m *SessionManager) GetOrAttach(grimoireID string, daemonSessionUUID string
 	// never receive PTY output. Without this check the browser appears
 	// frozen after every daemon-restart cycle and only "restart
 	// session" fixes it.
-	m.mu.RLock()
-	if session, ok := m.sessions[grimoireID]; ok {
-		alive := session.PTY != nil
-		m.mu.RUnlock()
-		if alive {
-			session.UpdateActivity()
-			return session, nil
-		}
-		m.logger.Info("GetOrAttach: stub entry detected (PTY nil), re-attaching",
-			slog.String("grimoire_id", grimoireID),
-			slog.String("daemon_uuid", daemonSessionUUID),
-		)
-	} else {
-		m.mu.RUnlock()
+	if session := m.lookupLiveAttach(grimoireID, daemonSessionUUID); session != nil {
+		session.UpdateActivity()
+		return session, nil
 	}
 
 	newSession, err := startDaemonSessionAttach(grimoireID, daemonSessionUUID, m.logger)
@@ -610,7 +616,7 @@ func (m *SessionManager) GetOrAttach(grimoireID string, daemonSessionUUID string
 	}
 
 	m.mu.Lock()
-	if existing, raced := m.sessions[grimoireID]; raced && existing.PTY != nil {
+	if existing, raced := m.sessions[grimoireID]; raced && existing.PTY != nil && existing.DaemonUUID == daemonSessionUUID {
 		m.mu.Unlock()
 		// Race-loser path: both attaches target the same daemon worker
 		// (same UUID), they only differ in AttachConn. shutdownSession
