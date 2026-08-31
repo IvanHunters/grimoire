@@ -2434,22 +2434,34 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			}
 
 			killed := false
+			matchedShort := ""
 			client := &daemon.Client{Logger: mcpCtx.logger}
 			if jobs, err := client.ListSessions(); err == nil {
 				for _, j := range jobs {
-					if j.SessionID == sessionID {
+					// Match the worker either by its own SessionID, or by
+					// the "grimoire-resume-<short8>" name pattern used when
+					// the live worker is a resume-child of a historical
+					// parent (the id the caller passes). Without the second
+					// branch, kill_session silently misses resumed sessions
+					// — same matching delete_session already does.
+					match := j.SessionID == sessionID ||
+						(strings.HasPrefix(j.Name, "grimoire-resume-") &&
+							strings.TrimPrefix(j.Name, "grimoire-resume-") == sessionID[:min(8, len(sessionID))])
+					if match {
 						if err := client.Remove(j.Short); err == nil {
 							killed = true
+							matchedShort = j.Short
 						}
 						break
 					}
 				}
 			}
 
-			// Reflect the stop in Mongo but KEEP the record — mark it
-			// terminated, don't delete it, so the sidebar shows it as a
-			// stopped-but-resumable session rather than dropping it.
-			if mcpCtx.sessionStorage != nil {
+			// Only touch Mongo when we actually killed something. Marking a
+			// historical (never-live) session "terminated" would be a lie.
+			// We KEEP the record — mark terminated, don't delete it — so the
+			// sidebar shows a stopped-but-resumable session.
+			if killed && mcpCtx.sessionStorage != nil {
 				if err := mcpCtx.sessionStorage.UpdateSessionStatus(ctx, sessionID, "terminated"); err != nil {
 					mcpCtx.logger.Warn("kill_session: update status (non-fatal)",
 						slog.String("session_id", sessionID), slog.Any("error", err))
@@ -2458,10 +2470,10 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 
 			if !killed {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
-					fmt.Sprintf("No live worker found for %s — nothing to kill. The transcript (if any) is untouched and still resumable.", sessionID))}}, nil
+					fmt.Sprintf("No live worker running for %s — nothing to kill (already stopped / historical). The transcript is intact and resumable. To remove it from the session list, use delete_session (moves it to recoverable trash).", sessionID))}}, nil
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
-				fmt.Sprintf("Killed worker for session %s\n  transcript preserved: yes (resume with `claude --resume %s`)", sessionID, sessionID))}}, nil
+				fmt.Sprintf("Killed worker %s for session %s\n  transcript preserved: yes (resume with `claude --resume %s`)", matchedShort, sessionID, sessionID))}}, nil
 		},
 	)
 
