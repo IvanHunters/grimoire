@@ -1397,17 +1397,25 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			out.Tempo = "active"
 			out.State = "running"
 		}
-		// Dedupe by daemon worker UUID: if this worker already has a row,
-		// keep only one. Prefer the canonical entry whose ID is the UUID
-		// itself over a grimoire handle ("global-*"/"note-*") alias.
-		if s.daemonBacked && s.daemonUUID != "" {
-			if idx, ok := seenUUID[s.daemonUUID]; ok {
-				if s.id == s.daemonUUID {
+		// Dedupe by daemon worker identity: one worker can be registered
+		// under multiple manager keys (its UUID entry AND a grimoire
+		// handle / a resumed-into alias), which surfaced as duplicate
+		// rows. Key by the worker's DaemonUUID; when this entry carries
+		// no DaemonUUID it IS the canonical UUID-keyed entry, so key by
+		// its own id — that way an alias whose DaemonUUID points here
+		// collapses onto it. Prefer the canonical (id == key) row.
+		if s.daemonBacked {
+			key := s.daemonUUID
+			if key == "" {
+				key = s.id
+			}
+			if idx, ok := seenUUID[key]; ok {
+				if s.id == key {
 					sessions[idx] = out
 				}
 				continue
 			}
-			seenUUID[s.daemonUUID] = len(sessions)
+			seenUUID[key] = len(sessions)
 		}
 		sessions = append(sessions, out)
 	}
