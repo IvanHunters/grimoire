@@ -191,6 +191,53 @@ func (s *SessionStorage) UpsertSessionName(ctx context.Context, sessionID string
 	return err
 }
 
+// EnsureSessionName sets a display name for a session WITHOUT ever
+// clobbering an existing, different name. It is the safe variant of
+// UpsertSessionName for writes keyed by a daemon UUID that may have
+// drifted onto another session's record: if that record already carries
+// a real name (e.g. a user-renamed "КТЖ"), a stray write from a
+// different session must NOT overwrite it — that cross-contamination is
+// how unrelated sessions all ended up labelled "qosi".
+//
+// Behaviour:
+//   - record absent      → insert it with this name
+//   - record has no name  → fill in this name
+//   - record has a name   → leave it untouched
+func (s *SessionStorage) EnsureSessionName(ctx context.Context, sessionID string, name string) error {
+	collection := s.db.Collection(sessionsCollection)
+
+	// 1. Insert the record with the name if it doesn't exist yet. On an
+	// existing record $setOnInsert is a no-op, so a real name is safe.
+	if _, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": sessionID},
+		bson.M{"$setOnInsert": bson.M{
+			"name":       name,
+			"created_at": time.Now(),
+			"updated_at": time.Now(),
+			"status":     "historical",
+		}},
+		options.Update().SetUpsert(true),
+	); err != nil {
+		return err
+	}
+
+	// 2. Fill the name only where it is still empty/missing — never
+	// overwrite a name another session (or the user) already set.
+	_, err := collection.UpdateOne(
+		ctx,
+		bson.M{"_id": sessionID, "$or": []bson.M{
+			{"name": bson.M{"$exists": false}},
+			{"name": ""},
+		}},
+		bson.M{"$set": bson.M{"name": name, "updated_at": time.Now()}},
+	)
+	if err == nil {
+		s.invalidateOverlay()
+	}
+	return err
+}
+
 // ListNameOverrides returns the map of sessionId → user-chosen display
 // name from Mongo. Used as an overlay when listing sessions so renames
 // stick across daemon restarts and survive even if the JSONL ai-title

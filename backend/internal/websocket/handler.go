@@ -584,14 +584,15 @@ resumeResolved:
 		go func(uuid, name string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			// Upsert (not Update) — for fresh forks/resumes the Mongo
-			// record keyed by daemon UUID doesn't exist yet (it's
-			// keyed by our grimoireID), so a strict Update fails with
-			// MatchedCount=0 and the overlay name is never persisted.
-			// Listing then falls back to the daemon's "grimoire-fork-…"
-			// token which we sanitize to "···<short>" — exactly what
-			// the user reported as "хрен знает с каким именем".
-			if err := h.sessionStorage.UpsertSessionName(ctx, uuid, name); err != nil {
+			// EnsureSessionName, not Upsert: for fresh forks/resumes the
+			// record keyed by daemon UUID doesn't exist yet, so we still
+			// want to insert it with the name (otherwise the listing
+			// falls back to the daemon's "grimoire-fork-…" token). But
+			// this key is DRIFT-PRONE — a daemon UUID can resolve onto
+			// another session's record — so we must NOT overwrite a name
+			// that's already there. A plain Upsert here is exactly how an
+			// unrelated session's "qosi" name once clobbered "КТЖ".
+			if err := h.sessionStorage.EnsureSessionName(ctx, uuid, name); err != nil {
 				h.logger.Warn("save overlay name (non-fatal)",
 					slog.String("session_uuid", uuid), slog.Any("error", err))
 			}
