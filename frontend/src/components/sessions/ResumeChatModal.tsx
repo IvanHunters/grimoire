@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { X, GitBranch } from 'lucide-react'
 import { TerminalChat, type TerminalChatHandle } from '../chat/TerminalChat'
+import { markSessionOpen, markSessionClosed } from '../../utils/openSessions'
 
 interface ResumeChatModalProps {
   visible: boolean
@@ -62,6 +63,16 @@ function ResumeChatModal({ visible, onClose, sessionId, sessionName, mode = 'res
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [visible, onClose])
+
+  // Publish this session as "open" while the modal is showing it, so the
+  // sidebar highlights it (covers attach/resume/fork/open — any live
+  // chat the user has in front of them). Cleared when the modal hides or
+  // the session changes.
+  useEffect(() => {
+    if (!visible || !sessionId) return
+    markSessionOpen(sessionId)
+    return () => markSessionClosed(sessionId)
+  }, [visible, sessionId])
 
   if (!sessionId) return null
 

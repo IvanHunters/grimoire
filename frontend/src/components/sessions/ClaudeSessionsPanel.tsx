@@ -5,6 +5,7 @@ import { sessionsAPI } from '../../api/sessions'
 import { tasksAPI } from '../../api/tasks'
 import type { ClaudeSession } from '../../types/claude'
 import { SessionStatusPill, formatSessionAge } from './SessionStatusPill'
+import { getOpenSessions, subscribeOpenSessions } from '../../utils/openSessions'
 
 /**
  * ClaudeSessionsPanel renders the "Claude Sessions" section that lives
@@ -104,6 +105,10 @@ export function ClaudeSessionsPanel({
       window.clearInterval(poll)
     }
   }, [])
+  // Session ids open in a live chat/attach modal (ResumeChatModal), so
+  // those get highlighted too — not only Quick Terminal tabs.
+  const [modalOpenIds, setModalOpenIds] = useState<Set<string>>(() => getOpenSessions())
+  useEffect(() => subscribeOpenSessions(() => setModalOpenIds(getOpenSessions())), [])
   const [contextMenu, setContextMenu] = useState<{ visible: boolean; x: number; y: number; items: ContextMenuItem[] }>({
     visible: false, x: 0, y: 0, items: [],
   })
@@ -562,7 +567,7 @@ export function ClaudeSessionsPanel({
                   // Highlight anything currently open: the attached chat
                   // (activeSessionId) OR a session open as a Quick
                   // Terminal tab. "Что открыто, то и подсвечиваем."
-                  const isActive = activeSessionId === session.id || openTabIds.has(session.id)
+                  const isActive = activeSessionId === session.id || openTabIds.has(session.id) || modalOpenIds.has(session.id)
                   const isRenaming = renamingId === session.id
                   return (
                     <div key={session.id}>
