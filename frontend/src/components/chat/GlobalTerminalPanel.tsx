@@ -16,9 +16,13 @@ const STORAGE_KEY = 'global-terminal-tabs'
 function loadTabs(): GlobalTab[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
+    if (raw !== null) {
       const parsed = JSON.parse(raw) as Array<{ sessionId: string; label: string }>
-      if (Array.isArray(parsed) && parsed.length > 0) {
+      if (Array.isArray(parsed)) {
+        // Respect an explicitly-emptied list — do NOT resurrect a
+        // terminal that was closed (by the user or an external kill).
+        // Only a never-initialized / corrupt store falls through to a
+        // fresh terminal below.
         return parsed.map(t => ({ sessionId: t.sessionId, label: t.label, sessionKey: 0 }))
       }
     }
@@ -75,6 +79,15 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
   const [pasteOpen, setPasteOpen] = useState(false)
   const [keyboardOffset, setKeyboardOffset] = useState(0)
   const terminalRefs = useRef<Map<string, TerminalChatHandle>>(new Map())
+  // Session ids we've observed live at least once. A tab is only removed
+  // by the periodic reconcile if it was live before and is now gone —
+  // this gives a just-added tab a grace period to spin up its worker
+  // before we'd consider it dead.
+  const everLiveRef = useRef<Set<string>>(new Set())
+  // First reconcile after (re)mount is strict: it drops any tab whose
+  // worker isn't live right now, clearing stale tabs left over from a
+  // backend restart. Later reconciles use the grace rule above.
+  const firstReconcileRef = useRef(true)
 
   useEffect(() => { saveTabs(tabs) }, [tabs])
 
@@ -92,31 +105,41 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
     return () => window.removeEventListener('global-terminal-tabs-changed', handler)
   }, [])
 
-  // On first mount, reconcile cached tabs against the backend's live
-  // session list. Tabs whose sessionId no longer corresponds to a
-  // daemon worker get dropped — without this, opening Quick Terminal
-  // after a backend restart respawns dead "global-*" workers because
-  // the active tab's TerminalChat would init against the stale id.
-  // Always keeps at least one tab (creates a fresh one if all dead)
-  // so the panel never opens empty.
+  // Reconcile cached tabs against the backend's live session list — once
+  // on mount, then on an interval while the panel is visible. A tab whose
+  // worker no longer exists (killed externally via MCP/Sidebar, or swept
+  // on a backend restart) is dropped, so the panel reflects reality
+  // instead of showing a dead PTY or respawning the worker on the next
+  // attach. We do NOT auto-add a replacement: a terminal closed
+  // externally stays closed (the user can hit + for a new one).
+  //
+  // The first pass is strict (drop anything not live now) to clear stale
+  // tabs from a restart. Later passes only drop tabs we've seen live and
+  // that then disappeared — this gives a just-added tab time to spin up
+  // its worker before it could be mistaken for dead.
   useEffect(() => {
     let cancelled = false
-    sessionsAPI.listByProject().then((items) => {
-      if (cancelled) return
-      const live = new Set(items.map((s) => s.sessionId))
-      setTabs((prev) => {
-        const alive = prev.filter((t) => live.has(t.sessionId))
-        if (alive.length === prev.length) return prev
-        if (alive.length === 0) return [newTab(1)]
-        return alive
-      })
-      setActiveIdx((idx) => {
-        // Defer correction to next paint so setTabs settles first.
-        return idx
-      })
-    }).catch(() => {})
-    return () => { cancelled = true }
-  }, [])
+    const reconcile = () => {
+      sessionsAPI.listByProject().then((items) => {
+        if (cancelled) return
+        const live = new Set(items.map((s) => s.sessionId))
+        live.forEach((id) => everLiveRef.current.add(id))
+        const strict = firstReconcileRef.current
+        firstReconcileRef.current = false
+        setTabs((prev) => {
+          const alive = prev.filter((t) =>
+            live.has(t.sessionId) || (!strict && !everLiveRef.current.has(t.sessionId)),
+          )
+          if (alive.length === prev.length) return prev
+          setActiveIdx((idx) => Math.max(0, Math.min(idx, alive.length - 1)))
+          return alive
+        })
+      }).catch(() => {})
+    }
+    reconcile()
+    const interval = visible ? window.setInterval(reconcile, 5000) : undefined
+    return () => { cancelled = true; if (interval) window.clearInterval(interval) }
+  }, [visible])
 
   // Visual viewport for mobile keyboard — update immediately in both directions
   useEffect(() => {
