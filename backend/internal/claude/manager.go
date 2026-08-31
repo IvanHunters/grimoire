@@ -692,6 +692,28 @@ func (m *SessionManager) GetOrResume(grimoireID string, resumeFromUUID string, w
 		m.mu.RUnlock()
 	}
 
+	// If the session is ALREADY running as a live daemon worker (a bg
+	// agent), attach to it instead of spawning `claude --resume`. claude
+	// refuses to resume a session that's already an active bg agent
+	// ("currently running as a background agent (bg)") and the worker
+	// exits with that message, which the supervisor then respawns in a
+	// tight crash loop. GetOrAttach resolves the live record by UUID
+	// (incl. resume-child mapping) and errors cleanly when there's no
+	// live worker — in which case we fall through to a normal resume.
+	// Forks must always branch a fresh copy, so skip this for them.
+	if !fork {
+		if attached, aerr := m.GetOrAttach(grimoireID, resumeFromUUID); aerr == nil {
+			if sessionName != "" && !strings.HasPrefix(sessionName, "grimoire-") {
+				attached.SetName(sessionName)
+			}
+			m.logger.Info("GetOrResume: session already live as bg agent, attached instead of resuming",
+				slog.String("grimoire_id", grimoireID),
+				slog.String("resume_from", resumeFromUUID),
+			)
+			return attached, nil
+		}
+	}
+
 	newSession, err := startDaemonSessionResume(grimoireID, resumeFromUUID, workingDir, m.mongoURI, m.mongoDatabase, m.logger, sessionName, fork)
 	if err != nil {
 		return nil, fmt.Errorf("daemon resume: %w", err)
