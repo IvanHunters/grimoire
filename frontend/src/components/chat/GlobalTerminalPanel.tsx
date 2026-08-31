@@ -88,6 +88,13 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
   // worker isn't live right now, clearing stale tabs left over from a
   // backend restart. Later reconciles use the grace rule above.
   const firstReconcileRef = useRef(true)
+  // Latest tabs / active index, readable inside the async reconcile
+  // without capturing a stale closure. Updated in effects (not during
+  // render) so we never write a ref mid-render.
+  const tabsRef = useRef(tabs)
+  const activeIdxRef = useRef(activeIdx)
+  useEffect(() => { tabsRef.current = tabs }, [tabs])
+  useEffect(() => { activeIdxRef.current = activeIdx }, [activeIdx])
 
   useEffect(() => { saveTabs(tabs) }, [tabs])
 
@@ -105,39 +112,63 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
     return () => window.removeEventListener('global-terminal-tabs-changed', handler)
   }, [])
 
-  // Reconcile cached tabs against the backend's live session list — once
-  // on mount, then on an interval while the panel is visible. A tab whose
-  // worker no longer exists (killed externally via MCP/Sidebar, or swept
-  // on a backend restart) is dropped, so the panel reflects reality
-  // instead of showing a dead PTY or respawning the worker on the next
-  // attach. We do NOT auto-add a replacement: a terminal closed
-  // externally stays closed (the user can hit + for a new one).
+  // Reconcile tabs against real per-session liveness — once on mount,
+  // then on an interval while the panel is visible. A tab whose worker no
+  // longer exists (killed externally via MCP/Sidebar, or swept on a
+  // backend restart) is dropped, so the panel reflects reality instead of
+  // showing a dead PTY or respawning the worker on the next attach. We do
+  // NOT auto-add a replacement: a terminal closed externally stays closed.
   //
-  // The first pass is strict (drop anything not live now) to clear stale
-  // tabs from a restart. Later passes only drop tabs we've seen live and
-  // that then disappeared — this gives a just-added tab time to spin up
-  // its worker before it could be mistaken for dead.
+  // Liveness comes from the per-session /status endpoint, NOT the session
+  // LIST. A quick terminal is listed under its "global-*" id only until it
+  // writes a transcript; after the user sends a task it re-keys to its
+  // daemon UUID and drops out of the list under "global-*" — even though
+  // the worker is very much alive. Reconciling on list membership then
+  // wrongly culled the active terminal mid-task. /status resolves the
+  // "global-*" id through the SessionManager, so a live worker always
+  // reports alive regardless of how the list keys it.
+  //
+  // First pass is strict (drop confirmed-dead now) to clear restart-stale
+  // tabs. Later passes only drop tabs seen alive that then died, and never
+  // the active tab — giving a just-opened tab time to spin up its worker.
   useEffect(() => {
     let cancelled = false
-    const reconcile = () => {
-      sessionsAPI.listByProject().then((items) => {
-        if (cancelled) return
-        const live = new Set(items.map((s) => s.sessionId))
-        live.forEach((id) => everLiveRef.current.add(id))
-        const strict = firstReconcileRef.current
-        firstReconcileRef.current = false
-        setTabs((prev) => {
-          const alive = prev.filter((t) =>
-            live.has(t.sessionId) || (!strict && !everLiveRef.current.has(t.sessionId)),
-          )
-          if (alive.length === prev.length) return prev
-          setActiveIdx((idx) => Math.max(0, Math.min(idx, alive.length - 1)))
-          return alive
+    const isGone = (s: SessionStatus) =>
+      s.state === 'unknown' &&
+      (s.detail === 'session not in memory' ||
+        s.detail.toLowerCase().includes('does not have this session'))
+    const reconcile = async () => {
+      const current = tabsRef.current
+      if (current.length === 0) return
+      const checks = await Promise.all(current.map(async (t) => {
+        try {
+          const s = await sessionsAPI.getStatus(t.sessionId)
+          return { id: t.sessionId, gone: isGone(s) }
+        } catch {
+          // Network/backend blip — never cull on uncertainty.
+          return { id: t.sessionId, gone: false }
+        }
+      }))
+      if (cancelled) return
+      const gone = new Set(checks.filter((c) => c.gone).map((c) => c.id))
+      checks.filter((c) => !c.gone).forEach((c) => everLiveRef.current.add(c.id))
+      const strict = firstReconcileRef.current
+      firstReconcileRef.current = false
+      setTabs((prev) => {
+        const activeId = prev[activeIdxRef.current]?.sessionId
+        const alive = prev.filter((t) => {
+          if (!gone.has(t.sessionId)) return true // alive → keep
+          if (t.sessionId === activeId) return true // never cull the active tab
+          if (!strict && !everLiveRef.current.has(t.sessionId)) return true // grace: still spinning up
+          return false
         })
-      }).catch(() => {})
+        if (alive.length === prev.length) return prev
+        setActiveIdx((idx) => Math.max(0, Math.min(idx, alive.length - 1)))
+        return alive
+      })
     }
-    reconcile()
-    const interval = visible ? window.setInterval(reconcile, 5000) : undefined
+    void reconcile()
+    const interval = visible ? window.setInterval(() => void reconcile(), 5000) : undefined
     return () => { cancelled = true; if (interval) window.clearInterval(interval) }
   }, [visible])
 
