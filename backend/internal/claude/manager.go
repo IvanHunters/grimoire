@@ -1400,12 +1400,16 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 		// Dedupe by daemon worker identity: one worker can be registered
 		// under multiple manager keys (its UUID entry AND a grimoire
 		// handle / a resumed-into alias), which surfaced as duplicate
-		// rows. Key by the worker's DaemonUUID; when this entry carries
-		// no DaemonUUID it IS the canonical UUID-keyed entry, so key by
-		// its own id — that way an alias whose DaemonUUID points here
-		// collapses onto it. Prefer the canonical (id == key) row.
+		// rows with different names. Key by the worker's DaemonShort — the
+		// daemon's own handle, which is reliably populated even when a
+		// session entry's DaemonUUID field is blank (the case that let
+		// two aliases of one worker slip through). Fall back to DaemonUUID
+		// then the entry's own id. Prefer the canonical (id == key) row.
 		if s.daemonBacked {
-			key := s.daemonUUID
+			key := s.daemonShort
+			if key == "" {
+				key = s.daemonUUID
+			}
 			if key == "" {
 				key = s.id
 			}
