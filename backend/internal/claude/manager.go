@@ -1440,13 +1440,29 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			if key == "" {
 				key = s.id
 			}
-			if idx, ok := seenUUID[key]; ok {
-				if s.id == key {
-					sessions[idx] = out
-				}
-				continue
+			isHandle := func(id string) bool {
+				return strings.HasPrefix(id, "global-") || strings.HasPrefix(id, "note-")
 			}
-			seenUUID[key] = len(sessions)
+			if idx, ok := seenUUID[key]; ok {
+				// A row for this worker already exists. Only collapse when
+				// one side is a grimoire-handle ALIAS (global-*/note-*) of
+				// the same worker — that's a safe duplicate. NEVER drop a
+				// distinct UUID-identified session that merely shares a
+				// worker key (that happens on a mis-attach); hiding it
+				// would make an 11MB conversation unreachable. When both
+				// are UUIDs, keep both.
+				switch {
+				case isHandle(s.id):
+					continue // drop this handle alias, keep existing row
+				case isHandle(sessions[idx].ID):
+					sessions[idx] = out // replace handle alias with canonical UUID
+					continue
+				default:
+					// both UUIDs — distinct sessions, keep both
+				}
+			} else {
+				seenUUID[key] = len(sessions)
+			}
 		}
 		sessions = append(sessions, out)
 	}
