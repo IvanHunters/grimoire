@@ -926,6 +926,33 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 				}
 			}
 		}
+		// Reconnect fallback for grimoire-handle ids (global-*/note-*,
+		// which aren't UUIDs so the smart-attach above skipped them): an
+		// existing daemon worker for this handle is named
+		// "grimoire-<sessionID>". Attach to it instead of spawning a
+		// second worker — otherwise every reconnect / backend restart
+		// piles up another "grimoire-global-*" worker for the same tab,
+		// which is the recurring duplicate-terminal-row bug. Falls through
+		// to a fresh spawn when no live worker is found.
+		if newSession == nil && spawnErr == nil && useDaemonBackend() && !isUUIDLike(sessionID) {
+			client := &daemon.Client{Logger: m.logger}
+			if jobs, err := client.ListSessions(); err == nil {
+				want := "grimoire-" + sessionID
+				for _, j := range jobs {
+					if j.Name == want {
+						if att, aerr := startDaemonSessionAttach(sessionID, j.SessionID, m.logger); aerr == nil {
+							newSession = att
+							m.logger.Info("GetOrCreate: attached to existing bg worker for handle instead of spawning",
+								slog.String("session_id", sessionID),
+								slog.String("worker_uuid", j.SessionID),
+								slog.String("worker_short", j.Short),
+							)
+						}
+						break
+					}
+				}
+			}
+		}
 		if newSession == nil && spawnErr == nil {
 			newSession, spawnErr = startDaemonSession(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger, systemPrompt)
 		}
