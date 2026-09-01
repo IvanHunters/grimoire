@@ -403,7 +403,7 @@ function HomePage() {
         {/* Sidebar resize handle - hidden when collapsed or on mobile */}
         {!sidebarCollapsed && (
           <div
-            className="hidden md:block w-1 bg-gray-200 hover:bg-purple-400 cursor-ew-resize transition-colors flex-shrink-0 dark:bg-gray-700 dark:hover:bg-purple-500"
+            className="hidden md:block w-2 bg-gray-200 hover:bg-purple-400 cursor-ew-resize transition-colors flex-shrink-0 dark:bg-gray-700 dark:hover:bg-purple-500"
             onMouseDown={(e) => {
             e.preventDefault()
             const startX = e.clientX
