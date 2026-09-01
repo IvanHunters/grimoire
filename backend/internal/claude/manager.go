@@ -61,13 +61,25 @@ var (
 	daemonJobsCacheMu  sync.Mutex
 	daemonJobsCacheVal daemonJobsCacheEntry
 	daemonJobsCacheTTL = 1 * time.Second
+	// daemonJobsStaleGrace bounds how long a failed op:list may reuse the
+	// last good job list. The daemon client fails fast for ~5s after a
+	// spawn hiccup (its circuit breaker); without a fallback, every poll
+	// in that window sees no job list, so ListActiveSessions can't run its
+	// stale-drop pass and a dead session's row resurfaces — the sidebar
+	// flips between two sessions sharing a cwd (wrong name on a live row).
+	// Reusing the last good list across the breaker window keeps the list
+	// stable; beyond the grace the error propagates so a real outage still
+	// surfaces rather than pinning a forever-stale snapshot.
+	daemonJobsStaleGrace = 30 * time.Second
 )
 
 // listSessionsCached returns the daemon's op:list result, refreshing
 // from the daemon only when the cached snapshot is older than
 // daemonJobsCacheTTL. A single inflight refresh is serialised by the
 // mutex so a burst of N concurrent SessionStatus callers triggers
-// exactly one op:list.
+// exactly one op:list. On a transient op:list failure it returns the last
+// good list within daemonJobsStaleGrace instead of an error, so a brief
+// daemon hiccup doesn't destabilise the sidebar.
 func listSessionsCached(client *daemon.Client) ([]daemon.Record, error) {
 	daemonJobsCacheMu.Lock()
 	defer daemonJobsCacheMu.Unlock()
@@ -76,6 +88,9 @@ func listSessionsCached(client *daemon.Client) ([]daemon.Record, error) {
 	}
 	jobs, err := client.ListSessions()
 	if err != nil {
+		if daemonJobsCacheVal.jobs != nil && time.Since(daemonJobsCacheVal.fetched) < daemonJobsStaleGrace {
+			return daemonJobsCacheVal.jobs, nil
+		}
 		return nil, err
 	}
 	daemonJobsCacheVal = daemonJobsCacheEntry{jobs: jobs, fetched: time.Now()}
@@ -1283,8 +1298,13 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	var jobs []daemon.Record
 	daemonReachable := false
 	if useDaemonBackend() {
-		client := &daemon.Client{}
-		if list, err := client.ListSessions(); err == nil {
+		client := &daemon.Client{Logger: m.logger}
+		// Use the cached list with last-good fallback: a transient op:list
+		// failure (e.g. the daemon client's ~5s circuit-breaker window)
+		// otherwise leaves daemonReachable=false, which skips the stale-drop
+		// pass below and lets dead sessions' rows resurface — the sidebar
+		// flips between two sessions sharing a cwd.
+		if list, err := listSessionsCached(client); err == nil {
 			daemonReachable = true
 			jobs = list
 			jobsByShort = make(map[string]daemon.Record, len(list))
