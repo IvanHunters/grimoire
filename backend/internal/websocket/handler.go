@@ -1103,8 +1103,7 @@ func (h *Handler) handleTerminalResize(conn *websocket.Conn, msg *WSMessage) {
 		return
 	}
 
-	// session.Resize routes to creack/pty for subprocess sessions or
-	// daemon.AttachConn.Resize for daemon-backed ones.
+	// session.Resize forwards to daemon.AttachConn.Resize (op:resize).
 	if err := session.Resize(msg.Cols, msg.Rows); err != nil {
 		h.logger.Error("failed to resize PTY",
 			slog.String("session_id", msg.SessionID),

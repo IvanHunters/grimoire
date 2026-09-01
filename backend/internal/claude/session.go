@@ -2,8 +2,8 @@ package claude
 
 import (
 	"errors"
+	"fmt"
 	"io"
-	"os/exec"
 	"sync"
 	"time"
 
@@ -34,15 +34,13 @@ var ErrWorkerShutdown = errors.New("session worker has been shut down")
 // restart) but the WS connection is still alive forwarding keystrokes.
 func IsShutdownErr(err error) bool { return errors.Is(err, ErrWorkerShutdown) }
 
-// ClaudeSession represents an active Claude session. Backed by either a
-// local subprocess (Cmd != nil, PTY is a creack/pty *os.File) or by the
-// claude daemon (Cmd == nil, PTY is a *daemon.AttachConn). Callers should
-// not assume which — use the methods, not the underlying type.
+// ClaudeSession represents an active Claude session. Every session is
+// hosted by the claude daemon: PTY is a *daemon.AttachConn. Callers should
+// use the methods, not the underlying type.
 type ClaudeSession struct {
 	ID            string
 	Name          string
-	Cmd           *exec.Cmd          // nil when daemon-backed
-	PTY           io.ReadWriteCloser // PTY for subprocess; AttachConn for daemon
+	PTY           io.ReadWriteCloser // daemon AttachConn
 	DangerousMode bool
 	WorkingDir    string
 	MCPConfigPath string
@@ -57,7 +55,7 @@ type ClaudeSession struct {
 	Messages        []models.ClaudeMessage // History stored on backend
 	OutputBuffer    []byte                 // Circular buffer for terminal output (last 500KB)
 
-	// Daemon-backend fields. All nil/empty for subprocess sessions.
+	// Daemon-backend fields, set for every session.
 	DaemonClient *daemon.Client // socket client; non-nil ↔ daemon-backed
 	DaemonShort  string         // 8-hex short id used by daemon ops
 	DaemonUUID   string         // full UUID claude assigned (differs from ID)
@@ -76,15 +74,6 @@ type ClaudeSession struct {
 	readerDone     chan struct{}
 	readerDoneInit sync.Once
 	readerDoneSig  sync.Once
-
-	// procExit signals that the subprocess Cmd.Wait goroutine has
-	// returned. Reading cmd.ProcessState directly races against the
-	// Wait goroutine writing it (Go race detector flags it); checking
-	// this channel via non-blocking select instead is race-free.
-	// Subprocess-backend only; nil for daemon-backed sessions.
-	procExit     chan struct{}
-	procExitInit sync.Once
-	procExitSig  sync.Once
 
 	subscribers []chan []byte // Fan-out: each WebSocket connection gets its own channel
 	subMu       sync.Mutex
@@ -106,9 +95,7 @@ type ClaudeSession struct {
 // daemon vs. a local subprocess we own.
 func (s *ClaudeSession) IsDaemonBacked() bool { return s.DaemonClient != nil }
 
-// Resize forwards a terminal-size change to the right backend: the daemon
-// over op:resize, or the local PTY via creack/pty.Setsize. The latter is
-// implemented in subprocess.go because it requires a *os.File.
+// Resize forwards a terminal-size change to the daemon over op:resize.
 func (s *ClaudeSession) Resize(cols, rows int) error {
 	// Snapshot PTY under mu so we don't race ShutdownWorker nil-assigning it.
 	s.mu.Lock()
@@ -117,12 +104,11 @@ func (s *ClaudeSession) Resize(cols, rows int) error {
 	if pty == nil {
 		return ErrWorkerShutdown
 	}
-	if s.IsDaemonBacked() {
-		if ac, ok := pty.(*daemon.AttachConn); ok {
-			return ac.Resize(cols, rows)
-		}
+	ac, ok := pty.(*daemon.AttachConn)
+	if !ok {
+		return fmt.Errorf("resize: session PTY is not a daemon AttachConn")
 	}
-	return resizeSubprocessPTY(pty, cols, rows)
+	return ac.Resize(cols, rows)
 }
 
 // WriteInput safely writes bytes to the PTY. Used by handleTerminalInput
@@ -448,45 +434,3 @@ func (s *ClaudeSession) SignalReaderDone() {
 	})
 }
 
-// ProcExitSignal returns the channel that's closed when the subprocess
-// Cmd.Wait goroutine returns. Use IsProcessDone for the common
-// "did it exit yet" check; this accessor exists for callers that need
-// to block until exit. Lazy-initialized.
-func (s *ClaudeSession) ProcExitSignal() <-chan struct{} {
-	s.procExitInit.Do(func() {
-		s.procExit = make(chan struct{})
-	})
-	return s.procExit
-}
-
-// SignalProcExit closes the procExit channel exactly once. Called by
-// the cmd.Wait goroutine in startClaudeSubprocess after Wait returns.
-func (s *ClaudeSession) SignalProcExit() {
-	s.procExitInit.Do(func() {
-		s.procExit = make(chan struct{})
-	})
-	s.procExitSig.Do(func() {
-		close(s.procExit)
-	})
-}
-
-// IsProcessDone reports whether the subprocess Cmd has exited, as
-// observed via the procExit channel. Race-free replacement for
-// `cmd.ProcessState != nil && cmd.ProcessState.Exited()` which races
-// against cmd.Wait writing ProcessState. Returns true for daemon-
-// backed sessions (no subprocess to wait on).
-func (s *ClaudeSession) IsProcessDone() bool {
-	if s.procExit == nil {
-		// Channel never initialized — for subprocess sessions this
-		// means the Wait goroutine never started (unexpected) or the
-		// session is daemon-backed. Treat as "done" so shutdown
-		// doesn't try to signal a phantom process.
-		return true
-	}
-	select {
-	case <-s.procExit:
-		return true
-	default:
-		return false
-	}
-}

@@ -89,8 +89,7 @@ func readHistoricalHeader(path string) (discovery.TranscriptHeader, error) {
 
 // startDaemonSession spawns a new background session via the claude daemon
 // and attaches to it, returning a ClaudeSession whose PTY field is the
-// AttachConn bridge. This is the daemon-backed counterpart to
-// startClaudeSubprocess.
+// AttachConn bridge.
 //
 // The session keeps running in the daemon after grimoire restarts —
 // reconnecting on next GetOrCreate is a matter of calling op:list +
@@ -616,8 +615,7 @@ func attachDaemonSession(
 	session := &ClaudeSession{
 		ID:            sessionID,
 		Name:          displayName,
-		Cmd:           nil, // not subprocess-owned
-		PTY:           ac,  // *daemon.AttachConn satisfies io.ReadWriteCloser
+		PTY:           ac, // *daemon.AttachConn satisfies io.ReadWriteCloser
 		DangerousMode: dangerousMode,
 		WorkingDir:    workingDir,
 		MCPConfigPath: mcpConfigPath,

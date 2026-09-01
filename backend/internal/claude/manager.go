@@ -786,44 +786,28 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 			return session, nil
 		}
 
-		// Dangerous mode mismatch. For daemon-backed sessions this flag
+		// Dangerous mode mismatch. Sessions are daemon-backed, so this flag
 		// is purely a UI marker — the actual `claude` process inside the
 		// daemon worker doesn't observe it. Killing and respawning the
-		// daemon worker just because the UI flag flipped destroys the
+		// daemon worker just because the UI flag flipped would destroy the
 		// live conversation (and the JSONL scrollback) for no benefit.
-		// Just align the flag in-memory and keep going.
-		//
-		// For subprocess sessions the flag actually changes the spawned
-		// process's CLI args (--dangerously-skip-permissions), so we keep
-		// the old shutdown-and-recreate behaviour there.
-		if session.IsDaemonBacked() {
-			m.logger.Info("dangerous_mode flag changed for daemon session, syncing in-memory only",
-				slog.String("session_id", sessionID),
-				slog.Bool("was", currentDangerous),
-				slog.Bool("now", dangerousMode),
-			)
-			session.SetDangerousMode(dangerousMode)
-			session.UpdateActivity()
-			go func() {
-				if m.storage != nil {
-					m.storage.UpdateSessionActivity(ctx, sessionID)
-				}
-			}()
-			return session, nil
-		}
-
-		m.mu.Lock()
-		delete(m.sessions, sessionID)
-		m.mu.Unlock()
-		if err := shutdownSession(session, m.logger); err != nil {
-			m.logger.Error("failed to shutdown session for restart", slog.Any("error", err))
-		}
-		if m.storage != nil {
-			m.storage.UpdateSessionStatus(ctx, sessionID, "inactive")
-		}
+		// Align the flag in-memory and keep going.
+		m.logger.Info("dangerous_mode flag changed for daemon session, syncing in-memory only",
+			slog.String("session_id", sessionID),
+			slog.Bool("was", currentDangerous),
+			slog.Bool("now", dangerousMode),
+		)
+		session.SetDangerousMode(dangerousMode)
+		session.UpdateActivity()
+		go func() {
+			if m.storage != nil {
+				m.storage.UpdateSessionActivity(ctx, sessionID)
+			}
+		}()
+		return session, nil
 	}
 
-	// Slow path: DB lookup + subprocess creation — all outside the lock.
+	// Slow path: DB lookup + daemon session creation — all outside the lock.
 	var dbSessionName string
 	var mcpConfigPath string
 	var restoredMessages []models.ClaudeMessage
@@ -1106,7 +1090,7 @@ func (m *SessionManager) ShutdownWorker(sessionID string) error {
 		return fmt.Errorf("failed to shutdown worker: %w", err)
 	}
 
-	// Wait for the PTY reader goroutine to exit before nil-ing PTY/Cmd,
+	// Wait for the PTY reader goroutine to exit before nil-ing PTY,
 	// otherwise it can race a final Read against our clear and panic on
 	// the nil deref. Bounded by a short timeout so a stuck reader can't
 	// hang shutdown forever.
@@ -1121,7 +1105,6 @@ func (m *SessionManager) ShutdownWorker(sessionID string) error {
 	// Name + ID so the entry is recognizable on the next restart.
 	m.mu.Lock()
 	session.PTY = nil
-	session.Cmd = nil
 	session.DaemonShort = ""
 	// DaemonClient may still be needed for status checks, leave intact.
 	m.mu.Unlock()
@@ -1430,33 +1413,28 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			UpdatedAt:     now,
 			LastActivity:  s.lastActivity,
 		}
-		if s.daemonBacked {
-			if rec, ok := jobsByShort[s.daemonShort]; ok {
-				out.Tempo = rec.Tempo
-				out.State = rec.State
-				out.Detail = rec.Detail
-				out.Needs = rec.Needs
-				if out.Tempo == "active" {
-					userHasTyped := !s.lastUserInputAt.IsZero()
-					jsonlStale := false
-					if mtime, found := jsonlMtimeFor(s.daemonUUID); found {
-						jsonlStale = time.Since(mtime) > 30*time.Second
-					}
-					switch {
-					case !userHasTyped:
-						out.Tempo = "idle"
-					case jsonlStale:
-						out.Tempo = "idle"
-					}
+		if rec, ok := jobsByShort[s.daemonShort]; ok {
+			out.Tempo = rec.Tempo
+			out.State = rec.State
+			out.Detail = rec.Detail
+			out.Needs = rec.Needs
+			if out.Tempo == "active" {
+				userHasTyped := !s.lastUserInputAt.IsZero()
+				jsonlStale := false
+				if mtime, found := jsonlMtimeFor(s.daemonUUID); found {
+					jsonlStale = time.Since(mtime) > 30*time.Second
 				}
-			} else {
-				out.Tempo = "idle"
-				out.State = "running"
-				out.Detail = "in grimoire memory"
+				switch {
+				case !userHasTyped:
+					out.Tempo = "idle"
+				case jsonlStale:
+					out.Tempo = "idle"
+				}
 			}
 		} else {
-			out.Tempo = "active"
+			out.Tempo = "idle"
 			out.State = "running"
+			out.Detail = "in grimoire memory"
 		}
 		// Dedupe by daemon worker identity: one worker can be registered
 		// under multiple manager keys (its UUID entry AND a grimoire
@@ -1619,26 +1597,6 @@ func (m *SessionManager) GetSessionStatus(sessionID string) (SessionStatus, erro
 	// re-derive the canonical name from the daemon UUID alone, which can
 	// differ from the grimoireID after resume/fork).
 	name := session.GetName()
-
-	if !session.IsDaemonBacked() {
-		// Subprocess: alive if Cmd hasn't exited yet. Use the race-free
-		// IsProcessDone() channel check instead of cmd.ProcessState
-		// (which races against cmd.Wait writes).
-		state := "running"
-		tempo := "active"
-		if session.Cmd != nil && session.IsProcessDone() {
-			state = "done"
-			tempo = "idle"
-		}
-		return SessionStatus{
-			SessionID:    sessionID,
-			Name:         name,
-			DaemonBacked: false,
-			Tempo:        tempo,
-			State:        state,
-			Detail:       "subprocess",
-		}, nil
-	}
 
 	// Daemon-backed: ask the daemon for the live record. Cached briefly
 	// to coalesce sidebar-polling bursts across N sessions.
