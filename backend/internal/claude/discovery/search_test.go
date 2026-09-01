@@ -84,6 +84,35 @@ func TestSearch_IgnoresMetadataEvents(t *testing.T) {
 	}
 }
 
+func TestSearch_IgnoresToolResultDumps(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", root)
+	dir := filepath.Join(root, "-x")
+	os.MkdirAll(dir, 0755)
+
+	// A synthetic user turn that carries a tool_result back to the model:
+	// the output of reading a shared index (MEMORY.md, note listing) that
+	// mentions "ignite" only as an unrelated link. This pollutes nearly
+	// every session, so it MUST NOT match — search targets the actual
+	// conversation, not dumped file/tool output.
+	path := filepath.Join(dir, "toolres.jsonl")
+	lines := []string{
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"- [Ignite handshake size limit](reference_ignite_handshake_size_limit.md) — unrelated memory index line"}]}}`,
+		`{"type":"user","message":{"role":"user","content":"the conversation was about keycloak sync only"}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	hits, err := Search(context.Background(), "ignite", "", 100)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Errorf("expected 0 hits (tool_result dump not searchable), got %d: %#v", len(hits), hits)
+	}
+}
+
 func TestSearch_FilterByCwd(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CLAUDE_PROJECTS_DIR", root)

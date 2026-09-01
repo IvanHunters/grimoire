@@ -215,26 +215,24 @@ func extractMessageText(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &withStr); err == nil && withStr.Content != "" {
 		return withStr.Content
 	}
-	// Try array of blocks (assistant or user-with-tool-result).
+	// Try array of blocks (assistant, or user-with-tool-result).
 	var withArr struct {
 		Content []struct {
-			Type    string `json:"type"`
-			Text    string `json:"text"`
-			Content string `json:"content"`
+			Type string `json:"type"`
+			Text string `json:"text"`
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(raw, &withArr); err == nil {
 		var parts []string
 		for _, b := range withArr.Content {
-			switch b.Type {
-			case "text":
-				if b.Text != "" {
-					parts = append(parts, b.Text)
-				}
-			case "tool_result":
-				if b.Content != "" {
-					parts = append(parts, b.Content)
-				}
+			// Only actual conversation prose is searchable. tool_result
+			// blocks carry dumped tool/file output (note listings, the
+			// MEMORY.md auto-memory index, git diffs) that mention terms
+			// from unrelated notes — indexing them makes every session
+			// that touched a shared index match every term in it. That
+			// noise is exactly what we must exclude.
+			if b.Type == "text" && b.Text != "" {
+				parts = append(parts, b.Text)
 			}
 		}
 		return strings.Join(parts, " ")
