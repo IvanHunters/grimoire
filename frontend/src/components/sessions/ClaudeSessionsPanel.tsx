@@ -72,6 +72,25 @@ export function ClaudeSessionsPanel({
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  // Sidebar filter: by status tier and by a free-text query (matches the
+  // session name locally, plus transcript CONTENT via the search API).
+  const [statusFilter, setStatusFilter] = useState<'all' | 'needs' | 'working' | 'ready'>('all')
+  const [query, setQuery] = useState('')
+  const [contentHitIds, setContentHitIds] = useState<Set<string>>(new Set())
+  // Debounced content search — union its session ids into the visible set
+  // so a query also surfaces sessions matched by transcript text, not just
+  // by name. Cleared when the query is short/empty.
+  useEffect(() => {
+    let cancelled = false
+    const t = window.setTimeout(() => {
+      const q = query.trim()
+      if (q.length < 2) { if (!cancelled) setContentHitIds(new Set()); return }
+      sessionsAPI.search(q, { limit: 100 })
+        .then((hits) => { if (!cancelled) setContentHitIds(new Set(hits.map((h) => h.sessionId))) })
+        .catch(() => { /* transient search failure — keep prior hits */ })
+    }, 250)
+    return () => { cancelled = true; window.clearTimeout(t) }
+  }, [query])
   // Session ids currently open in a live UI surface — the active Quick
   // Terminal tab and any chat/attach modal (ResumeChatModal) — published
   // to the in-memory openSessions store. This is what the sidebar
@@ -398,6 +417,20 @@ export function ClaudeSessionsPanel({
     ...orderedNoStatus,
   ]
 
+  // Apply the sidebar filters (status tier + name/content query) on top of
+  // the tiered order. Text matches the session name locally OR a
+  // transcript-content hit id from the search API.
+  const q = query.trim().toLowerCase()
+  const filterActive = statusFilter !== 'all' || q.length > 0
+  const matchesStatus = (s: ClaudeSession) =>
+    statusFilter === 'all' ||
+    (statusFilter === 'needs' && needsYou(s)) ||
+    (statusFilter === 'working' && isWorking(s)) ||
+    (statusFilter === 'ready' && isReady(s))
+  const matchesText = (s: ClaudeSession) =>
+    q.length < 1 || (s.name || '').toLowerCase().includes(q) || contentHitIds.has(s.id)
+  const visibleSessions = orderedSessions.filter((s) => matchesStatus(s) && matchesText(s))
+
   const handleDragStart = (id: string) => setDragId(id)
   const handleDragOver = (e: React.DragEvent, idx: number) => {
     e.preventDefault()
@@ -482,16 +515,48 @@ export function ClaudeSessionsPanel({
           </div>
         </div>
 
+        {/* Filter: text (name + content) and status tier */}
+        {!collapsed && (
+          <div className="px-2 pb-1.5 space-y-1.5">
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="filter by name or content…"
+              className="w-full text-xs font-mono bg-white/[0.03] border border-white/[0.06] rounded px-2 py-1 text-slate-300 placeholder:text-slate-600 outline-none focus:border-purple-500/40"
+            />
+            <div className="flex items-center gap-1">
+              {([
+                ['all', 'all'],
+                ['needs', 'ждёт'],
+                ['working', 'в работе'],
+                ['ready', 'готово'],
+              ] as const).map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setStatusFilter(key)}
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors ${
+                    statusFilter === key
+                      ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
+                      : 'text-slate-500 border-white/[0.06] hover:text-slate-300'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* List */}
         {!collapsed && (
           <div className="overflow-y-auto px-2 pb-2" style={{ height: `${height}px` }}>
-            {sessions.length === 0 ? (
+            {visibleSessions.length === 0 ? (
               <div className="text-[10px] font-mono text-slate-700 px-2 py-4 text-center tracking-wider uppercase">
-                no active sessions
+                {filterActive ? 'no matches' : 'no active sessions'}
               </div>
             ) : (
               <div className="space-y-0.5" onDragLeave={() => setDragOverIdx(null)}>
-                {orderedSessions.map((session, idx) => {
+                {visibleSessions.map((session, idx) => {
                   // Display name priority:
                   //   1. For note-task-<id> sessions: REAL task title
                   //      (we look it up via /api/tasks). claude tends to
