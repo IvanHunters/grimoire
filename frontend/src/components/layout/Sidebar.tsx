@@ -130,7 +130,7 @@ function FolderTreeNode({
         ) : (
           <Folder className={`w-3.5 h-3.5 ${isSkillFolder ? 'text-amber-700' : 'text-cyan-700'}`} />
         )}
-        <span className={`text-xs font-mono ${isSkillsRoot ? 'text-amber-400' : 'text-slate-400'}`}>{folder.name}</span>
+        <span className={`text-sm font-mono ${isSkillsRoot ? 'text-amber-400' : 'text-slate-400'}`}>{folder.name}</span>
         {skillState && !skillState.enabled && (
           <span className="text-[9px] font-mono text-slate-700 uppercase ml-1">off</span>
         )}
@@ -177,7 +177,7 @@ function FolderTreeNode({
               {/* Chevron-width spacer so note icons align with sibling sub-folder icons */}
               <span className="w-3.5 flex-shrink-0" />
               <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${currentNote?.id === note.id ? 'text-cyan-500' : 'text-slate-600'}`} />
-              <span className={`text-xs font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
+              <span className={`text-sm font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
             </button>
           ))}
         </div>
@@ -993,7 +993,7 @@ function Sidebar({ width = 256, collapsed = false, onToggleCollapse, onNoteSelec
                 {/* Chevron-width spacer so root note icons align with root folder icons */}
                 <span className="w-3.5 flex-shrink-0" />
                 <FileText className={`w-3.5 h-3.5 flex-shrink-0 ${currentNote?.id === note.id ? 'text-cyan-500' : 'text-slate-600'}`} />
-                <span className={`text-xs font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
+                <span className={`text-sm font-mono truncate ${currentNote?.id === note.id ? 'text-cyan-300' : 'text-slate-400'}`}>{note.title}</span>
               </button>
             ))}
         </div>
