@@ -166,16 +166,26 @@ func isUUIDLike(s string) bool {
 	return true
 }
 
-// useDaemonBackend reports whether new sessions should be hosted by the
-// claude daemon instead of an in-process subprocess. Toggled by the
-// USE_DAEMON_BACKEND env var (any non-empty value enables).
-//
-// This is intentionally an env-only switch for now — daemon-backend is
-// dev-validated, not yet a user-facing setting. When we're confident,
-// we'll flip the default and the flag becomes inverted (USE_SUBPROCESS).
+// useDaemonBackend reports whether new sessions are hosted by the claude
+// daemon. The in-process PTY subprocess backend has been removed: raw
+// subprocesses produced orphan sessions with no DaemonUUID, no persisted
+// JSONL transcript, and contaminated names. The daemon is now the only
+// backend, so this always reports true — kept as a single seam the daemon
+// call sites still branch on.
 func useDaemonBackend() bool {
-	return os.Getenv("USE_DAEMON_BACKEND") != ""
+	return true
 }
+
+// daemonSpawnRetries / daemonSpawnRetryBackoff bound the non-subprocess
+// fallback: on a transient daemon spawn failure the manager forces the
+// daemon up and retries this many times, sleeping between attempts. The
+// backoff is sized to outlast the daemon client's ~5s lazy-start circuit
+// breaker so a retry lands after the breaker clears rather than fast-failing
+// inside its window.
+const (
+	daemonSpawnRetries      = 3
+	daemonSpawnRetryBackoff = 2500 * time.Millisecond
+)
 
 // SessionStorage interface for persisting sessions
 type SessionStorage interface {
@@ -956,15 +966,28 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 		if newSession == nil && spawnErr == nil {
 			newSession, spawnErr = startDaemonSession(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger, systemPrompt)
 		}
-		if spawnErr != nil {
-			m.logger.Warn("daemon backend failed, falling back to subprocess",
+		// Daemon is the only backend. A transient daemon failure (typically
+		// the ~5s lazy-start circuit-breaker window right after a spawn
+		// hiccup) must NOT silently degrade to a raw PTY subprocess: that
+		// produced orphan sessions with no DaemonUUID, no persisted JSONL,
+		// and contaminated names. Force the daemon up (bypassing the breaker)
+		// and retry the spawn a few times; only a genuinely unavailable
+		// daemon surfaces as an error the UI can show.
+		for attempt := 1; spawnErr != nil && attempt <= daemonSpawnRetries; attempt++ {
+			m.logger.Warn("daemon session spawn failed, forcing daemon up and retrying",
 				slog.String("session_id", sessionID),
+				slog.Int("attempt", attempt),
 				slog.Any("error", spawnErr),
 			)
-			newSession, spawnErr = startClaudeSubprocess(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger, systemPrompt)
+			if ensErr := daemon.EnsureRunning(m.logger); ensErr != nil {
+				spawnErr = fmt.Errorf("daemon unavailable (attempt %d/%d): %w", attempt, daemonSpawnRetries, ensErr)
+			} else {
+				newSession, spawnErr = startDaemonSession(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger, systemPrompt)
+			}
+			if spawnErr != nil {
+				time.Sleep(daemonSpawnRetryBackoff)
+			}
 		}
-	} else {
-		newSession, spawnErr = startClaudeSubprocess(sessionID, dangerousMode, workingDir, m.mongoURI, m.mongoDatabase, m.logger, systemPrompt)
 	}
 	if spawnErr != nil {
 		return nil, fmt.Errorf("failed to start claude session: %w", spawnErr)

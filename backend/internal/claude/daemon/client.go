@@ -398,6 +398,51 @@ func startDaemonLazily(logger *slog.Logger) error {
 	return nil
 }
 
+// EnsureRunning forces the daemon supervisor up and waits for its control
+// socket to become dialable. Unlike resolveSock's opportunistic path it
+// deliberately ignores the daemonDownUntil circuit-breaker window: callers
+// use it as an explicit recovery step after a spawn failure, where the
+// whole point is to retry past the back-off rather than fail fast. Returns
+// nil once the socket answers, an error if the daemon can't be brought up.
+//
+// This is the non-subprocess fallback for session creation: when a daemon
+// dispatch fails transiently (typically the 5s breaker right after a
+// hiccup), the manager calls EnsureRunning and retries the daemon spawn
+// instead of degrading to a raw PTY subprocess.
+func EnsureRunning(logger *slog.Logger) error {
+	// Drop the circuit breaker so the dial-check and startDaemonLazily
+	// below actually attempt work instead of short-circuiting.
+	daemonDownUntil.Store(0)
+
+	dialable := func() bool {
+		sock, err := FindSock()
+		if err != nil {
+			return false
+		}
+		conn, derr := net.DialTimeout("unix", sock, 300*time.Millisecond)
+		if derr != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
+	}
+
+	if dialable() {
+		return nil
+	}
+	if err := startDaemonLazily(logger); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if dialable() {
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return fmt.Errorf("daemon spawned but control socket never became reachable")
+}
+
 // request sends one newline-framed JSON request and returns the first reply
 // line. On transient daemon-startup errors (ESTARTING / ENOCONN) it retries
 // up to 10 times with 200ms backoff, matching the claude-side behaviour.
