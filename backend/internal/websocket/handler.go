@@ -580,7 +580,14 @@ resumeResolved:
 	// sessions: they don't have a separate daemon UUID exposed in the
 	// listing the same way, and the listing already pulls the right
 	// name from the note path. Best-effort — log on failure.
-	if msg.SessionName != "" && !strings.HasPrefix(msg.SessionName, "grimoire-") && h.sessionStorage != nil && session.DaemonUUID != "" {
+	// Gate on DaemonUUID == msg.SessionID: only persist the name under the
+	// daemon UUID when it IS this session's own id (no drift). A differing
+	// UUID means a fork/resume or a drifted resolution onto another
+	// session's worker — writing the name there is how one title
+	// contaminated unrelated records ("Blockstor" onto "daily clients
+	// report", "qosi" onto "КТЖ"). The grimoire-id write above already
+	// names this session's own row authoritatively.
+	if msg.SessionName != "" && !strings.HasPrefix(msg.SessionName, "grimoire-") && h.sessionStorage != nil && session.DaemonUUID != "" && session.DaemonUUID == msg.SessionID {
 		go func(uuid, name string) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
