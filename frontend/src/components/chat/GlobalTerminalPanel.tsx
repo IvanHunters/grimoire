@@ -81,13 +81,16 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
   // deduped sidebar row carries.
   const activeUuid = activeStatus?.daemonUuid
   useEffect(() => {
-    if (!visible || !activeSessionId) return
-    markSessionOpen(activeSessionId)
-    if (activeUuid) markSessionOpen(activeUuid)
-    return () => {
-      markSessionClosed(activeSessionId)
-      if (activeUuid) markSessionClosed(activeUuid)
-    }
+    if (!visible) return
+    // Publish exactly ONE id for the active terminal: the daemon UUID
+    // (the id the deduped sidebar row uses) when known, else the tab's
+    // own id. Publishing BOTH lit up two different rows when the tab id
+    // and its uuid resolved to distinct rows — the "2 sessions
+    // highlighted at once" bug.
+    const openId = activeUuid || activeSessionId
+    if (!openId) return
+    markSessionOpen(openId)
+    return () => markSessionClosed(openId)
   }, [visible, activeSessionId, activeUuid])
   // Defer mounting terminals until panel is first opened — prevents phantom WS sessions on load
   const [everOpened, setEverOpened] = useState(false)
