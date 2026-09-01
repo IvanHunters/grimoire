@@ -403,7 +403,7 @@ function HomePage() {
         {/* Sidebar resize handle - hidden when collapsed or on mobile */}
         {!sidebarCollapsed && (
           <div
-            className="hidden md:block w-2 bg-gray-200 hover:bg-purple-400 cursor-ew-resize transition-colors flex-shrink-0 dark:bg-gray-700 dark:hover:bg-purple-500"
+            className="hidden md:flex group w-2 cursor-ew-resize flex-shrink-0 items-stretch justify-center"
             onMouseDown={(e) => {
             e.preventDefault()
             const startX = e.clientX
@@ -422,7 +422,10 @@ function HomePage() {
             document.addEventListener('mousemove', handleMouseMove)
             document.addEventListener('mouseup', handleMouseUp)
           }}
-          />
+          >
+            {/* Thin visible line, centered in the wider grab zone above. */}
+            <div className="w-px bg-gray-200 group-hover:bg-purple-400 dark:bg-gray-700 dark:group-hover:bg-purple-500 transition-colors" />
+          </div>
         )}
 
         {/* Editor/Preview area */}
