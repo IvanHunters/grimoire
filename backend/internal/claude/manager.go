@@ -1440,29 +1440,19 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			if key == "" {
 				key = s.id
 			}
-			isHandle := func(id string) bool {
-				return strings.HasPrefix(id, "global-") || strings.HasPrefix(id, "note-")
-			}
 			if idx, ok := seenUUID[key]; ok {
-				// A row for this worker already exists. Only collapse when
-				// one side is a grimoire-handle ALIAS (global-*/note-*) of
-				// the same worker — that's a safe duplicate. NEVER drop a
-				// distinct UUID-identified session that merely shares a
-				// worker key (that happens on a mis-attach); hiding it
-				// would make an 11MB conversation unreachable. When both
-				// are UUIDs, keep both.
-				switch {
-				case isHandle(s.id):
-					continue // drop this handle alias, keep existing row
-				case isHandle(sessions[idx].ID):
-					sessions[idx] = out // replace handle alias with canonical UUID
-					continue
-				default:
-					// both UUIDs — distinct sessions, keep both
+				// Same daemon worker already has a row — keep one. This
+				// collapses resume aliases (a parent session resumed into
+				// a fresh worker shows under both its own id and the
+				// worker's uuid). Prefer the canonical entry whose id is
+				// the worker's own identity (id == key) so the live row
+				// wins over the alias.
+				if s.id == key {
+					sessions[idx] = out
 				}
-			} else {
-				seenUUID[key] = len(sessions)
+				continue
 			}
+			seenUUID[key] = len(sessions)
 		}
 		sessions = append(sessions, out)
 	}
