@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Terminal, ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
 import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
-import { sessionsAPI } from '../../api/sessions'
+import { sessionsAPI, type SessionListItem } from '../../api/sessions'
 import { tasksAPI } from '../../api/tasks'
 import type { ClaudeSession } from '../../types/claude'
 import { SessionStatusPill, formatSessionAge } from './SessionStatusPill'
@@ -51,6 +51,11 @@ export function ClaudeSessionsPanel({
   onMobileClose,
 }: ClaudeSessionsPanelProps) {
   const [sessions, setSessions] = useState<ClaudeSession[]>([])
+  // ALL sessions on disk (active + historical), from listByProject. Only
+  // used to widen the filter pool so a name/content query finds sessions
+  // that aren't currently live (the active list alone missed e.g. an
+  // "Ignite Client" historical session).
+  const [allItems, setAllItems] = useState<SessionListItem[]>([])
   // taskTitles maps task-id → human title so note-task-<id> sessions
   // can show their task's real name in the panel instead of the
   // claude-auto-renamed "Load and review task details" that comes
@@ -180,6 +185,7 @@ export function ClaudeSessionsPanel({
           }
         })
         setSessions(liveSessions)
+        setAllItems(byProject)
       } catch (err) {
         console.error('Failed to load Claude sessions:', err)
       }
@@ -429,7 +435,33 @@ export function ClaudeSessionsPanel({
     (statusFilter === 'ready' && isReady(s))
   const matchesText = (s: ClaudeSession) =>
     q.length < 1 || (s.name || '').toLowerCase().includes(q) || contentHitIds.has(s.id)
-  const visibleSessions = orderedSessions.filter((s) => matchesStatus(s) && matchesText(s))
+  // When a text query is set, widen the pool to ALL sessions (active +
+  // historical from listByProject) so name/content matches surface even
+  // for sessions that aren't currently live. Map by-project items to the
+  // ClaudeSession shape and dedupe against the active list.
+  const b2c = (b: SessionListItem): ClaudeSession => ({
+    id: b.sessionId,
+    name: b.name,
+    workingDir: b.cwd,
+    dangerousMode: false,
+    messages: [],
+    isActive: !!b.live,
+    initialized: true,
+    lastActivity: b.lastActivity,
+    createdAt: b.startedAt,
+    tempo: b.live?.tempo,
+    state: b.live?.state,
+    detail: b.live?.detail,
+    needs: b.live?.needs,
+  })
+  const activeIds = new Set(sessions.map((s) => s.id))
+  const pool: ClaudeSession[] =
+    q.length >= 1
+      ? [...sessions, ...allItems.filter((b) => !activeIds.has(b.sessionId)).map(b2c)]
+      : sessions
+  const visibleSessions = filterActive
+    ? pool.filter((s) => matchesStatus(s) && matchesText(s)).sort(byCreatedDesc)
+    : orderedSessions
 
   const handleDragStart = (id: string) => setDragId(id)
   const handleDragOver = (e: React.DragEvent, idx: number) => {
