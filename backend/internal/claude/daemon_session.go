@@ -234,13 +234,13 @@ func startDaemonSessionResume(
 
 	// Daemon name is a STRUCTURED token used by listing.go's
 	// splitResumeChildren to merge this resumed worker back into its
-	// historical parent. Always "grimoire-resume-<short>" — UI never
+	// historical parent. Always "grimoire-resume-<full-uuid>" — UI never
 	// sees this string. The human-readable name (sessionName arg, or
 	// the historical session's name looked up below) goes into the
 	// in-manager session.Name for display.
-	daemonName := fmt.Sprintf("grimoire-resume-%s", resumeFromUUID[:8])
+	daemonName := fmt.Sprintf("grimoire-resume-%s", resumeFromUUID)
 	if fork {
-		daemonName = fmt.Sprintf("grimoire-fork-%s", resumeFromUUID[:8])
+		daemonName = fmt.Sprintf("grimoire-fork-%s", resumeFromUUID)
 	}
 
 	// Pick the display name. Caller may have passed one explicitly
@@ -271,7 +271,7 @@ func startDaemonSessionResume(
 	// Skip for fork — forks intentionally create a new session UUID
 	// so collision with the original is fine.
 	if !fork {
-		expectedChildName := fmt.Sprintf("grimoire-resume-%s", resumeFromUUID[:8])
+		expectedChildName := fmt.Sprintf("grimoire-resume-%s", resumeFromUUID)
 		jobs, _ := client.ListSessions()
 		for i := range jobs {
 			j := jobs[i]
@@ -448,7 +448,7 @@ func startDaemonSessionAttach(
 	// listing merges these as one row, so the frontend naturally uses
 	// the parent UUID for attach. Map back to the child here.
 	if rec == nil && len(daemonSessionUUID) >= 8 {
-		want := "grimoire-resume-" + daemonSessionUUID[:8]
+		want := "grimoire-resume-" + daemonSessionUUID
 		for i := range jobs {
 			if jobs[i].Name == want {
 				logger.Info("attach resolved historical UUID to resume-child",

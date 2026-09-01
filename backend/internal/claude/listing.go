@@ -188,7 +188,7 @@ func ListSessionsByCwdOverlay(cwd string, overlay NameOverlay) ([]SessionListIte
 //   - "regular" live sessions (fresh spawns, attaches, etc)
 //   - resume-spawn sessions whose name encodes the original historical
 //     short id (our startDaemonSessionResume sets name to
-//     "grimoire-resume-<8hex>" — that hex is the prefix of the
+//     "grimoire-resume-<full-uuid>" — that uuid identifies the
 //     historical session being resumed).
 //
 // The resume-spawn bucket is keyed by the original short so the merge
@@ -296,7 +296,7 @@ func listSessionsByCwd(cwd string, overlay NameOverlay, managedLive map[string]b
 			if r.Name != "" && !strings.HasPrefix(r.Name, "grimoire-") {
 				item.Name = r.Name
 			}
-		} else if r, ok := resumeOf[h.SessionID[:8]]; ok {
+		} else if r, ok := resumeOf[h.SessionID]; ok {
 			// Historical session has been resumed — that live record is
 			// actually a child of this row, surface it as our live state
 			// rather than letting it appear as a separate "grimoire-resume-*"
@@ -309,7 +309,7 @@ func listSessionsByCwd(cwd string, overlay NameOverlay, managedLive map[string]b
 				Detail: r.Detail,
 				Needs:  r.Needs,
 			}
-			delete(resumeOf, h.SessionID[:8]) // mark consumed
+			delete(resumeOf, h.SessionID) // mark consumed
 		} else if managedLive[h.SessionID] {
 			// Session is alive in our manager (chat panel open in
 			// browser) even if its daemon worker has paused. UI still

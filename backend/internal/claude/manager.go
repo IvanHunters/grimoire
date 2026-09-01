@@ -86,7 +86,7 @@ func listSessionsCached(client *daemon.Client) ([]daemon.Record, error) {
 // starting with `prefix` and returns its display name (ai-title or
 // first-prompt fallback). Cached for histNameCacheTTL.
 func lookupHistoricalNameByShort(prefix string) string {
-	if len(prefix) != 8 {
+	if len(prefix) < 8 {
 		return ""
 	}
 	if v, ok := histNameCache.Load(prefix); ok {
@@ -885,7 +885,7 @@ func (m *SessionManager) GetOrCreate(sessionID string, dangerousMode bool, worki
 				// encodes the original short. Reuse that worker rather
 				// than spawning yet another resume.
 				if newSession == nil && spawnErr == nil {
-					expectedChildName := "grimoire-resume-" + sessionID[:8]
+					expectedChildName := "grimoire-resume-" + sessionID
 					for _, j := range jobs {
 						if j.Name == expectedChildName {
 							newSession, spawnErr = startDaemonSessionAttach(sessionID, j.SessionID, m.logger)
