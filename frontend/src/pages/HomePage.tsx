@@ -28,7 +28,7 @@ function HomePage() {
 
   const [editorWidth, setEditorWidth] = useState<number | null>(null)
   const [previewWidth, setPreviewWidth] = useState<number | null>(null)
-  const [sidebarWidth, setSidebarWidth] = useState<number>(256) // Default 256px (w-64)
+  const [sidebarWidth, setSidebarWidth] = useState<number>(512) // Default 512px (wider left menu; resize 200–600)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [insertMarkdown, setInsertMarkdown] = useState<((type: string, value?: string) => void) | null>(null)
   const [editorContent, setEditorContent] = useState<string>('')
