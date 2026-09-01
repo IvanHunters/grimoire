@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { X, RotateCcw, Trash2 } from 'lucide-react'
+import { X, RotateCcw, Trash2, MoreVertical, RefreshCw, FileJson, GitFork, Pencil, Archive } from 'lucide-react'
 import { TerminalChat, type TerminalChatHandle } from './TerminalChat'
 import { sessionsAPI, type SessionStatus } from '../../api/sessions'
 import { useSessionStatus } from '../../hooks/useSessionStatus'
@@ -257,6 +257,111 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
     if (id) terminalRefs.current.get(id)?.restart()
   }, [tabs, activeIdx])
 
+  // ── Session actions kebab (⋮) — the mobile access point for
+  // Export/Fork/Rename/Compact/Kill. Mirrors ChatPanel's menu; acts on
+  // the ACTIVE tab's session. Dropdown is portaled into document.body so
+  // xterm's stacking context can't clip it.
+  const [kebabOpen, setKebabOpen] = useState(false)
+  const [kebabPos, setKebabPos] = useState<{ top: number; right: number } | null>(null)
+  const [compacting, setCompacting] = useState(false)
+  const kebabRef = useRef<HTMLDivElement>(null)
+  const kebabBtnRef = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    if (!kebabOpen) return
+    const handler = (e: PointerEvent) => {
+      const target = e.target as Node
+      const inTrigger = kebabRef.current?.contains(target)
+      const inDropdown = (target as HTMLElement).closest?.('[data-terminal-kebab-dropdown]')
+      if (!inTrigger && !inDropdown) setKebabOpen(false)
+    }
+    window.addEventListener('pointerdown', handler)
+    return () => window.removeEventListener('pointerdown', handler)
+  }, [kebabOpen])
+
+  useEffect(() => {
+    if (!kebabOpen || !kebabBtnRef.current) return
+    const r = kebabBtnRef.current.getBoundingClientRect()
+    setKebabPos({ top: r.bottom + 4, right: window.innerWidth - r.right })
+  }, [kebabOpen])
+
+  const handleExport = useCallback(() => {
+    const id = tabs[activeIdx]?.sessionId
+    setKebabOpen(false)
+    if (!id) return
+    const a = document.createElement('a')
+    a.href = `/api/sessions/${id}/jsonl`
+    a.download = `${id}.jsonl`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }, [tabs, activeIdx])
+
+  const handleFork = useCallback(() => {
+    const tab = tabs[activeIdx]
+    setKebabOpen(false)
+    if (!tab) return
+    const suggested = tab.label ? `${tab.label} (fork)` : 'fork'
+    const name = window.prompt('Имя для форка:', suggested)
+    if (name == null) return
+    const trimmed = name.trim()
+    if (!trimmed) return
+    // Reuse the existing fork flow (HomePage listens and opens the fork
+    // in its ChatPanel) rather than forking inside the throwaway tab.
+    window.dispatchEvent(new CustomEvent('fork-session-request', {
+      detail: { sourceId: tab.sessionId, name: trimmed },
+    }))
+  }, [tabs, activeIdx])
+
+  const handleRename = useCallback(async () => {
+    const tab = tabs[activeIdx]
+    setKebabOpen(false)
+    if (!tab) return
+    const name = window.prompt('Переименовать терминал:', tab.label)
+    if (name == null) return
+    const trimmed = name.trim()
+    if (!trimmed || trimmed === tab.label) return
+    setTabs(prev => prev.map((t, i) => i === activeIdx ? { ...t, label: trimmed } : t))
+    try {
+      await sessionsAPI.renameSession(tab.sessionId, trimmed)
+    } catch {
+      /* rename is best-effort — the tab label already updated locally */
+    }
+  }, [tabs, activeIdx])
+
+  const handleCompact = useCallback(async () => {
+    const id = tabs[activeIdx]?.sessionId
+    if (!id || compacting) return
+    setKebabOpen(false)
+    setCompacting(true)
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(id)}/compact`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ generate_ledger: true }),
+      })
+      if (r.status === 404) {
+        // No on-disk transcript yet — nothing to compact, just restart.
+        console.info('[compact] skipped: no transcript on disk yet')
+      } else if (!r.ok) {
+        throw new Error(`HTTP ${r.status}`)
+      } else {
+        const j = await r.json()
+        const mb = (b: number) => `${(b / 1e6).toFixed(2)} MB`
+        if (j.no_change) {
+          alert('Nothing to compact: this session is already minimal. Its size is conversation text, not evictable tool output.')
+        } else {
+          alert(`Compacted: ${mb(j.bytes_before)} to ${mb(j.bytes_after)} (${j.tool_results_evicted}/${j.tool_results} tool results evicted).`)
+        }
+      }
+      handleRestartActive()
+    } catch (err) {
+      alert('Compact failed: ' + (err as Error).message)
+    } finally {
+      setCompacting(false)
+    }
+  }, [tabs, activeIdx, compacting, handleRestartActive])
+
   // Same external restart trigger ChatPanel listens to — Sidebar
   // dispatches after a successful Compact so the live daemon worker
   // reloads from the shrunken JSONL. We match against ANY tab, not
@@ -304,9 +409,22 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
           <button onClick={handleRestartActive} className="terminal-btn" title="Restart Session">
             <RotateCcw className="w-3 h-3" />
           </button>
-          <button onClick={handleKillActive} className="terminal-btn terminal-btn-kill" title="Kill Session">
+          <button onClick={handleKillActive} className="terminal-btn terminal-btn-kill hidden md:inline-flex" title="Kill Session">
             <Trash2 className="w-3 h-3" />
           </button>
+          {/* Session actions kebab — visible on ALL viewports (primary
+              access point for Export/Fork/Rename/Compact/Kill on mobile). */}
+          <div className="relative" ref={kebabRef}>
+            <button
+              ref={kebabBtnRef}
+              onClick={() => setKebabOpen(v => !v)}
+              className={`terminal-btn ${kebabOpen ? 'bg-white/5 text-slate-300' : ''}`}
+              title="More actions"
+              aria-label="Open actions menu"
+            >
+              <MoreVertical className="w-3 h-3" />
+            </button>
+          </div>
           <button
             onClick={() => {
               setShowKeyboard(v => {
@@ -438,6 +556,65 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
           onCancel={() => setPasteOpen(false)}
           onPaste={(text) => { if (text) sendKey(text); setPasteOpen(false) }}
         />
+      )}
+
+      {/* Kebab dropdown — portaled to document.body so xterm's stacking
+          context can't clip it. Acts on the active tab's session. */}
+      {kebabOpen && kebabPos && createPortal(
+        <div
+          data-terminal-kebab-dropdown
+          className="fixed z-[100] min-w-[180px] bg-[#0a0b10] border border-white/[0.09] rounded shadow-2xl py-1"
+          style={{ top: kebabPos.top, right: kebabPos.right }}
+        >
+          <button
+            onClick={() => { setKebabOpen(false); handleRestartActive() }}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <RefreshCw className="w-3 h-3 text-amber-400/80" />
+            Restart session
+          </button>
+          <button
+            onClick={handleExport}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <FileJson className="w-3 h-3 text-amber-400/80" />
+            Export .jsonl
+          </button>
+          <button
+            onClick={handleFork}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <GitFork className="w-3 h-3 text-violet-400/80" />
+            Fork…
+          </button>
+          <button
+            onClick={handleRename}
+            className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors"
+          >
+            <Pencil className="w-3 h-3 text-cyan-400/80" />
+            Rename…
+          </button>
+          <button
+            onClick={handleCompact}
+            disabled={compacting}
+            className={`w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-slate-300 hover:bg-white/5 transition-colors ${compacting ? 'opacity-40 cursor-not-allowed' : ''}`}
+            title="Evict bulky tool_result payloads from older turns. Original archived. Effect lands on next resume."
+          >
+            <Archive className={`w-3 h-3 text-emerald-400/80 ${compacting ? 'animate-pulse' : ''}`} />
+            {compacting ? 'Compacting…' : 'Compact'}
+          </button>
+          {/* Mobile-only Kill (destructive). Desktop keeps the standalone
+              toolbar Kill button next to the kebab. */}
+          <div className="md:hidden h-px bg-white/[0.06] my-1" />
+          <button
+            onClick={() => { setKebabOpen(false); handleKillActive() }}
+            className="md:hidden w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono text-rose-300 hover:bg-rose-500/10 transition-colors"
+          >
+            <Trash2 className="w-3 h-3 text-rose-400/80" />
+            Kill session
+          </button>
+        </div>,
+        document.body,
       )}
     </div>
   )
