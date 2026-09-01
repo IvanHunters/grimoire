@@ -246,11 +246,22 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
   }, [onClose])
 
   const handleKillActive = useCallback(async () => {
-    const tab = tabs[activeIdx]
+    const idx = activeIdx
+    const tab = tabs[idx]
     if (!tab) return
     try { await sessionsAPI.deleteSession(tab.sessionId, { deleteTranscript: true }) } catch {}
-    setTabs(prev => prev.map((t, i) => i === activeIdx ? { ...t, sessionKey: t.sessionKey + 1 } : t))
-  }, [tabs, activeIdx])
+    // REMOVE the tab — do NOT remount it. Bumping sessionKey re-inits the
+    // TerminalChat WS, which calls GetOrCreate and respawns a fresh empty
+    // worker under a "grimoire-<id>" token — exactly the "killed session
+    // came back empty with a grimoire-* name" bug. A killed terminal
+    // should just go away.
+    setTabs(prev => {
+      const next = prev.filter((_, i) => i !== idx)
+      if (next.length === 0) { onClose(); return next }
+      setActiveIdx(cur => (cur >= idx && cur > 0) ? cur - 1 : Math.min(cur, next.length - 1))
+      return next
+    })
+  }, [tabs, activeIdx, onClose])
 
   const handleRestartActive = useCallback(() => {
     const id = tabs[activeIdx]?.sessionId

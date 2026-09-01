@@ -1384,6 +1384,17 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 				}
 			}
 		}
+		// Never surface a raw daemon wire token to the UI. If the name is
+		// still a "grimoire-*" structured token (no friendly name found),
+		// sanitize it — matches listing.go's "···<short>" placeholder.
+		// This is how "grimoire-global-tgykya" leaked into the sidebar.
+		if strings.HasPrefix(name, "grimoire-") {
+			if s.daemonShort != "" {
+				name = "···" + s.daemonShort
+			} else {
+				name = "Terminal Session"
+			}
+		}
 		out := &models.ClaudeSession{
 			ID:            s.id,
 			Name:          name,
