@@ -459,8 +459,21 @@ export function ClaudeSessionsPanel({
     q.length >= 1
       ? [...sessions, ...allItems.filter((b) => !activeIds.has(b.sessionId)).map(b2c)]
       : sessions
+  // With a text query, rank NAME matches above content-only matches so an
+  // exact title hit ("Ignite Client…") sits on top and a session that
+  // merely mentions the term in its transcript (a weak content hit) sinks
+  // below — within each group, newest first.
+  const isNameMatch = (s: ClaudeSession) => q.length >= 1 && (s.name || '').toLowerCase().includes(q)
   const visibleSessions = filterActive
-    ? pool.filter((s) => matchesStatus(s) && matchesText(s)).sort(byCreatedDesc)
+    ? pool
+        .filter((s) => matchesStatus(s) && matchesText(s))
+        .sort((a, b) => {
+          if (q.length >= 1) {
+            const rank = (isNameMatch(a) ? 0 : 1) - (isNameMatch(b) ? 0 : 1)
+            if (rank !== 0) return rank
+          }
+          return byCreatedDesc(a, b)
+        })
     : orderedSessions
 
   const handleDragStart = (id: string) => setDragId(id)
