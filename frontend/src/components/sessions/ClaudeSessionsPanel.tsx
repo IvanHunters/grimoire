@@ -361,45 +361,28 @@ export function ClaudeSessionsPanel({
     if (st === 'unknown' && (!tp || tp === 'unknown')) return false
     return true
   }
-  // Bucket lastActivity into 60-second windows so continuously-emitting
-  // sessions don't reshuffle on every 3s poll. Two sessions whose activity
-  // is within the same 60s bucket are tied; we tiebreak by createdAt
-  // (stable across polls). The visible result: a freshly-active session
-  // appears near the top once and stays there until another session
-  // gets a notably more recent burst (>60s newer).
-  const BUCKET_MS = 60_000
   const ts = (d?: string) => (d ? new Date(d).getTime() : 0)
-  const byActivityDesc = (a: ClaudeSession, b: ClaudeSession) => {
-    const ba = Math.floor(ts(a.lastActivity) / BUCKET_MS)
-    const bb = Math.floor(ts(b.lastActivity) / BUCKET_MS)
-    if (ba !== bb) return bb - ba // newer bucket first
-    // Tiebreak by createdAt (older first → stable). a/b's createdAt may
-    // be missing for daemon-rehydrated sessions — fall back to id for
-    // determinism.
+  // Within each tier sort by CREATION date, newest first — freshest
+  // sessions on top, oldest sink to the bottom. Sessions missing
+  // createdAt (rare, daemon-rehydrated) sort last; the id tiebreak keeps
+  // ordering deterministic across the 3s poll.
+  const byCreatedDesc = (a: ClaudeSession, b: ClaudeSession) => {
     const ca = ts(a.createdAt)
     const cb = ts(b.createdAt)
-    if (ca !== cb) return ca - cb
+    if (ca !== cb) return cb - ca
     return a.id < b.id ? -1 : 1
   }
-  // needs-you tier: sort by ACTUAL lastActivity (no bucket smoothing).
-  // When a session becomes blocked-waiting, the user wants it visible
-  // immediately at #1 — even if another needs-you session got blocked
-  // 30 seconds earlier. Stability concerns from byActivityDesc don't
-  // apply here because needs-you events are rare (one per turn, not
-  // every PTY byte).
-  const byLastActivityRaw = (a: ClaudeSession, b: ClaudeSession) =>
-    ts(b.lastActivity) - ts(a.lastActivity)
   // Priority tiers (top → bottom in sidebar):
   //   1. NEEDS YOU — blocked / awaiting user input
   //   2. WORKING   — tempo=active, claude is generating
   //   3. READY     — done/running/working but idle (no active turn)
   //   4. OTHER     — failed / stopped / unknown-but-set status
   //   5. NO-STATUS — manual drag-order preserved + tail of newcomers
-  // Within each tier sort by lastActivity desc (most recent first).
-  const tierNeedsYou = sessions.filter(needsYou).sort(byLastActivityRaw)
-  const tierWorking = sessions.filter(isWorking).sort(byActivityDesc)
-  const tierReady = sessions.filter(isReady).sort(byActivityDesc)
-  const tierOther = sessions.filter(hasStatus).sort(byActivityDesc)
+  // Within each status tier, newest-created first.
+  const tierNeedsYou = sessions.filter(needsYou).sort(byCreatedDesc)
+  const tierWorking = sessions.filter(isWorking).sort(byCreatedDesc)
+  const tierReady = sessions.filter(isReady).sort(byCreatedDesc)
+  const tierOther = sessions.filter(hasStatus).sort(byCreatedDesc)
   const tierNoStatus = sessions.filter(
     (s) => !needsYou(s) && !isWorking(s) && !isReady(s) && !hasStatus(s),
   )
