@@ -559,11 +559,11 @@ export function ClaudeSessionsPanel({
                                 e.stopPropagation()
                               }}
                               onClick={(e) => e.stopPropagation()}
-                              className="w-full text-xs font-mono bg-transparent border-b border-cyan-500/50 text-cyan-300 outline-none pb-px"
+                              className="w-full text-sm font-mono bg-transparent border-b border-cyan-500/50 text-cyan-300 outline-none pb-px"
                             />
                           ) : (
                             <div className="flex items-center gap-1.5 min-w-0">
-                              <div className={`flex-1 text-xs font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
+                              <div className={`flex-1 text-sm font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
                                 {sessionName}
                               </div>
                               <SessionStatusPill state={session.state} tempo={session.tempo} detail={session.detail} needs={session.needs} />
