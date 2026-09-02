@@ -32,21 +32,6 @@ var (
 	histNameCacheTTL = 30 * time.Second
 )
 
-// jsonlMtimeCache caches discovery.SessionPath + os.Stat results per
-// daemon UUID. ListActiveSessions stat's every daemon-backed session's
-// JSONL on every poll to compute "stale" tempo override; without cache
-// that's N syscalls every 3s.
-type jsonlMtimeCacheEntry struct {
-	mtime    time.Time
-	cachedAt time.Time
-	ok       bool // false ⇒ SessionPath miss; don't re-glob for 10s
-}
-
-var (
-	jsonlMtimeCache    sync.Map // map[uuid]jsonlMtimeCacheEntry
-	jsonlMtimeCacheTTL = 10 * time.Second
-)
-
 // daemonJobsCache caches a recent op:list response across SessionStatus
 // calls. Sidebar polling fans out N=open-sessions calls every few
 // seconds — without this, every poll opens a unix socket, sends an
@@ -133,31 +118,6 @@ func lookupHistoricalNameByShortUncached(prefix string) string {
 	return hdr.Name
 }
 
-// jsonlMtimeFor returns the JSONL mtime for the given daemon UUID,
-// using a short TTL cache. ok=false means the JSONL doesn't exist
-// (or path lookup failed); callers should treat that as "no stale
-// timer running" rather than retry.
-func jsonlMtimeFor(daemonUUID string) (mtime time.Time, ok bool) {
-	if daemonUUID == "" {
-		return time.Time{}, false
-	}
-	if v, ok := jsonlMtimeCache.Load(daemonUUID); ok {
-		entry := v.(jsonlMtimeCacheEntry)
-		if time.Since(entry.cachedAt) < jsonlMtimeCacheTTL {
-			return entry.mtime, entry.ok
-		}
-	}
-	var entry jsonlMtimeCacheEntry
-	entry.cachedAt = time.Now()
-	if path, err := discovery.SessionPath(daemonUUID); err == nil {
-		if info, statErr := os.Stat(path); statErr == nil {
-			entry.mtime = info.ModTime()
-			entry.ok = true
-		}
-	}
-	jsonlMtimeCache.Store(daemonUUID, entry)
-	return entry.mtime, entry.ok
-}
 
 // isUUIDLike reports whether s has the canonical 8-4-4-4-12 UUID shape.
 // We treat such sessionIDs as "potentially identifying a claude daemon
@@ -1454,18 +1414,18 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			out.State = rec.State
 			out.Detail = rec.Detail
 			out.Needs = rec.Needs
-			if out.Tempo == "active" {
-				userHasTyped := !s.lastUserInputAt.IsZero()
-				jsonlStale := false
-				if mtime, found := jsonlMtimeFor(s.daemonUUID); found {
-					jsonlStale = time.Since(mtime) > 30*time.Second
-				}
-				switch {
-				case !userHasTyped:
-					out.Tempo = "idle"
-				case jsonlStale:
-					out.Tempo = "idle"
-				}
+			// Downgrade a stale "active" to idle when the session hasn't
+			// emitted any PTY output for >30s. LastActivity is bumped by the
+			// PTY reader on every chunk the worker emits, so it directly
+			// measures "is this worker producing output right now" — the
+			// true signal. Two earlier heuristics were wrong: downgrading on
+			// "user never typed" hid autonomous agent sessions that do real
+			// work with no terminal input, and downgrading on JSONL mtime
+			// checked <daemonUUID>.jsonl, which for resume/fork sessions is
+			// NOT the file being written (the worker appends to the resumed
+			// transcript), so a hard-working resumed session read as idle.
+			if out.Tempo == "active" && !s.lastActivity.IsZero() && time.Since(s.lastActivity) > 30*time.Second {
+				out.Tempo = "idle"
 			}
 		} else {
 			out.Tempo = "idle"
