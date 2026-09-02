@@ -165,23 +165,25 @@ export function ClaudeSessionsPanel({
         // grimoire id IS keyed differently so the join may miss; that's
         // fine, the row still renders with the name and click works.
         const liveSessions = grimoireSessions.map((s) => {
-          // ClaudeSession from backend already carries tempo/state/detail/
-          // needs from ListActiveSessions. We ONLY override those fields
-          // when a by-project match is found AND its live data is
-          // non-empty — otherwise the override would clobber valid backend
-          // values with `undefined` (which is what happened for
-          // note-task-* sessions where by-project doesn't surface a row
-          // keyed by the grimoire id).
+          // ClaudeSession from ListActiveSessions already carries
+          // tempo/state/detail/needs — and crucially the backend applies a
+          // staleness downgrade (tempo active→idle when the JSONL hasn't
+          // been written for >30s). by-project reports the RAW daemon tempo
+          // with no such downgrade, so it must only FILL IN fields the
+          // backend row lacks (e.g. note-task-* sessions by-project doesn't
+          // key by the grimoire id), never OVERRIDE ones already present —
+          // otherwise a long-idle session flips back to "working" because
+          // by-project still says tempo=active.
           const match = Object.values(byUuid).find((b) =>
             b.daemonShort && b.name === s.name && !!b.live
           )
           if (!match || !match.live) return s
           return {
             ...s,
-            tempo: match.live.tempo ?? s.tempo,
-            state: match.live.state ?? s.state,
-            detail: match.live.detail ?? s.detail,
-            needs: match.live.needs ?? s.needs,
+            tempo: s.tempo ?? match.live.tempo,
+            state: s.state ?? match.live.state,
+            detail: s.detail ?? match.live.detail,
+            needs: s.needs ?? match.live.needs,
           }
         })
         setSessions(liveSessions)
