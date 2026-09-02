@@ -1374,7 +1374,21 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 			name == "Quick Terminal" ||
 			name == "(unnamed)" ||
 			strings.HasPrefix(name, "grimoire-")
-		if isGenericName {
+		if strings.HasPrefix(s.id, "global-") && s.daemonBacked {
+			// global-* is an ephemeral Quick Terminal handle, reused across
+			// conversations. Its stored overlay name is keyed by the handle,
+			// not the conversation, so it LEAKS: a tab reattached to a new
+			// worker kept the previous conversation's title (e.g. showing
+			// "CI переменные для тестов" on an unrelated fresh worker). The
+			// worker's OWN ai-title is the current conversation's true name —
+			// always prefer it. A fresh worker with no title yet gets the
+			// generic label rather than the stale leaked name.
+			if friendly := lookupHistoricalNameByShort(s.daemonShort); friendly != "" {
+				name = friendly
+			} else {
+				name = "Terminal Session"
+			}
+		} else if isGenericName {
 			if s.daemonShort != "" {
 				if friendly := lookupHistoricalNameByShort(s.daemonShort); friendly != "" {
 					name = friendly
