@@ -199,9 +199,14 @@ func (c *Client) resolveSock() (string, error) {
 	if s, err := FindSock(); err == nil {
 		// Dial-check before caching — a sock-file lingering after a
 		// supervisor crash would otherwise become a permanently cached
-		// dead path and every op would 5s-timeout. The dial is cheap
-		// (300ms) and only runs on cache-miss, not the hot path.
-		conn, derr := net.DialTimeout("unix", s, 300*time.Millisecond)
+		// dead path and every op would 5s-timeout. Only runs on cache-miss.
+		// Timeout is 1s (not 300ms): under heavy session spawning the
+		// daemon's accept loop is momentarily busy, and a too-tight dial
+		// spuriously fails, falls through to the spawn circuit breaker, and
+		// makes even cheap reads like op:list fail — which pinned the
+		// sidebar to a stale job list (dead sessions shown, live ones
+		// hidden). A live socket answers well within 1s.
+		conn, derr := net.DialTimeout("unix", s, 1*time.Second)
 		if derr == nil {
 			_ = conn.Close()
 			c.Sock = s

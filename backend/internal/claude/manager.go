@@ -69,8 +69,10 @@ var (
 	// flips between two sessions sharing a cwd (wrong name on a live row).
 	// Reusing the last good list across the breaker window keeps the list
 	// stable; beyond the grace the error propagates so a real outage still
-	// surfaces rather than pinning a forever-stale snapshot.
-	daemonJobsStaleGrace = 30 * time.Second
+	// surfaces rather than pinning a forever-stale snapshot. Kept short (5s):
+	// a longer grace pinned a stale snapshot for its whole duration, showing
+	// sessions whose worker had died and hiding ones born meanwhile.
+	daemonJobsStaleGrace = 5 * time.Second
 )
 
 // listSessionsCached returns the daemon's op:list result, refreshing
