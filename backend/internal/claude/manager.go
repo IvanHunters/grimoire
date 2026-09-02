@@ -1315,10 +1315,21 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	m.mu.RLock()
 	snaps := make([]sessSnap, 0, len(m.sessions))
 	known := make(map[string]bool, len(m.sessions))
+	// knownShort tracks the daemon SHORT id of every manager-held worker.
+	// The daemon-jobs block below re-adds any live worker not already
+	// represented; it matched only by full SessionID (uuid), so a worker a
+	// manager entry attached to by SHORT — e.g. a bg agent resuming another
+	// session (its op:list uuid differs from the session's own uuid) —
+	// slipped through and rendered as a duplicate row alongside the manager
+	// entry pointing at it.
+	knownShort := make(map[string]bool, len(m.sessions))
 	for _, session := range m.sessions {
 		known[session.ID] = true
 		if session.DaemonUUID != "" {
 			known[session.DaemonUUID] = true
+		}
+		if session.DaemonShort != "" {
+			knownShort[session.DaemonShort] = true
 		}
 		// Read session fields under session-local lock — not m.mu —
 		// because handler-side mutations (MarkUserInput, SetName,
@@ -1493,7 +1504,7 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 	if useDaemonBackend() {
 		now := time.Now()
 		for _, j := range jobs {
-			if known[j.SessionID] {
+			if known[j.SessionID] || knownShort[j.Short] {
 				continue
 			}
 			// SKIP continuation-children entirely — they belong to a
