@@ -191,6 +191,20 @@ func useDaemonBackend() bool {
 	return true
 }
 
+// dedupPreferred reports whether the `candidate` session id should replace
+// `incumbent` as the single surviving row when both map to the same daemon
+// worker (its UUID entry plus a global-*/note- handle alias). A UUID-like id
+// is the worker's canonical identity and always wins over a handle; among
+// ids of the same kind the lexicographically smaller wins, so the choice is
+// stable across polls regardless of map-iteration order.
+func dedupPreferred(candidate, incumbent string) bool {
+	cu, iu := isUUIDLike(candidate), isUUIDLike(incumbent)
+	if cu != iu {
+		return cu
+	}
+	return candidate < incumbent
+}
+
 // daemonSpawnRetries / daemonSpawnRetryBackoff bound the non-subprocess
 // fallback: on a transient daemon spawn failure the manager forces the
 // daemon up and retries this many times, sleeping between attempts. The
@@ -1473,13 +1487,17 @@ func (m *SessionManager) ListActiveSessions() []*models.ClaudeSession {
 				key = s.id
 			}
 			if idx, ok := seenUUID[key]; ok {
-				// Same daemon worker already has a row — keep one. This
-				// collapses resume aliases (a parent session resumed into
-				// a fresh worker shows under both its own id and the
-				// worker's uuid). Prefer the canonical entry whose id is
-				// the worker's own identity (id == key) so the live row
-				// wins over the alias.
-				if s.id == key {
+				// Same daemon worker already surfaced under another manager
+				// key — one worker can be registered under BOTH its UUID
+				// and a global-*/note- handle alias, each carrying a
+				// different display name. Keep exactly one, DETERMINISTICALLY:
+				// the previous check (`s.id == key`) never matched because
+				// key is the 8-hex daemonShort while s.id is a full UUID or
+				// handle, so map-iteration order decided the winner and the
+				// row flipped names/position every poll. dedupPreferred picks
+				// the canonical UUID entry over a handle alias, with a stable
+				// tiebreak.
+				if dedupPreferred(s.id, sessions[idx].ID) {
 					sessions[idx] = out
 				}
 				continue
