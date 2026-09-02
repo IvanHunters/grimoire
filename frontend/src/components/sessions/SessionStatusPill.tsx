@@ -74,3 +74,18 @@ export function formatSessionAge(iso: string): string {
   if (d < 30) return `${d}d`
   return `${Math.floor(d / 30)}mo`
 }
+
+// formatSessionDate — absolute calendar date for inactive sessions, where a
+// relative "3mo ago" is less useful than knowing when it was last touched.
+// Compact and unambiguous: "2 Sep 2026" (drops the year when it's the
+// current year to save width).
+export function formatSessionDate(iso: string): string {
+  if (!iso) return ''
+  const dt = new Date(iso)
+  if (Number.isNaN(dt.getTime())) return ''
+  const opts: Intl.DateTimeFormatOptions =
+    dt.getFullYear() === new Date().getFullYear()
+      ? { day: 'numeric', month: 'short' }
+      : { day: 'numeric', month: 'short', year: 'numeric' }
+  return dt.toLocaleDateString(undefined, opts)
+}

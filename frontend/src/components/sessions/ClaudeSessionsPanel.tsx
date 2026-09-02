@@ -4,7 +4,7 @@ import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
 import { sessionsAPI, type SessionListItem } from '../../api/sessions'
 import { tasksAPI } from '../../api/tasks'
 import type { ClaudeSession } from '../../types/claude'
-import { SessionStatusPill, formatSessionAge } from './SessionStatusPill'
+import { SessionStatusPill, formatSessionAge, formatSessionDate } from './SessionStatusPill'
 import { getOpenSessions, subscribeOpenSessions } from '../../utils/openSessions'
 
 /**
@@ -685,15 +685,29 @@ export function ClaudeSessionsPanel({
                             </div>
                           )}
                           <div className="flex items-center gap-1.5 mt-0.5">
-                            {session.createdAt && (
-                              <span className="text-[9px] font-mono text-slate-800" title={`Created: ${new Date(session.createdAt).toLocaleString()}`}>
-                                {'+'}{formatSessionAge(session.createdAt)}
-                              </span>
-                            )}
-                            {session.lastActivity && (
-                              <span className="text-[9px] font-mono text-slate-700" title={`Last active: ${new Date(session.lastActivity).toLocaleString()}`}>
-                                {'·'} {formatSessionAge(session.lastActivity)} ago
-                              </span>
+                            {session.state ? (
+                              // Live session: relative age (created + last-active).
+                              <>
+                                {session.createdAt && (
+                                  <span className="text-[9px] font-mono text-slate-800" title={`Created: ${new Date(session.createdAt).toLocaleString()}`}>
+                                    {'+'}{formatSessionAge(session.createdAt)}
+                                  </span>
+                                )}
+                                {session.lastActivity && (
+                                  <span className="text-[9px] font-mono text-slate-700" title={`Last active: ${new Date(session.lastActivity).toLocaleString()}`}>
+                                    {'·'} {formatSessionAge(session.lastActivity)} ago
+                                  </span>
+                                )}
+                              </>
+                            ) : (
+                              // Inactive session (surfaced via search, no live
+                              // worker): a relative "3mo ago" is less useful than
+                              // the actual last-updated date.
+                              (session.lastActivity || session.createdAt) && (
+                                <span className="text-[9px] font-mono text-slate-700" title={`Last updated: ${new Date(session.lastActivity || session.createdAt).toLocaleString()}`}>
+                                  {formatSessionDate(session.lastActivity || session.createdAt)}
+                                </span>
+                              )
                             )}
                           </div>
                         </div>
