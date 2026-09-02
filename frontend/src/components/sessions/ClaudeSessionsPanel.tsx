@@ -457,10 +457,32 @@ export function ClaudeSessionsPanel({
     needs: b.live?.needs,
   })
   const activeIds = new Set(sessions.map((s) => s.id))
-  const pool: ClaudeSession[] =
+  const rawPool: ClaudeSession[] =
     q.length >= 1
       ? [...sessions, ...allItems.filter((b) => !activeIds.has(b.sessionId)).map(b2c)]
       : sessions
+  // Drop by-project "ghosts" — the same conversation surfaced under an old
+  // id. A resume/fork lineage leaves a stale record (by-project can still
+  // report a dead "cozystack pr #2729 review" as live) next to the current
+  // live session of the same name+cwd, rendering as two identical rows.
+  // Keep every ACTIVE session (never merge two distinct live workers, which
+  // the backend already separates by daemon id), and drop any non-active
+  // pool item whose name+cwd duplicates an active session or another ghost
+  // already kept.
+  const convKey = (s: ClaudeSession) => `${(s.name || '').toLowerCase().trim()}|${s.workingDir || ''}`
+  const activeConvKeys = new Set(sessions.map(convKey))
+  const seenGhostKeys = new Set<string>()
+  const pool: ClaudeSession[] = []
+  for (const s of rawPool) {
+    if (activeIds.has(s.id)) {
+      pool.push(s)
+      continue
+    }
+    const k = convKey(s)
+    if (activeConvKeys.has(k) || seenGhostKeys.has(k)) continue
+    seenGhostKeys.add(k)
+    pool.push(s)
+  }
   // With a text query, rank NAME matches above content-only matches so an
   // exact title hit ("Ignite Client…") sits on top and a session that
   // merely mentions the term in its transcript (a weak content hit) sinks
