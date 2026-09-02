@@ -42,6 +42,22 @@ type Record struct {
 	StartedAt int64  `json:"startedAt"`
 }
 
+// Agent is one entry from `claude agents --json` — claude's own view of
+// live agents. Unlike Record (op:list), which is keyed by the worker's own
+// UUID, this exposes the UNDERLYING claude SessionID a worker is resuming.
+// That mapping is how we detect "the session the user is opening is already
+// running as a background agent" and attach to it instead of trying to
+// --resume it (which claude refuses, crash-looping the worker).
+type Agent struct {
+	ID        string `json:"id"`        // 8-hex short; matches Record.Short in op:list
+	SessionID string `json:"sessionId"` // underlying claude session UUID being run
+	Kind      string `json:"kind"`      // "background" | "interactive" | ...
+	Name      string `json:"name"`
+	Cwd       string `json:"cwd"`
+	PID       int    `json:"pid"`
+	Status    string `json:"status"`
+}
+
 // PingReply is the response to op:ping.
 type PingReply struct {
 	Version string // claude CLI version hosting the daemon

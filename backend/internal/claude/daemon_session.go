@@ -460,6 +460,37 @@ func startDaemonSessionAttach(
 			}
 		}
 	}
+	// Fallback: the requested UUID is not any daemon job's OWN UUID, but a
+	// live background agent may be RESUMING it. op:list only carries a
+	// worker's own UUID; `claude agents` additionally exposes the
+	// underlying session a worker runs. Map requested UUID → live bg agent
+	// → its worker short (which IS in op:list) and attach to that. Without
+	// this, opening such a session fell through to `claude --resume`, which
+	// claude refuses ("currently running as a background agent (bg)"),
+	// crash-looping the worker.
+	if rec == nil {
+		if agents, aerr := client.Agents(); aerr == nil {
+			for _, ag := range agents {
+				if ag.SessionID != daemonSessionUUID || ag.Kind != "background" || ag.ID == "" {
+					continue
+				}
+				for i := range jobs {
+					if jobs[i].Short == ag.ID {
+						logger.Info("attach resolved UUID to live bg agent via claude agents",
+							slog.String("requested_uuid", daemonSessionUUID),
+							slog.String("agent_short", ag.ID),
+							slog.String("agent_name", ag.Name),
+						)
+						rec = &jobs[i]
+						break
+					}
+				}
+				if rec != nil {
+					break
+				}
+			}
+		}
+	}
 	if rec == nil {
 		return nil, fmt.Errorf("session %s not live in daemon", daemonSessionUUID)
 	}

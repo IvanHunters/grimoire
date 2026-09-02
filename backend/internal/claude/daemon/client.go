@@ -403,6 +403,35 @@ func startDaemonLazily(logger *slog.Logger) error {
 	return nil
 }
 
+// Agents runs `claude agents --json` and returns claude's live agent list.
+// Best-effort: returns an error on missing CLI / parse failure so callers
+// can fall back. The value is the UNDERLYING-sessionId → worker-short
+// mapping that op:list can't provide (op:list keys by the worker's own
+// UUID), used to attach to a session already running as a background agent
+// instead of --resume'ing it into a crash loop.
+func (c *Client) Agents() ([]Agent, error) {
+	out, err := exec.Command("claude", "agents", "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("claude agents --json: %w", err)
+	}
+	var arr []Agent
+	if err := json.Unmarshal(out, &arr); err == nil {
+		return arr, nil
+	}
+	// Tolerate an object wrapper in case the CLI shape changes.
+	var wrap struct {
+		Agents   []Agent `json:"agents"`
+		Sessions []Agent `json:"sessions"`
+	}
+	if err := json.Unmarshal(out, &wrap); err != nil {
+		return nil, fmt.Errorf("parse agents json: %w", err)
+	}
+	if len(wrap.Agents) > 0 {
+		return wrap.Agents, nil
+	}
+	return wrap.Sessions, nil
+}
+
 // EnsureRunning forces the daemon supervisor up and waits for its control
 // socket to become dialable. Unlike resolveSock's opportunistic path it
 // deliberately ignores the daemonDownUntil circuit-breaker window: callers
