@@ -637,9 +637,13 @@ resumeResolved:
 			SessionID: session.ID,
 			Messages:  messages,
 		})
-	} else if msg.SkipContextPrompt {
-		// Handler-internal hint (e.g. from restart) says don't inject
-		// context. Mark sent so future reconnects also skip.
+	} else if msg.SkipContextPrompt || strings.HasPrefix(msg.SessionID, "global-") {
+		// Don't inject the SESSION CONTEXT block. Either the handler asked
+		// to skip it (e.g. restart), OR this is a Quick Terminal (global-*
+		// handle): it isn't bound to a note, so even though the frontend
+		// still sends the currently-open note as CurrentNote, pasting the
+		// context block into a bare terminal the user opened for ad-hoc use
+		// is unwanted noise. Mark sent so reconnects also skip.
 		session.MarkContextPromptSent()
 	} else if msg.CurrentNote != nil && !session.HasContextPromptSent() && msg.ResumeFromSessionID == "" {
 		// Send automatic context prompt — once per session lifetime,
