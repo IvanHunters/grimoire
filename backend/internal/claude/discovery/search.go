@@ -20,7 +20,16 @@ type SearchHit struct {
 	Snippet     string `json:"snippet"`     // matched line, truncated
 	Role        string `json:"role"`        // "user" / "assistant" / event type
 	LineNumber  int    `json:"lineNumber"`
+	State       string `json:"state"` // active / archived / deleted
 }
+
+// Where a search hit's session currently lives. A hit is only resumable
+// straight away when it is active; the other two need a restore first.
+const (
+	SessionStateActive   = "active"
+	SessionStateArchived = "archived"
+	SessionStateDeleted  = "deleted"
+)
 
 // Search scans every JSONL transcript under projectsRoot for `query` and
 // returns matching hits. Substring search (case-insensitive), no regex.
@@ -65,7 +74,7 @@ func Search(ctx context.Context, query, cwdFilter string, limit int) ([]SearchHi
 			return hits, ctx.Err()
 		}
 		subdir := filepath.Join(root, entry.Name())
-		dirHits, err := searchDir(ctx, subdir, entry.Name(), lowerQ, limit-len(hits))
+		dirHits, err := searchDir(ctx, subdir, entry.Name(), lowerQ, SessionStateActive, limit-len(hits))
 		if err != nil {
 			continue // bad file, skip
 		}
@@ -73,6 +82,19 @@ func Search(ctx context.Context, query, cwdFilter string, limit int) ([]SearchHi
 		if limit > 0 && len(hits) >= limit {
 			hits = hits[:limit]
 			break
+		}
+	}
+
+	// Archived and deleted sessions are searched too — a session the
+	// user put away must stay findable, otherwise the only way back is
+	// digging through the filesystem by hand.
+	if limit <= 0 || len(hits) < limit {
+		storeHits, storeErr := searchStore(ctx, lowerQ, cwdFilter, limit-len(hits))
+		if storeErr == nil {
+			hits = append(hits, storeHits...)
+			if limit > 0 && len(hits) > limit {
+				hits = hits[:limit]
+			}
 		}
 	}
 
@@ -87,7 +109,7 @@ func Search(ctx context.Context, query, cwdFilter string, limit int) ([]SearchHi
 	return hits, nil
 }
 
-func searchDir(ctx context.Context, dir, sanitizedDir, lowerQ string, capLeft int) ([]SearchHit, error) {
+func searchDir(ctx context.Context, dir, sanitizedDir, lowerQ, state string, capLeft int) ([]SearchHit, error) {
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -102,7 +124,7 @@ func searchDir(ctx context.Context, dir, sanitizedDir, lowerQ string, capLeft in
 		}
 		path := filepath.Join(dir, f.Name())
 		sessionID := strings.TrimSuffix(f.Name(), ".jsonl")
-		fHits, _ := searchFile(ctx, path, sessionID, sanitizedDir, lowerQ, capLeft-len(hits))
+		fHits, _ := searchFile(ctx, path, sessionID, sanitizedDir, lowerQ, state, capLeft-len(hits))
 		hits = append(hits, fHits...)
 		if capLeft > 0 && len(hits) >= capLeft {
 			break
@@ -111,7 +133,38 @@ func searchDir(ctx context.Context, dir, sanitizedDir, lowerQ string, capLeft in
 	return hits, nil
 }
 
-func searchFile(ctx context.Context, path, sessionID, sanitizedDir, lowerQ string, capLeft int) ([]SearchHit, error) {
+// searchStore scans the archived and deleted shelves. Each entry is a
+// self-contained folder rather than a project dir, so the cwd filter is
+// matched against the cwd recorded for the bundle instead of the folder
+// name.
+func searchStore(ctx context.Context, lowerQ, cwdFilter string, capLeft int) ([]SearchHit, error) {
+	entries, err := ListStore("")
+	if err != nil {
+		return nil, err
+	}
+	var hits []SearchHit
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return hits, ctx.Err()
+		}
+		if cwdFilter != "" && SanitizeCwd(e.Cwd) != SanitizeCwd(cwdFilter) {
+			continue
+		}
+		state := SessionStateArchived
+		if e.Kind == StoreTrash {
+			state = SessionStateDeleted
+		}
+		eHits, _ := searchFile(ctx, e.JSONLPath, e.SessionID, SanitizeCwd(e.Cwd), lowerQ, state, capLeft-len(hits))
+		hits = append(hits, eHits...)
+		if capLeft > 0 && len(hits) >= capLeft {
+			hits = hits[:capLeft]
+			break
+		}
+	}
+	return hits, nil
+}
+
+func searchFile(ctx context.Context, path, sessionID, sanitizedDir, lowerQ, state string, capLeft int) ([]SearchHit, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -162,6 +215,7 @@ func searchFile(ctx context.Context, path, sessionID, sanitizedDir, lowerQ strin
 			Snippet:     snippet,
 			Role:        role,
 			LineNumber:  lineNum,
+			State:       state,
 		})
 		if capLeft > 0 && len(hits) >= capLeft {
 			break
