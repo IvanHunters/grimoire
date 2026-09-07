@@ -394,3 +394,20 @@ func sessionIDFromStoreDir(name string) string {
 func FindStoreEntry(sessionID string) (StoreEntry, error) {
 	return findStoreEntry(sessionID)
 }
+
+// EnsureRestored guarantees a session's transcript is sitting in its
+// project dir, restoring it from the archive or trash when needed, and
+// reports whether a restore actually happened. Callers that want to run
+// a session found in search go through this: `claude --resume` only
+// sees transcripts under the project dir for the session's cwd, so a
+// stored session has to come back before it can start.
+func EnsureRestored(sessionID string) (path string, restored bool, err error) {
+	if live, liveErr := SessionPath(sessionID); liveErr == nil {
+		return live, false, nil
+	}
+	restoredPath, err := RestoreFromStore(sessionID)
+	if err != nil {
+		return "", false, err
+	}
+	return restoredPath, true, nil
+}

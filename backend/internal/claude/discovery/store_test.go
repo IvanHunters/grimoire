@@ -275,3 +275,52 @@ func TestListStoreReportsBothKinds(t *testing.T) {
 		t.Fatalf("ListStore(archive) = %+v, want just the archived session", only)
 	}
 }
+
+// EnsureRestored is what makes "open this session" work straight from a
+// search result: a live session is left alone, an archived or deleted
+// one is brought back first, because claude --resume cannot see a
+// transcript that is not in the project dir.
+func TestEnsureRestoredBringsBackStoredSessions(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", root)
+
+	const uuid = "7c9a1b2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d"
+	const cwd = "/Users/ivan/gitops/thing"
+	origin := seedSession(t, root, SanitizeCwd(cwd), uuid, cwd)
+	if _, err := MoveTranscriptToStore(origin, uuid, StoreArchive, 1735689600000000000); err != nil {
+		t.Fatal(err)
+	}
+
+	path, restored, err := EnsureRestored(uuid)
+	if err != nil {
+		t.Fatalf("EnsureRestored: %v", err)
+	}
+	if !restored {
+		t.Error("expected the archived session to be reported as restored")
+	}
+	if path != origin {
+		t.Errorf("path = %q, want %q", path, origin)
+	}
+
+	// Second call is a no-op: the session is live now.
+	path, restored, err = EnsureRestored(uuid)
+	if err != nil {
+		t.Fatalf("EnsureRestored on a live session: %v", err)
+	}
+	if restored {
+		t.Error("a live session must not be reported as restored")
+	}
+	if path != origin {
+		t.Errorf("path = %q, want %q", path, origin)
+	}
+}
+
+// A session that exists nowhere is an error, not a silent empty path.
+func TestEnsureRestoredUnknownSession(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", root)
+
+	if _, _, err := EnsureRestored("00000000-0000-4000-8000-00000000dead"); err == nil {
+		t.Fatal("expected an error for a session that is neither live nor stored")
+	}
+}

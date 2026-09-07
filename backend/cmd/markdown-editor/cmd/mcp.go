@@ -2158,7 +2158,7 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 	// claude can confirm the match in context.
 	s.AddTool(
 		mcp.NewTool("search_sessions",
-			mcp.WithDescription("Search Claude sessions by name OR by conversation content. Returns matches grouped by session, with snippet context around each content hit. Use this to locate a session before renaming/deleting/attaching."),
+			mcp.WithDescription("Search Claude sessions by name OR by conversation content, including sessions that were archived or deleted. Returns matches grouped by session, with snippet context around each content hit, and labels rows active, archived or deleted. Use this to locate a session before renaming/archiving/deleting/attaching, or to find a put-away session to restore."),
 			mcp.WithString("query", mcp.Required(), mcp.Description("Substring to match. Case-insensitive.")),
 			mcp.WithString("cwd", mcp.Description("Optional working-directory filter — scopes to one project")),
 			mcp.WithNumber("limit", mcp.Description("Max results per mode (default 20)")),
@@ -2193,12 +2193,32 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				}
 			}
 
+			// Archived and deleted sessions match by name too — a
+			// session the user put away has to stay findable, not just
+			// by the words inside it.
+			var storedHits []discovery.StoreEntry
+			if stored, storeErr := discovery.ListStore(""); storeErr == nil {
+				for _, e := range stored {
+					if cwd != "" && discovery.SanitizeCwd(e.Cwd) != discovery.SanitizeCwd(cwd) {
+						continue
+					}
+					if strings.Contains(strings.ToLower(e.Name), lcq) ||
+						strings.Contains(strings.ToLower(e.Cwd), lcq) ||
+						strings.Contains(strings.ToLower(e.SessionID), lcq) {
+						storedHits = append(storedHits, e)
+						if len(storedHits) >= limit {
+							break
+						}
+					}
+				}
+			}
+
 			contentHits, err := discovery.Search(ctx, query, cwd, limit*3)
 			if err != nil {
 				mcpCtx.logger.Warn("transcript content search failed", slog.Any("error", err))
 			}
 
-			if len(nameHits) == 0 && len(contentHits) == 0 {
+			if len(nameHits) == 0 && len(contentHits) == 0 && len(storedHits) == 0 {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("No sessions match '" + query + "'")}}, nil
 			}
 			var sb strings.Builder
@@ -2222,6 +2242,19 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 				}
 				sb.WriteString("\n")
 			}
+			if len(storedHits) > 0 {
+				fmt.Fprintf(&sb, "## Put away — archived or deleted (%d)\n\n", len(storedHits))
+				for _, e := range storedHits {
+					state := discovery.SessionStateArchived
+					if e.Kind == discovery.StoreTrash {
+						state = discovery.SessionStateDeleted
+					}
+					fmt.Fprintf(&sb, "- **%s** `%s`\n  cwd: `%s` · %s · %s · put away: %s\n  restore with restore_session, or start_session resume_from=%s\n",
+						e.Name, e.SessionID, e.Cwd, state, humanBytes(e.SizeBytes),
+						e.MovedAt.Format("2006-01-02 15:04"), e.SessionID)
+				}
+				sb.WriteString("\n")
+			}
 			if len(contentHits) > 0 {
 				bySession := map[string][]discovery.SearchHit{}
 				order := []string{}
@@ -2241,7 +2274,11 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 						sizeStr = " · " + humanBytes(meta.SizeBytes)
 						lastStr = " · last: " + meta.LastActivity.Format("2006-01-02 15:04")
 					}
-					fmt.Fprintf(&sb, "- **%s** `%s` · cwd: `%s` · %d hits%s%s\n", first.SessionName, id, first.Cwd, len(hs), sizeStr, lastStr)
+					stateStr := ""
+					if first.State != "" && first.State != discovery.SessionStateActive {
+						stateStr = " · " + first.State
+					}
+					fmt.Fprintf(&sb, "- **%s** `%s` · cwd: `%s` · %d hits%s%s%s\n", first.SessionName, id, first.Cwd, len(hs), sizeStr, lastStr, stateStr)
 					perSessionShown := 5
 					for i, h := range hs {
 						if i >= perSessionShown {
@@ -2291,6 +2328,17 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			// when caller didn't supply one. `claude --resume` locates
 			// the transcript via (cwd, uuid) — must match.
 			if resumeFrom != "" {
+				// The session may have been archived or deleted. Bring
+				// it back first: `claude --resume` only finds a
+				// transcript that sits in the project dir for its cwd,
+				// so a stored session cannot start until it is restored.
+				if _, restored, rErr := discovery.EnsureRestored(resumeFrom); rErr != nil {
+					mcpCtx.logger.Debug("resume target not restorable",
+						slog.String("session_id", resumeFrom), slog.Any("error", rErr))
+				} else if restored {
+					mcpCtx.logger.Info("restored session before resume",
+						slog.String("session_id", resumeFrom))
+				}
 				if cwd == "" {
 					if path, err := discovery.SessionPath(resumeFrom); err == nil {
 						if tr, err := discovery.ReadTranscript(path); err == nil && tr.Header.Cwd != "" {
@@ -2487,14 +2535,12 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			transcriptTrashed := false
 			trashDest := ""
 			if err == nil && path != "" {
-				if trashRoot, trErr := discovery.TrashRoot(); trErr == nil {
-					if dest, mvErr := discovery.MoveTranscriptToTrash(path, sessionID, trashRoot, time.Now().UnixNano()); mvErr == nil {
-						transcriptTrashed = true
-						trashDest = dest
-					} else {
-						mcpCtx.logger.Warn("move transcript to trash failed",
-							slog.String("session_id", sessionID), slog.String("path", path), slog.Any("error", mvErr))
-					}
+				if dest, mvErr := discovery.MoveTranscriptToStore(path, sessionID, discovery.StoreTrash, time.Now().UnixNano()); mvErr == nil {
+					transcriptTrashed = true
+					trashDest = dest
+				} else {
+					mcpCtx.logger.Warn("move transcript to trash failed",
+						slog.String("session_id", sessionID), slog.String("path", path), slog.Any("error", mvErr))
 				}
 			}
 
@@ -2513,6 +2559,78 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			if trashDest != "" {
 				msg += "\n  trash: " + trashDest
 			}
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(msg)}}, nil
+		},
+	)
+
+	// archive_session — put a session away without deleting it. The
+	// worker stops and the transcript moves to the archive shelf of the
+	// store, so the sidebar stops listing it while search still reaches
+	// it and restore_session brings it back.
+	s.AddTool(
+		mcp.NewTool("archive_session",
+			mcp.WithDescription("Archive a session: stops its worker and moves the transcript (with sidecars) onto the archive shelf. The session leaves the active list but stays searchable, and restore_session or start_session bring it back. Nothing is deleted."),
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Full session UUID to archive")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]interface{})
+			sessionID, _ := argsMap["session_id"].(string)
+			if sessionID == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
+			}
+
+			killed, _ := killLiveWorker(mcpCtx, sessionID)
+
+			path, err := discovery.SessionPath(sessionID)
+			if err != nil {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
+					"No live transcript for " + sessionID + " — it may already be archived or deleted. Check with search_sessions.")}}, nil
+			}
+			dest, mvErr := discovery.MoveTranscriptToStore(path, sessionID, discovery.StoreArchive, time.Now().UnixNano())
+			if mvErr != nil {
+				return nil, fmt.Errorf("archive session: %w", mvErr)
+			}
+			msg := fmt.Sprintf("Archived session %s\n  worker stopped: %v\n  archive: %s\n  restore with restore_session, or start_session resume_from=%s (restores automatically)",
+				sessionID, killed, dest, sessionID)
+			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(msg)}}, nil
+		},
+	)
+
+	// restore_session — the inverse of archive/delete. Brings a bundle
+	// back into its project dir so the session is listed again and can
+	// be resumed.
+	s.AddTool(
+		mcp.NewTool("restore_session",
+			mcp.WithDescription("Restore an archived or deleted session: moves its transcript back into the project dir it came from, so it appears in the session list again and can be resumed. Find candidates with search_sessions — hits are labelled active, archived or deleted."),
+			mcp.WithString("session_id", mcp.Required(), mcp.Description("Full session UUID to restore")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			argsMap, _ := req.Params.Arguments.(map[string]interface{})
+			sessionID, _ := argsMap["session_id"].(string)
+			if sessionID == "" {
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: session_id is required")}}, nil
+			}
+
+			entry, findErr := discovery.FindStoreEntry(sessionID)
+			if findErr != nil {
+				if live, liveErr := discovery.SessionPath(sessionID); liveErr == nil {
+					return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
+						"Session " + sessionID + " is already active at " + live)}}, nil
+				}
+				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(
+					"Session " + sessionID + " is not in the archive or trash")}}, nil
+			}
+
+			path, err := discovery.RestoreFromStore(sessionID)
+			if err != nil {
+				return nil, fmt.Errorf("restore session: %w", err)
+			}
+			from := "archive"
+			if entry.Kind == discovery.StoreTrash {
+				from = "trash"
+			}
+			msg := fmt.Sprintf("Restored session %s from %s\n  transcript: %s\n  cwd: %s\n  start it with start_session resume_from=%s",
+				sessionID, from, path, entry.Cwd, sessionID)
 			return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent(msg)}}, nil
 		},
 	)
