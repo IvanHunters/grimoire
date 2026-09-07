@@ -53,6 +53,9 @@ export interface SessionSearchHit {
   snippet: string
   role: 'user' | 'assistant'
   lineNumber: number
+  // Where the session lives now. Archived and deleted ones need a
+  // restore before they can be opened.
+  state?: SessionState
 }
 
 // TranscriptMessage is one chat-bubble-worthy event from a JSONL.

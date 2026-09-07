@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { X, RefreshCw, Pencil, Trash2, Check, Plus, Filter, Upload, Search } from 'lucide-react'
-import { sessionsAPI, type SessionListItem, type SessionLiveState, type ImportFileResult, type SessionSearchHit } from '../../api/sessions'
+import { sessionsAPI, type SessionListItem, type SessionLiveState, type ImportFileResult, type SessionSearchHit, type SessionState } from '../../api/sessions'
 
 interface SessionsModalProps {
   visible: boolean
@@ -433,6 +433,15 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
                   setSessions((prev) => prev.filter((s) => s.sessionId !== sid))
                   setHits((prev) => prev.filter((h) => h.sessionId !== sid))
                 }}
+                onRestored={(sid) => {
+                  // The session is live again: relabel its hits so the
+                  // restore buttons disappear, and refresh the list so
+                  // it shows up among the normal rows.
+                  setHits((prev) =>
+                    prev.map((h) => (h.sessionId === sid ? { ...h, state: 'active' as SessionState } : h)),
+                  )
+                  handleRefresh()
+                }}
               />
             </>
           )}
@@ -662,7 +671,7 @@ function SessionRow({ item, onClick, onRenamed, onDeleted }: SessionRowProps) {
                   onClick={handleDelete}
                   disabled={busy}
                   className="p-1 text-red-400 hover:bg-red-500/10 rounded font-mono text-[10px] tracking-wider uppercase"
-                  title="Confirm delete (kills session + removes transcript)"
+                  title="Confirm delete (stops the worker, transcript moves to the trash shelf and can be restored)"
                 >
                   delete
                 </button>
@@ -686,7 +695,7 @@ function SessionRow({ item, onClick, onRenamed, onDeleted }: SessionRowProps) {
                 }}
                 disabled={busy}
                 className="p-1 text-slate-500 hover:text-red-400 hover:bg-white/5 rounded"
-                title="Delete session + transcript"
+                title="Delete session (transcript goes to the trash shelf, restorable)"
               >
                 <Trash2 className="w-3 h-3" />
               </button>
@@ -766,9 +775,11 @@ function SearchResultGroupCard({
   hits,
   query,
   isLive,
+  state = 'active',
   onOpenSession,
   onRenamed,
   onDeleted,
+  onRestored,
 }: {
   sessionId: string
   niceName: string
@@ -776,9 +787,11 @@ function SearchResultGroupCard({
   hits: SessionSearchHit[]
   query: string
   isLive: boolean
+  state?: SessionState
   onOpenSession?: (sessionId: string, isLive: boolean, name: string) => void
   onRenamed?: (sessionId: string, newName: string) => void
   onDeleted?: (sessionId: string) => void
+  onRestored?: (sessionId: string) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [editValue, setEditValue] = useState(niceName)
@@ -790,6 +803,24 @@ function SearchResultGroupCard({
   }, [niceName])
 
   const stop = (e: React.SyntheticEvent) => e.stopPropagation()
+
+  // A stored session cannot be opened as-is: claude --resume only sees a
+  // transcript sitting in the project dir for its cwd, so bring it back
+  // first and then hand it to the normal open path.
+  const handleRestore = async (e: React.SyntheticEvent, thenOpen: boolean) => {
+    stop(e)
+    setBusy(true)
+    try {
+      await sessionsAPI.restoreSession(sessionId)
+      onRestored?.(sessionId)
+      if (thenOpen) onOpenSession?.(sessionId, false, niceName)
+    } catch (err) {
+      console.error('restore failed', err)
+      alert('Failed to restore session')
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const handleSave = async (e: React.SyntheticEvent) => {
     stop(e)
@@ -857,12 +888,37 @@ function SearchResultGroupCard({
           )}
           <div className="font-mono text-[9px] text-slate-600 tracking-wider uppercase truncate">
             {sessionId.slice(0, 8)} · {cwd}
+            {state !== 'active' && (
+              <span className={state === 'archived' ? ' text-amber-400' : ' text-red-400'}>
+                {' · '}{state}
+              </span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-1.5 flex-shrink-0">
           <span className="font-mono text-[10px] text-slate-600">
             {hits.length} match{hits.length === 1 ? '' : 'es'}
           </span>
+          {state !== 'active' && (
+            <>
+              <button
+                onClick={(e) => handleRestore(e, false)}
+                disabled={busy}
+                className="p-1 text-slate-500 hover:text-emerald-400 hover:bg-white/5 rounded font-mono text-[10px] tracking-wider uppercase"
+                title={`Restore this ${state} session back into its project`}
+              >
+                restore
+              </button>
+              <button
+                onClick={(e) => handleRestore(e, true)}
+                disabled={busy}
+                className="p-1 text-slate-500 hover:text-cyan-400 hover:bg-white/5 rounded font-mono text-[10px] tracking-wider uppercase"
+                title="Restore and open the session"
+              >
+                restore + open
+              </button>
+            </>
+          )}
           <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
             {editing ? (
               <button
@@ -889,7 +945,7 @@ function SearchResultGroupCard({
                   onClick={handleDelete}
                   disabled={busy}
                   className="p-1 text-red-400 hover:bg-red-500/10 rounded font-mono text-[10px] tracking-wider uppercase"
-                  title="Confirm delete (kills session + removes transcript)"
+                  title="Confirm delete (stops the worker, transcript moves to the trash shelf and can be restored)"
                 >
                   delete
                 </button>
@@ -907,7 +963,7 @@ function SearchResultGroupCard({
                 onClick={(e) => { stop(e); setConfirmingDelete(true) }}
                 disabled={busy}
                 className="p-1 text-slate-500 hover:text-red-400 hover:bg-white/5 rounded"
-                title="Delete session + transcript"
+                title="Delete session (transcript goes to the trash shelf, restorable)"
               >
                 <Trash2 className="w-3 h-3" />
               </button>
@@ -954,6 +1010,7 @@ function SearchResultsBlock({
   onOpenSession,
   onRenamed,
   onDeleted,
+  onRestored,
   sessionNames,
   sessionsByIdLive,
 }: {
@@ -965,6 +1022,8 @@ function SearchResultsBlock({
   onRenamed?: (sessionId: string, newName: string) => void
   /** Called after a successful delete — caller refreshes the list. */
   onDeleted?: (sessionId: string) => void
+  /** Called after an archived or deleted session was restored. */
+  onRestored?: (sessionId: string) => void
   /** Map of sessionId → human-readable name. Missing entries fall
       back to the 8-hex prefix so the header is never empty. */
   sessionNames?: Record<string, string>
@@ -972,14 +1031,14 @@ function SearchResultsBlock({
   sessionsByIdLive?: Record<string, boolean>
 }) {
   // Group hits by sessionId.
-  const groups: { sessionId: string; sessionName: string; cwd: string; hits: SessionSearchHit[] }[] = []
+  const groups: { sessionId: string; sessionName: string; cwd: string; state: SessionState; hits: SessionSearchHit[] }[] = []
   const byId = new Map<string, number>()
   for (const h of hits) {
     let idx = byId.get(h.sessionId)
     if (idx === undefined) {
       idx = groups.length
       byId.set(h.sessionId, idx)
-      groups.push({ sessionId: h.sessionId, sessionName: h.sessionName, cwd: h.cwd, hits: [] })
+      groups.push({ sessionId: h.sessionId, sessionName: h.sessionName, cwd: h.cwd, state: h.state ?? 'active', hits: [] })
     }
     groups[idx].hits.push(h)
   }
@@ -998,9 +1057,11 @@ function SearchResultsBlock({
             hits={group.hits}
             query={query}
             isLive={isLive}
+            state={group.state}
             onOpenSession={onOpenSession}
             onRenamed={onRenamed}
             onDeleted={onDeleted}
+            onRestored={onRestored}
           />
         )
       })}
