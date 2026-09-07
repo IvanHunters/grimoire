@@ -15,6 +15,7 @@ import (
 	"github.com/ivanohotnikov/markdown-editor/internal/api"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude"
 	"github.com/ivanohotnikov/markdown-editor/internal/claude/daemon"
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/discovery"
 	"github.com/ivanohotnikov/markdown-editor/internal/config"
 	mw "github.com/ivanohotnikov/markdown-editor/internal/middleware"
 	"github.com/ivanohotnikov/markdown-editor/internal/scheduler"
@@ -155,6 +156,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 		logger.Warn("skills watcher failed to start", slog.Any("error", err))
 	}
 	defer skillSyncer.Stop()
+
+	// Fold sessions deleted by older builds into the central store, so
+	// archived and deleted sessions live in one place and search has one
+	// root to walk. Idempotent, and a failure here is not fatal: the
+	// legacy dir stays readable either way.
+	if moved, err := discovery.MigrateLegacyTrash(); err != nil {
+		logger.Warn("legacy trash migration failed", slog.Any("error", err))
+	} else if moved > 0 {
+		logger.Info("legacy trash migrated into the session store", slog.Int("folders", moved))
+	}
 
 	// Setup HTTP server
 	handler := api.NewHandler(cfg, db, manager, logger)
