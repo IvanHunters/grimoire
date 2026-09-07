@@ -167,15 +167,15 @@ function ChatPanel({
   }, [sessionId, handleRestart])
 
   const handleKill = useCallback(async () => {
-    // Kill = backend deletes the session + JSONL, AND we close the
-    // panel so the WS doesn't reconnect-and-respawn. The old behaviour
-    // (deleteSession + sessionKey bump) re-mounted TerminalChat which
-    // immediately sent a new init → backend GetOrCreate spawned a
-    // replacement worker → "kill" appeared to do nothing.
+    // Kill stops the worker and leaves the transcript alone — the
+    // session stays listed and resumable. We still close the panel so
+    // the WS doesn't reconnect-and-respawn: re-mounting TerminalChat
+    // sends a new init → backend GetOrCreate spawns a replacement
+    // worker → "kill" appears to do nothing.
     // Also clean up the localStorage tab so Quick Terminal doesn't
     // restore this id on next panel open.
     try {
-      await sessionsAPI.deleteSession(sessionId, { deleteTranscript: true })
+      await sessionsAPI.killSession(sessionId)
     } catch (e) {
       console.error('kill session failed', e)
     }

@@ -252,7 +252,10 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
     const idx = activeIdx
     const tab = tabs[idx]
     if (!tab) return
-    try { await sessionsAPI.deleteSession(tab.sessionId, { deleteTranscript: true }) } catch {}
+    // Kill stops the worker only. The transcript stays on disk so the
+    // session remains listed and resumable — closing a terminal is not
+    // a request to throw the conversation away.
+    try { await sessionsAPI.killSession(tab.sessionId) } catch {}
     // REMOVE the tab — do NOT remount it. Bumping sessionKey re-inits the
     // TerminalChat WS, which calls GetOrCreate and respawns a fresh empty
     // worker under a "grimoire-<id>" token — exactly the "killed session

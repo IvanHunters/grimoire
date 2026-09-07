@@ -84,6 +84,30 @@ export interface Transcript {
   messages: TranscriptMessage[]
 }
 
+export type SessionState = 'active' | 'archived' | 'deleted'
+
+// One session sitting on the archive or trash shelf.
+export interface StoredSession {
+  sessionId: string
+  kind: 'archive' | 'trash'
+  state: SessionState
+  name: string
+  cwd: string
+  sizeBytes: number
+  movedAt: string
+}
+
+// Result of archiving or restoring: `path` and `cwd` are what a resume
+// needs, since claude --resume finds a transcript by (cwd, uuid).
+export interface StoredSessionAction {
+  sessionId: string
+  state: SessionState
+  dir?: string
+  path?: string
+  cwd?: string
+  from?: SessionState
+}
+
 export const sessionsAPI = {
   listActiveSessions: async (): Promise<ClaudeSession[]> => {
     const response = await apiClient.get<ClaudeSession[]>('/sessions')
@@ -94,6 +118,35 @@ export const sessionsAPI = {
     const params: Record<string, string> = {}
     if (opts.deleteTranscript) params.transcript = 'true'
     await apiClient.delete(`/sessions/${sessionId}`, { params })
+  },
+
+  // Stop the worker and leave the transcript alone. This is what a
+  // "kill" must do: the session stays listed and resumable, only the
+  // process goes away.
+  killSession: async (sessionId: string): Promise<void> => {
+    await apiClient.delete(`/sessions/${sessionId}`)
+  },
+
+  // Put a session away: worker stops, transcript moves to the archive
+  // shelf. It leaves the active list but stays searchable and can be
+  // restored.
+  archiveSession: async (sessionId: string): Promise<StoredSessionAction> => {
+    const response = await apiClient.post<StoredSessionAction>(`/sessions/${sessionId}/archive`)
+    return response.data
+  },
+
+  // Bring an archived or deleted session back into its project dir.
+  // The returned cwd is what a subsequent start has to run in.
+  restoreSession: async (sessionId: string): Promise<StoredSessionAction> => {
+    const response = await apiClient.post<StoredSessionAction>(`/sessions/${sessionId}/restore`)
+    return response.data
+  },
+
+  // Everything on the shelves, newest first. Pass a kind to narrow.
+  listStoredSessions: async (kind?: 'archive' | 'trash'): Promise<StoredSession[]> => {
+    const params = kind ? { kind } : undefined
+    const response = await apiClient.get<{ entries: StoredSession[] }>('/sessions/store', { params })
+    return response.data.entries ?? []
   },
 
   renameSession: async (sessionId: string, name: string): Promise<void> => {

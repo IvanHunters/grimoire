@@ -233,27 +233,54 @@ export function ClaudeSessionsPanel({
     }
   }
 
-  const handleDelete = async (sessionId: string) => {
+  // Drop a row from the panel and from the terminal panel's restored
+  // tabs, so a session that is gone doesn't come back on next open.
+  const forgetSessionInUI = (sessionId: string) => {
+    setSessions((prev) => prev.filter((s) => s.id !== sessionId))
+    onSessionDeleted?.(sessionId)
     try {
-      // deleteTranscript:true so the JSONL also goes — otherwise the
-      // historical row keeps coming back on the next poll, looking like
-      // "delete didn't work".
-      await sessionsAPI.deleteSession(sessionId, { deleteTranscript: true })
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId))
-      onSessionDeleted?.(sessionId)
-      // Drop matching tab from GlobalTerminalPanel's localStorage so the
-      // panel doesn't restore the (now-dead) tab on next open.
-      try {
-        const raw = localStorage.getItem('global-terminal-tabs')
-        if (raw) {
-          const tabs = JSON.parse(raw) as Array<{ sessionId: string; label: string }>
-          const filtered = tabs.filter((t) => t.sessionId !== sessionId)
-          if (filtered.length !== tabs.length) {
-            localStorage.setItem('global-terminal-tabs', JSON.stringify(filtered))
-            window.dispatchEvent(new CustomEvent('global-terminal-tabs-changed'))
-          }
+      const raw = localStorage.getItem('global-terminal-tabs')
+      if (raw) {
+        const tabs = JSON.parse(raw) as Array<{ sessionId: string; label: string }>
+        const filtered = tabs.filter((t) => t.sessionId !== sessionId)
+        if (filtered.length !== tabs.length) {
+          localStorage.setItem('global-terminal-tabs', JSON.stringify(filtered))
+          window.dispatchEvent(new CustomEvent('global-terminal-tabs-changed'))
         }
-      } catch {}
+      }
+    } catch {}
+  }
+
+  // Kill stops the worker and nothing else. The session stays listed and
+  // stays resumable — killing a process is not the same act as throwing
+  // the conversation away.
+  const handleKill = async (sessionId: string) => {
+    try {
+      await sessionsAPI.killSession(sessionId)
+      window.dispatchEvent(new CustomEvent('claude-sessions-refresh'))
+    } catch (err) {
+      console.error('kill failed', err)
+      alert('Failed to kill session')
+    }
+  }
+
+  // Archive puts the session away: it leaves the list but stays
+  // searchable and can be restored later.
+  const handleArchive = async (sessionId: string) => {
+    try {
+      await sessionsAPI.archiveSession(sessionId)
+      forgetSessionInUI(sessionId)
+    } catch (err) {
+      console.error('archive failed', err)
+      alert('Failed to archive session')
+    }
+  }
+
+  const handleDelete = async (sessionId: string) => {
+    if (!window.confirm('Delete this session? The transcript moves to the trash shelf and can be restored from search.')) return
+    try {
+      await sessionsAPI.deleteSession(sessionId, { deleteTranscript: true })
+      forgetSessionInUI(sessionId)
     } catch (err) {
       console.error('delete failed', err)
       alert('Failed to delete session')
@@ -344,6 +371,16 @@ export function ClaudeSessionsPanel({
         },
         {
           text: 'Kill Session',
+          icon: 'ban',
+          action: () => handleKill(session.id),
+        },
+        {
+          text: 'Archive Session',
+          icon: 'box-archive',
+          action: () => handleArchive(session.id),
+        },
+        {
+          text: 'Delete Session',
           icon: 'trash',
           action: () => handleDelete(session.id),
           danger: true,
