@@ -373,50 +373,9 @@ func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Session ID required", http.StatusBadRequest)
 		return
 	}
-	dropTranscript := r.URL.Query().Get("transcript") == "true"
+	alsoDropTranscript := r.URL.Query().Get("transcript") == "true"
 
-	// Close session in manager (stops subprocess / daemon worker) — runs
-	// in background so the HTTP response doesn't wait on shutdown.
-	if h.sessionManager != nil {
-		go func() {
-			if err := h.sessionManager.Close(sessionID); err != nil {
-				h.logger.Warn("failed to close session in manager", "session_id", sessionID, "error", err)
-			}
-		}()
-	}
-
-	// Also kill the daemon worker by its session UUID. This catches
-	// external sessions (kvaps spawned, our orphans across restarts)
-	// that aren't in manager.sessions — without this, manager.Close
-	// is a no-op and the worker stays alive, so the row re-appears on
-	// the next sidebar poll.
-	go func() {
-		client := &daemon.Client{Logger: h.logger}
-		jobs, err := client.ListSessions()
-		if err != nil {
-			return
-		}
-		for _, j := range jobs {
-			if j.SessionID == sessionID {
-				if rmErr := client.Remove(j.Short); rmErr != nil {
-					h.logger.Warn("daemon worker remove failed",
-						"session_id", sessionID, "short", j.Short, "error", rmErr)
-				}
-				return
-			}
-			// Also match the "grimoire-resume-<short>" name pattern in
-			// case the row's sessionID was the historical parent and the
-			// live worker is the resume child.
-			if strings.HasPrefix(j.Name, "grimoire-resume-") &&
-				strings.TrimPrefix(j.Name, "grimoire-resume-") == sessionID[:min(8, len(sessionID))] {
-				if rmErr := client.Remove(j.Short); rmErr != nil {
-					h.logger.Warn("daemon resume-child remove failed",
-						"session_id", sessionID, "short", j.Short, "error", rmErr)
-				}
-				return
-			}
-		}
-	}()
+	h.stopWorker(sessionID)
 
 	// Update Mongo status with a fresh ctx (not request-bound).
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -439,23 +398,15 @@ func (h *Handler) DeleteSession(w http.ResponseWriter, r *http.Request) {
 	// accidental delete is always recoverable. Failure here is logged
 	// but doesn't surface 500 — the session is already gone from memory
 	// and Mongo.
-	if dropTranscript {
-		if path, err := discovery.SessionPath(sessionID); err == nil {
-			trashRoot, trErr := discovery.TrashRoot()
-			if trErr != nil {
-				h.logger.Warn("resolve transcript trash root failed",
-					"session_id", sessionID, "error", trErr)
-			} else if dest, mvErr := discovery.MoveTranscriptToTrash(path, sessionID, trashRoot, time.Now().UnixNano()); mvErr != nil {
-				h.logger.Warn("move transcript to trash failed",
-					"session_id", sessionID, "path", path, "error", mvErr)
-			} else {
-				h.logger.Info("transcript moved to trash (recoverable)",
-					"session_id", sessionID, "path", path, "trash", dest)
-			}
-		} else {
-			// Path lookup failed — likely the transcript was already gone.
-			h.logger.Debug("transcript not found for delete",
+	if alsoDropTranscript {
+		if dir, err := h.dropTranscript(sessionID, discovery.StoreTrash); err != nil {
+			// Failure is logged, not surfaced: the session is already gone
+			// from memory and Mongo, and the transcript is untouched.
+			h.logger.Debug("transcript not moved to trash",
 				"session_id", sessionID, "error", err)
+		} else {
+			h.logger.Info("transcript moved to trash (recoverable)",
+				"session_id", sessionID, "dir", dir)
 		}
 	}
 
@@ -628,4 +579,58 @@ func (h *Handler) CompactSession(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		h.logger.Error("encode compact response", "error", err)
 	}
+}
+
+// stopWorker halts whatever is running a session: the manager entry if
+// we own it, plus the daemon worker itself, which catches externally
+// spawned sessions and orphans across restarts. Both run in the
+// background so an HTTP handler never waits on shutdown.
+//
+// It stops the process and NOTHING else — no transcript is touched.
+// Killing a session and putting it away are separate acts, and a menu
+// item that says "kill" must not quietly delete history.
+func (h *Handler) stopWorker(sessionID string) {
+	// Close session in manager (stops subprocess / daemon worker) — runs
+	// in background so the HTTP response doesn't wait on shutdown.
+	if h.sessionManager != nil {
+		go func() {
+			if err := h.sessionManager.Close(sessionID); err != nil {
+				h.logger.Warn("failed to close session in manager", "session_id", sessionID, "error", err)
+			}
+		}()
+	}
+
+	// Also kill the daemon worker by its session UUID. This catches
+	// external sessions (kvaps spawned, our orphans across restarts)
+	// that aren't in manager.sessions — without this, manager.Close
+	// is a no-op and the worker stays alive, so the row re-appears on
+	// the next sidebar poll.
+	go func() {
+		client := &daemon.Client{Logger: h.logger}
+		jobs, err := client.ListSessions()
+		if err != nil {
+			return
+		}
+		for _, j := range jobs {
+			if j.SessionID == sessionID {
+				if rmErr := client.Remove(j.Short); rmErr != nil {
+					h.logger.Warn("daemon worker remove failed",
+						"session_id", sessionID, "short", j.Short, "error", rmErr)
+				}
+				return
+			}
+			// Also match the "grimoire-resume-<short>" name pattern in
+			// case the row's sessionID was the historical parent and the
+			// live worker is the resume child.
+			if strings.HasPrefix(j.Name, "grimoire-resume-") &&
+				strings.TrimPrefix(j.Name, "grimoire-resume-") == sessionID[:min(8, len(sessionID))] {
+				if rmErr := client.Remove(j.Short); rmErr != nil {
+					h.logger.Warn("daemon resume-child remove failed",
+						"session_id", sessionID, "short", j.Short, "error", rmErr)
+				}
+				return
+			}
+		}
+	}()
+
 }

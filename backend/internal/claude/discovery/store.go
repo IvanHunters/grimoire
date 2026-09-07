@@ -387,3 +387,10 @@ func sessionIDFromStoreDir(name string) string {
 	}
 	return name[:idx]
 }
+
+// FindStoreEntry locates a relocated session by id across both shelves.
+// Callers need it before a restore to learn the cwd the session belongs
+// to, which is what a subsequent start has to run in.
+func FindStoreEntry(sessionID string) (StoreEntry, error) {
+	return findStoreEntry(sessionID)
+}

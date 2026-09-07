@@ -200,6 +200,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Get("/sessions", handler.ListSessions)
 		r.Get("/sessions/by-project", handler.SessionsByCwd)
 		r.Get("/sessions/search", handler.SearchSessions)
+		r.Get("/sessions/store", handler.ListStoredSessions)
 		r.Post("/sessions/import", handler.ImportSession)
 		r.Delete("/sessions/{id}", handler.DeleteSession)
 		r.Get("/sessions/{id}/status", handler.SessionStatus)
@@ -207,6 +208,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		r.Get("/sessions/{id}/jsonl", handler.SessionRawJSONL)
 		r.Put("/sessions/{id}/name", handler.RenameSession)
 		r.Post("/sessions/{id}/compact", handler.CompactSession)
+		r.Post("/sessions/{id}/archive", handler.ArchiveSession)
+		r.Post("/sessions/{id}/restore", handler.RestoreSession)
 
 		// Projects
 		r.Get("/projects", handler.ListProjects)
