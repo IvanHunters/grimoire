@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Terminal, ChevronDown, ChevronUp, Settings2 } from 'lucide-react'
 import ContextMenu, { type ContextMenuItem } from '../common/ContextMenu'
-import { sessionsAPI, type SessionListItem } from '../../api/sessions'
+import { sessionsAPI, type SessionListItem, type StoredSession } from '../../api/sessions'
 import { tasksAPI } from '../../api/tasks'
 import type { ClaudeSession } from '../../types/claude'
 import { SessionStatusPill, formatSessionAge, formatSessionDate } from './SessionStatusPill'
@@ -56,6 +56,13 @@ export function ClaudeSessionsPanel({
   // that aren't currently live (the active list alone missed e.g. an
   // "Ignite Client" historical session).
   const [allItems, setAllItems] = useState<SessionListItem[]>([])
+  // Sessions that were put away — archived on purpose, or deleted.
+  // They are absent from every live listing because their transcript
+  // left the project dir, so they are loaded separately and folded into
+  // the filter pool, marked with where they came from. Loaded once and
+  // on refresh rather than on the 3s poll: the shelves change rarely and
+  // walking them is more work than listing live workers.
+  const [stored, setStored] = useState<StoredSession[]>([])
   // taskTitles maps task-id → human title so note-task-<id> sessions
   // can show their task's real name in the panel instead of the
   // claude-auto-renamed "Load and review task details" that comes
@@ -107,6 +114,18 @@ export function ClaudeSessionsPanel({
     visible: false, x: 0, y: 0, items: [],
   })
   const resizeRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const loadStored = () => {
+      sessionsAPI
+        .listStoredSessions()
+        .then(setStored)
+        .catch(() => {})
+    }
+    loadStored()
+    window.addEventListener('claude-sessions-refresh', loadStored)
+    return () => window.removeEventListener('claude-sessions-refresh', loadStored)
+  }, [])
 
   // Persist collapse + height changes locally.
   useEffect(() => { localStorage.setItem(LS_COLLAPSED, String(collapsed)) }, [collapsed])
@@ -276,17 +295,6 @@ export function ClaudeSessionsPanel({
     }
   }
 
-  const handleDelete = async (sessionId: string) => {
-    if (!window.confirm('Delete this session? The transcript moves to the trash shelf and can be restored from search.')) return
-    try {
-      await sessionsAPI.deleteSession(sessionId, { deleteTranscript: true })
-      forgetSessionInUI(sessionId)
-    } catch (err) {
-      console.error('delete failed', err)
-      alert('Failed to delete session')
-    }
-  }
-
   const handleSessionContextMenu = (e: React.MouseEvent, session: ClaudeSession) => {
     e.preventDefault()
     e.stopPropagation()
@@ -378,12 +386,6 @@ export function ClaudeSessionsPanel({
           text: 'Archive Session',
           icon: 'box-archive',
           action: () => handleArchive(session.id),
-        },
-        {
-          text: 'Delete Session',
-          icon: 'trash',
-          action: () => handleDelete(session.id),
-          danger: true,
         },
       ],
     })
@@ -494,9 +496,28 @@ export function ClaudeSessionsPanel({
     needs: b.live?.needs,
   })
   const activeIds = new Set(sessions.map((s) => s.id))
+  // Archived and deleted sessions read as ordinary rows apart from the
+  // marker, so the same filter, sort and click paths apply to them.
+  const s2c = (e: StoredSession): ClaudeSession => ({
+    id: e.sessionId,
+    name: e.name || e.sessionId.slice(0, 8),
+    workingDir: e.cwd,
+    dangerousMode: false,
+    messages: [],
+    isActive: false,
+    lastActivity: e.movedAt,
+    createdAt: e.movedAt,
+    initialized: false,
+    storedState: e.state === 'deleted' ? 'deleted' : 'archived',
+  })
+  const listedIds = new Set([...activeIds, ...allItems.map((b) => b.sessionId)])
   const rawPool: ClaudeSession[] =
     q.length >= 1
-      ? [...sessions, ...allItems.filter((b) => !activeIds.has(b.sessionId)).map(b2c)]
+      ? [
+          ...sessions,
+          ...allItems.filter((b) => !activeIds.has(b.sessionId)).map(b2c),
+          ...stored.filter((e) => !listedIds.has(e.sessionId)).map(s2c),
+        ]
       : sessions
   // Drop by-project "ghosts" — the same conversation surfaced under an old
   // id. A resume/fork lineage leaves a stale record (by-project can still
@@ -558,8 +579,22 @@ export function ClaudeSessionsPanel({
     setDragOverIdx(null)
   }
 
-  const handleClick = (session: ClaudeSession, sessionName: string) => {
+  const handleClick = async (session: ClaudeSession, sessionName: string) => {
     if (renamingId === session.id) return
+    // A put-away session cannot be attached to as-is: its transcript is
+    // on a shelf, and claude --resume only finds transcripts under the
+    // project dir for their cwd. Bring it back, then open it normally.
+    if (session.storedState) {
+      try {
+        await sessionsAPI.restoreSession(session.id)
+        setStored((prev) => prev.filter((e) => e.sessionId !== session.id))
+        window.dispatchEvent(new CustomEvent('claude-sessions-refresh'))
+      } catch (err) {
+        console.error('restore failed', err)
+        alert('Failed to restore session')
+        return
+      }
+    }
     // Note-bound chats go through ChatPanel via onOpenChatWithNote.
     // Anything else (global-*, task-*, raw daemon UUIDs) → attach modal.
     if (session.id.startsWith('note-') && !session.id.startsWith('note-task-')) {
@@ -737,6 +772,22 @@ export function ClaudeSessionsPanel({
                               <div className={`flex-1 text-sm font-mono truncate ${isActive ? 'text-purple-300' : 'text-slate-400'}`}>
                                 {sessionName}
                               </div>
+                              {session.storedState && (
+                                <span
+                                  className={`flex-shrink-0 text-[9px] font-mono uppercase tracking-wider px-1 py-px rounded border ${
+                                    session.storedState === 'archived'
+                                      ? 'text-amber-400 border-amber-500/30 bg-amber-500/10'
+                                      : 'text-red-400 border-red-500/30 bg-red-500/10'
+                                  }`}
+                                  title={
+                                    session.storedState === 'archived'
+                                      ? 'Archived — click to restore and open'
+                                      : 'Deleted — click to restore and open'
+                                  }
+                                >
+                                  {session.storedState}
+                                </span>
+                              )}
                               <SessionStatusPill state={session.state} tempo={session.tempo} detail={session.detail} needs={session.needs} />
                             </div>
                           )}

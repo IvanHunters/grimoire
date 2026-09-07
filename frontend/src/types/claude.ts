@@ -23,6 +23,10 @@ export interface ClaudeSession {
   state?: 'working' | 'blocked' | 'done' | 'failed' | 'stopped' | 'running' | 'unknown' | string
   detail?: string
   needs?: string
+  /** Set when the row comes from the archive or the trash rather than
+      the live listing. Such a session has to be restored before it can
+      be opened, because its transcript sits outside the project dir. */
+  storedState?: 'archived' | 'deleted'
 }
 
 export type WSMessageType =
