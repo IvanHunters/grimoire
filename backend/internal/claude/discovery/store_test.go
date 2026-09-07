@@ -324,3 +324,45 @@ func TestEnsureRestoredUnknownSession(t *testing.T) {
 		t.Fatal("expected an error for a session that is neither live nor stored")
 	}
 }
+
+// Sessions deleted by older builds live in the pre-store trash dir.
+// They must stay visible and restorable, otherwise upgrading the app
+// silently hides everything that was deleted before it.
+func TestListStoreIncludesLegacyTrash(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CLAUDE_PROJECTS_DIR", root)
+
+	const uuid = "3f2a1b0c-9d8e-4f7a-8b6c-5d4e3f2a1b0c"
+	const cwd = "/Users/ivan/gitops/legacy"
+	legacyRoot, err := LegacyTrashRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(legacyRoot, uuid+"-1735689600000000000")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"type":"user","cwd":"` + cwd + `","sessionId":"` + uuid + `","message":{"role":"user","content":"legacy"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, uuid+".jsonl"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := ListStore("")
+	if err != nil {
+		t.Fatalf("ListStore: %v", err)
+	}
+	if len(entries) != 1 || entries[0].SessionID != uuid {
+		t.Fatalf("ListStore() = %+v, want the legacy session %s", entries, uuid)
+	}
+	if entries[0].Kind != StoreTrash {
+		t.Errorf("legacy entry kind = %q, want trash", entries[0].Kind)
+	}
+
+	restored, err := RestoreFromStore(uuid)
+	if err != nil {
+		t.Fatalf("RestoreFromStore from legacy trash: %v", err)
+	}
+	if want := filepath.Join(root, SanitizeCwd(cwd), uuid+".jsonl"); restored != want {
+		t.Errorf("restored to %q, want %q", restored, want)
+	}
+}
