@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { X, RefreshCw, Pencil, Trash2, Check, Plus, Filter, Upload, Search } from 'lucide-react'
-import { sessionsAPI, type SessionListItem, type SessionLiveState, type ImportFileResult, type SessionSearchHit, type SessionState } from '../../api/sessions'
+import { X, RefreshCw, Pencil, Trash2, Check, Plus, Filter, Upload, Search, Archive, RotateCcw } from 'lucide-react'
+import { sessionsAPI, type SessionListItem, type SessionLiveState, type ImportFileResult, type SessionSearchHit, type SessionState, type StoredSession } from '../../api/sessions'
 
 interface SessionsModalProps {
   visible: boolean
@@ -46,6 +46,12 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
   // When true, list is filtered to imported-only sessions. Cheap
   // client-side filter on top of the standard listing.
   const [importedOnly, setImportedOnly] = useState(false)
+  // Sessions that were put away: archived deliberately, or deleted.
+  // They are not in the normal list because their transcript has left
+  // the project dir, so they get their own view.
+  const [storedOnly, setStoredOnly] = useState(false)
+  const [stored, setStored] = useState<StoredSession[]>([])
+  const [storedLoading, setStoredLoading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
   const [importing, setImporting] = useState(false)
   const [importSummary, setImportSummary] = useState<{ ok: number; failed: number } | null>(null)
@@ -154,6 +160,32 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
       clearTimeout(timer)
     }
   }, [visible, query, effectiveCwd])
+
+  const loadStored = () => {
+    setStoredLoading(true)
+    sessionsAPI
+      .listStoredSessions()
+      .then(setStored)
+      .catch((err) => console.error('list stored sessions failed', err))
+      .finally(() => setStoredLoading(false))
+  }
+
+  useEffect(() => {
+    if (!visible || !storedOnly) return
+    loadStored()
+  }, [visible, storedOnly])
+
+  const handleRestoreStored = async (sessionId: string, thenOpen: boolean, name: string) => {
+    try {
+      await sessionsAPI.restoreSession(sessionId)
+      setStored((prev) => prev.filter((e) => e.sessionId !== sessionId))
+      handleRefresh()
+      if (thenOpen) onOpenSession?.(sessionId, false, name)
+    } catch (err) {
+      console.error('restore failed', err)
+      alert('Failed to restore session')
+    }
+  }
 
   const handleRefresh = () => {
     setLoading(true)
@@ -281,6 +313,13 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
               title={importedOnly ? 'Showing imported only — click to show all' : 'Show only imported sessions'}
             >
               <span className="font-mono text-[10px] tracking-wider uppercase font-semibold">imp</span>
+            </button>
+            <button
+              onClick={() => setStoredOnly((v) => !v)}
+              className={`p-1.5 transition-colors rounded ${storedOnly ? 'text-amber-400 bg-amber-500/10' : 'text-slate-500 hover:text-slate-300'}`}
+              title={storedOnly ? 'Showing put-away sessions — click to go back' : 'Show archived and deleted sessions'}
+            >
+              <Archive className="w-3.5 h-3.5" />
             </button>
             <button
               onClick={handleRefresh}
@@ -446,10 +485,35 @@ function SessionsModal({ visible, onClose, cwd, currentProjectCwd, onOpenSession
             </>
           )}
 
+          {storedOnly && !query && (
+            <>
+              <div className="px-4 py-2 text-[10px] font-mono uppercase tracking-widest text-amber-400/80 border-b border-amber-500/15 bg-amber-500/[0.03] sticky top-0 z-[1]">
+                Put away · {stored.length}
+              </div>
+              {storedLoading && stored.length === 0 && (
+                <div className="px-4 py-6 text-center font-mono text-[11px] text-slate-600">loading…</div>
+              )}
+              {!storedLoading && stored.length === 0 && (
+                <div className="px-4 py-6 text-center font-mono text-[11px] text-slate-600">
+                  Nothing archived or deleted
+                </div>
+              )}
+              <ul className="divide-y divide-white/[0.04]">
+                {stored.map((e) => (
+                  <StoredSessionRow
+                    key={`${e.kind}-${e.sessionId}-${e.movedAt}`}
+                    entry={e}
+                    onRestore={(thenOpen) => handleRestoreStored(e.sessionId, thenOpen, e.name)}
+                  />
+                ))}
+              </ul>
+            </>
+          )}
+
           {/* Split into live / history sections when no query is set.
               Backend already sorts live-first, so we just look for the
               boundary and inject a header in the middle. */}
-          {(() => {
+          {!storedOnly && (() => {
             const visibleSessions = importedOnly ? sessions.filter((s) => s.imported) : sessions
             const liveCount = visibleSessions.filter((s) => s.live).length
             return (
@@ -1094,3 +1158,70 @@ function highlightQuery(text: string, query: string): React.ReactNode {
 }
 
 export default SessionsModal
+
+// StoredSessionRow is one archived or deleted session in the put-away
+// view. Restoring is the only way back: a stored transcript sits outside
+// the project dir, and claude --resume only finds transcripts that live
+// in the project dir for their cwd.
+function StoredSessionRow({
+  entry,
+  onRestore,
+}: {
+  entry: StoredSession
+  onRestore: (thenOpen: boolean) => void
+}) {
+  const [busy, setBusy] = useState(false)
+
+  const run = async (thenOpen: boolean) => {
+    setBusy(true)
+    try {
+      await onRestore(thenOpen)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stateColour = entry.state === 'archived' ? 'text-amber-400' : 'text-red-400'
+
+  return (
+    <li className="group px-4 py-2 flex items-center gap-3 hover:bg-white/[0.02]">
+      <div className="min-w-0 flex-1">
+        <div className="font-mono text-xs text-slate-300 truncate">
+          {entry.name || entry.sessionId.slice(0, 8)}
+        </div>
+        <div className="font-mono text-[9px] text-slate-600 tracking-wider uppercase truncate">
+          {entry.sessionId.slice(0, 8)} · {entry.cwd || 'unknown cwd'}
+          <span className={` ${stateColour}`}> · {entry.state}</span>
+          {' · '}
+          {formatBytes(entry.sizeBytes)}
+          {' · '}
+          {formatRelative(new Date(entry.movedAt))}
+        </div>
+      </div>
+      <div className="flex items-center gap-0.5 flex-shrink-0">
+        <button
+          onClick={() => run(false)}
+          disabled={busy}
+          className="p-1 text-slate-500 hover:text-emerald-400 hover:bg-white/5 rounded disabled:opacity-40"
+          title="Restore into its project"
+        >
+          <RotateCcw className="w-3 h-3" />
+        </button>
+        <button
+          onClick={() => run(true)}
+          disabled={busy}
+          className="p-1 text-slate-500 hover:text-cyan-400 hover:bg-white/5 rounded font-mono text-[10px] tracking-wider uppercase disabled:opacity-40"
+          title="Restore and open"
+        >
+          open
+        </button>
+      </div>
+    </li>
+  )
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
