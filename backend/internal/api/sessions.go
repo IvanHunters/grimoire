@@ -438,44 +438,12 @@ func (h *Handler) CompactSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Body optional — all fields have safe defaults.
-	var body struct {
-		KeepRecentToolResults    int   `json:"keep_recent_tool_results"`
-		MaxStubBytes             int   `json:"max_stub_bytes"`
-		DropToolUseResultMirror  *bool `json:"drop_tool_use_result_mirror"`
-		GenerateLedger           *bool `json:"generate_ledger"`
-		DropFileHistorySnapshots *bool `json:"drop_file_history_snapshots"`
-		DropMetaSidecar          *bool `json:"drop_meta_sidecar"`
-		DropThinking             *bool `json:"drop_thinking"`
-		KeepRecentAttachments    int   `json:"keep_recent_attachments"`
-	}
+	var body compactRequest
 	if r.Body != nil && r.ContentLength != 0 {
 		_ = json.NewDecoder(r.Body).Decode(&body) // best-effort
 	}
-	dropMirror := true
-	if body.DropToolUseResultMirror != nil {
-		dropMirror = *body.DropToolUseResultMirror
-	}
-	genLedger := true
-	if body.GenerateLedger != nil {
-		genLedger = *body.GenerateLedger
-	}
-	// New aggressive-but-safe drops — all default true. These remove
-	// content claude does NOT consume on --resume (file-history is
-	// rebuilt from disk; meta sidecar is grimoire-side; thinking is
-	// internal scratchpad). Override via JSON body if you need to keep
-	// any category.
-	dropFileHistory := true
-	if body.DropFileHistorySnapshots != nil {
-		dropFileHistory = *body.DropFileHistorySnapshots
-	}
-	dropMeta := true
-	if body.DropMetaSidecar != nil {
-		dropMeta = *body.DropMetaSidecar
-	}
-	dropThinking := true
-	if body.DropThinking != nil {
-		dropThinking = *body.DropThinking
-	}
+	settings := body.resolve()
+	genLedger := settings.GenerateLedger
 
 	// Resolve transcript path with three-step lookup so compact works
 	// even when the UI sends a worker UUID (drift after resume cycles)
@@ -535,15 +503,7 @@ func (h *Handler) CompactSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	opts := compact.Options{
-		KeepRecentToolResults:    body.KeepRecentToolResults,
-		MaxStubBytes:             body.MaxStubBytes,
-		DropToolUseResultMirror:  dropMirror,
-		DropFileHistorySnapshots: dropFileHistory,
-		DropMetaSidecar:          dropMeta,
-		DropThinking:             dropThinking,
-		KeepRecentAttachments:    body.KeepRecentAttachments,
-	}
+	opts := settings.Options
 
 	var ledgerSink io.Writer
 	var ledgerBuf strings.Builder
