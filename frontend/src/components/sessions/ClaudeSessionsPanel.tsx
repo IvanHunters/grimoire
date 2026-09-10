@@ -364,6 +364,7 @@ export function ClaudeSessionsPanel({
                   bytes: `${j.bytes_before} to ${j.bytes_after}`,
                   tokens: `${j.approx_tokens_before} to ${j.approx_tokens_after}`,
                   evicted: `${j.tool_results_evicted}/${j.tool_results}`,
+                  recompressed: j.stubs_recompressed,
                   archive: j.archive_path, ledger: j.ledger_path,
                 })
               }

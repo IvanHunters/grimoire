@@ -5,6 +5,7 @@ import { TerminalChat, type TerminalChatHandle } from './TerminalChat'
 import { sessionsAPI, type SessionStatus } from '../../api/sessions'
 import { useSessionStatus } from '../../hooks/useSessionStatus'
 import { markSessionOpen, markSessionClosed } from '../../utils/openSessions'
+import { formatCompactResult } from '../../utils/compactSummary'
 
 interface GlobalTab {
   sessionId: string
@@ -364,12 +365,7 @@ export default function GlobalTerminalPanel({ visible, onClose, onMobileSidebarC
         throw new Error(`HTTP ${r.status}`)
       } else {
         const j = await r.json()
-        const mb = (b: number) => `${(b / 1e6).toFixed(2)} MB`
-        if (j.no_change) {
-          alert('Nothing to compact: this session is already minimal. Its size is conversation text, not evictable tool output.')
-        } else {
-          alert(`Compacted: ${mb(j.bytes_before)} to ${mb(j.bytes_after)} (${j.tool_results_evicted}/${j.tool_results} tool results evicted).`)
-        }
+        alert(formatCompactResult(j))
       }
       handleRestartActive()
     } catch (err) {

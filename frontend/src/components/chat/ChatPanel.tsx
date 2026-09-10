@@ -6,6 +6,7 @@ import { sessionsAPI, type SessionStatus } from '../../api/sessions'
 import { useNotes } from '../../contexts/NotesContext'
 import { useSessionStatus } from '../../hooks/useSessionStatus'
 import type { TaskContextPayload } from '../../hooks/useTerminalWebSocket'
+import { formatCompactResult } from '../../utils/compactSummary'
 
 interface ChatPanelProps {
   visible: boolean
@@ -287,17 +288,13 @@ function ChatPanel({
           bytes: `${j.bytes_before} to ${j.bytes_after}`,
           tokens: `${j.approx_tokens_before} to ${j.approx_tokens_after}`,
           evicted: `${j.tool_results_evicted}/${j.tool_results}`,
+          recompressed: j.stubs_recompressed,
           archive: j.archive_path, ledger: j.ledger_path,
         })
         // Visible result — without this the user can't tell whether
         // Compact did anything, which read as "compact doesn't work"
         // (it was a silent no-op on already-compacted sessions).
-        const mb = (b: number) => `${(b / 1e6).toFixed(2)} MB`
-        if (j.no_change) {
-          alert('Nothing to compact: this session is already minimal. Its size is conversation text, not evictable tool output.')
-        } else {
-          alert(`Compacted: ${mb(j.bytes_before)} to ${mb(j.bytes_after)} (${j.tool_results_evicted}/${j.tool_results} tool results evicted).`)
-        }
+        alert(formatCompactResult(j))
       }
       // Restart via the same path the manual Restart button uses —
       // throttle is shared so a fast double-fire is safe.
