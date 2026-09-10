@@ -40,7 +40,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +54,132 @@ import (
 // already evicted — without this, repeated compacts would re-evict
 // stubs and pile sentinel text on top of sentinel text.
 const EvictedMarker = "[evicted by grimoire compact"
+
+// StubMarker is the header current versions write. It is deliberately
+// terse: the legacy EvictedMarker header ran ~115 bytes and repeated
+// tool_use_id, which is already a sibling field, so on small payloads
+// the stub came out LARGER than the content it replaced. A session
+// with thousands of stubs paid that overhead thousands of times.
+//
+// EvictedMarker starts with this same "[evicted" prefix, so a single
+// isEvictedStub check recognises stubs from both eras.
+const StubMarker = "[evicted"
+
+// isEvictedStub reports whether s is a stub this package wrote, in
+// either the legacy verbose form or the current compact one.
+func isEvictedStub(s string) bool {
+	return strings.HasPrefix(s, StubMarker)
+}
+
+// stubSizeRe pulls the original payload size out of a stub header,
+// matching all three shapes we have written over time:
+// "original 270 bytes,", "4000 bytes evicted.", and "[evicted 270B]".
+var stubSizeRe = regexp.MustCompile(`(\d+)\s*(?:bytes|B\])`)
+
+// buildStub renders the compact stub header, optionally followed by a
+// recall tail on its own line.
+func buildStub(originalSize int, tail string) string {
+	head := StubMarker + "]"
+	if originalSize > 0 {
+		head = fmt.Sprintf("%s %dB]", StubMarker, originalSize)
+	}
+	if tail == "" {
+		return head
+	}
+	return head + "\n" + tail
+}
+
+// parseStubOriginalSize recovers the byte count a stub header records,
+// so re-compression keeps reporting the true original size. Returns 0
+// when the header carries no size.
+func parseStubOriginalSize(s string) int {
+	head := s
+	if i := strings.IndexByte(head, '\n'); i >= 0 {
+		head = head[:i]
+	}
+	m := stubSizeRe.FindStringSubmatch(head)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// recompressStub rewrites an existing stub into the compact form with
+// a shorter tail. The second return is false when the rewrite would
+// not actually shrink the block — callers must leave it alone then, or
+// repeated Compact runs would rewrite and re-archive forever.
+func recompressStub(s string, tailBytes int) (string, bool) {
+	if !isEvictedStub(s) {
+		return s, false
+	}
+	tail := ""
+	if tailBytes > 0 {
+		if i := strings.IndexByte(s, '\n'); i >= 0 {
+			tail = utf8SafeTail(s[i+1:], tailBytes)
+		}
+	}
+	out := buildStub(parseStubOriginalSize(s), tail)
+	if len(out) >= len(s) {
+		return s, false
+	}
+	return out, true
+}
+
+// recompressValue applies recompressStub to every string reachable
+// inside v (MultiEdit.edits nests them inside an array of objects).
+func recompressValue(v any, tailBytes int, changed *bool) any {
+	switch x := v.(type) {
+	case string:
+		if out, did := recompressStub(x, tailBytes); did {
+			*changed = true
+			return out
+		}
+		return x
+	case []any:
+		for i, item := range x {
+			x[i] = recompressValue(item, tailBytes, changed)
+		}
+		return x
+	case map[string]any:
+		for k, item := range x {
+			x[k] = recompressValue(item, tailBytes, changed)
+		}
+		return x
+	default:
+		return v
+	}
+}
+
+// recompressToolResult shrinks an already-evicted tool_result stub.
+func recompressToolResult(blk map[string]any, tailBytes int) bool {
+	s, ok := blk["content"].(string)
+	if !ok {
+		return false
+	}
+	out, did := recompressStub(s, tailBytes)
+	if did {
+		blk["content"] = out
+	}
+	return did
+}
+
+// recompressToolUseInput shrinks already-evicted stubs inside a
+// tool_use input map.
+func recompressToolUseInput(blk map[string]any, tailBytes int) bool {
+	input, ok := blk["input"].(map[string]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for k, v := range input {
+		input[k] = recompressValue(v, tailBytes, &changed)
+	}
+	return changed
+}
 
 // Options controls how aggressive the compaction is.
 type Options struct {
@@ -107,6 +235,32 @@ type Options struct {
 	// regenerates reasoning from the visible conversation. Default
 	// true. Frees ~15% on long sessions.
 	DropThinking bool
+
+	// RecompressStubs re-processes blocks a PREVIOUS compact already
+	// evicted, rewriting their verbose legacy header to the compact
+	// form and trimming the retained tail to RestubTailBytes. Without
+	// it those blocks are skipped forever, so a session whose tool
+	// output is entirely stubbed cannot be shrunk any further even
+	// though most of its remaining weight is stub boilerplate.
+	//
+	// Re-compression ignores the recency window: a block can only be
+	// already-evicted if an earlier pass judged it old, and its payload
+	// is gone either way. Default false — opt in, since trimming the
+	// tail is the one lossy step here.
+	RecompressStubs bool
+
+	// RestubTailBytes is the recall tail kept inside a re-compressed
+	// stub. Zero drops the tail entirely, which is safe when the
+	// ledger sidecar is regenerated in the same pass. Only read when
+	// RecompressStubs is set.
+	RestubTailBytes int
+
+	// DropUsage removes `message.usage` — per-response token
+	// accounting. Claude never sends it back as context, so dropping
+	// it shrinks the file without touching the prompt. It is also the
+	// only on-disk record of how large the context grew, which is worth
+	// keeping for diagnosis, so this defaults to false.
+	DropUsage bool
 
 	// KeepRecentAttachments leaves the last N attachment events alone
 	// and drops everything older. Attachments are large inline file
@@ -175,6 +329,8 @@ type Stats struct {
 	MetaSidecarDropped          int    `json:"meta_sidecar_dropped"`
 	ThinkingBlocksDropped       int    `json:"thinking_blocks_dropped"`
 	AttachmentsDropped          int    `json:"attachments_dropped"`
+	StubsRecompressed           int    `json:"stubs_recompressed"`
+	UsageBlocksDropped          int    `json:"usage_blocks_dropped"`
 	// NoChange is true when compaction evicted/dropped nothing, so the
 	// transcript was left untouched (no archive rotated, no rewrite).
 	NoChange bool `json:"no_change"`
@@ -334,6 +490,27 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 		}
 	}
 
+	// Pass 2b: drop `message.usage`. It is response-side accounting the
+	// API never reads back, so removing it shrinks the file with zero
+	// effect on the resumed prompt. Off by default: it is also the only
+	// on-disk trace of how large the context grew.
+	if opts.DropUsage {
+		for i, m := range parsed {
+			if m == nil || dropLine[i] {
+				continue
+			}
+			msg, ok := m["message"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, has := msg["usage"]; has {
+				delete(msg, "usage")
+				stats.UsageBlocksDropped++
+				dirty[i] = true
+			}
+		}
+	}
+
 	// Pass 3: collect tool_use/tool_result refs with FINAL positions
 	// (post-thinking-strip). Skip drop'd lines — they won't be written
 	// anyway, no point evicting their content.
@@ -369,6 +546,13 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 	for i, ref := range useRefs {
 		if ref.alreadyEvicted {
 			stats.AlreadyEvictedSkipped++
+			if opts.RecompressStubs {
+				blk := messageContent(parsed[ref.line])[ref.idx]
+				if recompressToolUseInput(blk, opts.RestubTailBytes) {
+					stats.StubsRecompressed++
+					dirty[ref.line] = true
+				}
+			}
 			continue
 		}
 		if i >= useCutoff {
@@ -384,6 +568,13 @@ func Compact(sourcePath string, opts Options, ledgerOut io.Writer) (*Result, err
 	for i, ref := range resultRefs {
 		if ref.alreadyEvicted {
 			stats.AlreadyEvictedSkipped++
+			if opts.RecompressStubs {
+				blk := messageContent(parsed[ref.line])[ref.idx]
+				if recompressToolResult(blk, opts.RestubTailBytes) {
+					stats.StubsRecompressed++
+					dirty[ref.line] = true
+				}
+			}
 			continue
 		}
 		if i >= resultCutoff {
@@ -570,15 +761,13 @@ func computeCutoff(refs []blockRef, keep int) int {
 //   - a string (legacy / simple form)
 //   - an array of {type:"text"|"image"|"document", ...}
 //
-// Both forms get reduced to a single string stub preserving the
-// sentinel + tool_use_id + sample tail.
+// Both forms get reduced to a single string stub carrying the
+// sentinel, the original size and a sample tail. tool_use_id is NOT
+// repeated inside the text — it stays a sibling field on the block.
 func evictToolResultContent(blk map[string]any, maxTailBytes int) {
-	toolUseID, _ := blk["tool_use_id"].(string)
-
 	originalSize, tail := summariseContent(blk["content"], maxTailBytes)
 
-	blk["content"] = fmt.Sprintf("%s — original %d bytes, tool_use_id=%s. Tail follows.]\n%s",
-		EvictedMarker, originalSize, toolUseID, tail)
+	blk["content"] = buildStub(originalSize, tail)
 }
 
 // summariseContent returns (approxOriginalBytes, utf8SafeTail). Handles
@@ -645,27 +834,28 @@ func evictToolUseInput(blk map[string]any, threshold, maxTailBytes int) bool {
 	}
 	changed := false
 	for k, v := range input {
-		input[k], _, _ = maybeEvictValue(v, threshold, maxTailBytes, &changed, k)
+		input[k], _, _ = maybeEvictValue(v, threshold, maxTailBytes, &changed)
 	}
 	return changed
 }
 
 // maybeEvictValue: returns (replacementValue, evicted bool, sizeBytes).
+// The evicted field's name is not embedded in the stub: it is already
+// the map key the value sits under.
 // It handles strings (eviction by size), arrays (recurse — for
 // MultiEdit.edits), maps (recurse — defensive), and leaves primitives.
-func maybeEvictValue(v any, threshold, maxTailBytes int, changed *bool, fieldHint string) (any, bool, int) {
+func maybeEvictValue(v any, threshold, maxTailBytes int, changed *bool) (any, bool, int) {
 	switch x := v.(type) {
 	case string:
 		if len(x) > threshold {
 			*changed = true
-			return fmt.Sprintf("%s — %s field, %d bytes evicted. Tail follows.]\n%s",
-				EvictedMarker, fieldHint, len(x), utf8SafeTail(x, maxTailBytes)), true, len(x)
+			return buildStub(len(x), utf8SafeTail(x, maxTailBytes)), true, len(x)
 		}
 		return x, false, len(x)
 	case []any:
 		total := 0
 		for i, item := range x {
-			repl, _, sz := maybeEvictValue(item, threshold, maxTailBytes, changed, fmt.Sprintf("%s[%d]", fieldHint, i))
+			repl, _, sz := maybeEvictValue(item, threshold, maxTailBytes, changed)
 			x[i] = repl
 			total += sz
 		}
@@ -673,7 +863,7 @@ func maybeEvictValue(v any, threshold, maxTailBytes int, changed *bool, fieldHin
 	case map[string]any:
 		total := 0
 		for k, item := range x {
-			repl, _, sz := maybeEvictValue(item, threshold, maxTailBytes, changed, k)
+			repl, _, sz := maybeEvictValue(item, threshold, maxTailBytes, changed)
 			x[k] = repl
 			total += sz
 		}
@@ -687,7 +877,7 @@ func maybeEvictValue(v any, threshold, maxTailBytes int, changed *bool, fieldHin
 // sentinel string (string form) is already evicted; skip on re-pass.
 func resultAlreadyEvicted(blk map[string]any) bool {
 	if s, ok := blk["content"].(string); ok {
-		return strings.HasPrefix(s, EvictedMarker)
+		return isEvictedStub(s)
 	}
 	return false
 }
@@ -703,7 +893,7 @@ func inputAlreadyEvicted(blk map[string]any) bool {
 	}
 	for _, v := range input {
 		if s, ok := v.(string); ok {
-			if strings.HasPrefix(s, EvictedMarker) {
+			if isEvictedStub(s) {
 				continue
 			}
 			if len(s) > 400 {
@@ -772,7 +962,7 @@ func buildLedger(parsed []map[string]any, rawLines []string) string {
 		for _, b := range messageContent(m) {
 			switch b["type"] {
 			case "text":
-				if t, _ := b["text"].(string); t != "" && !strings.HasPrefix(t, EvictedMarker) {
+				if t, _ := b["text"].(string); t != "" && !isEvictedStub(t) {
 					if turnText.Len() > 0 {
 						turnText.WriteString(" ")
 					}

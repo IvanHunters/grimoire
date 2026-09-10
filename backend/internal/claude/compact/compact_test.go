@@ -3,6 +3,7 @@ package compact
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -139,7 +140,7 @@ func TestCompact_PreservesRecentEvictsOld(t *testing.T) {
 	if strings.Contains(body, bigOld) {
 		t.Errorf("evicted body still contains original payload")
 	}
-	if !strings.Contains(body, "evicted by grimoire compact") {
+	if !isEvictedStub(body) {
 		t.Errorf("evicted body missing stub marker: %s", body)
 	}
 
@@ -383,7 +384,7 @@ func TestCompact_EvictsLargeToolUseInput(t *testing.T) {
 	if strings.Contains(contentStr, huge) {
 		t.Errorf("content field not evicted, still contains payload")
 	}
-	if !strings.HasPrefix(contentStr, EvictedMarker) {
+	if !isEvictedStub(contentStr) {
 		t.Errorf("content stub missing sentinel marker: %s", contentStr)
 	}
 
@@ -459,13 +460,13 @@ func TestCompact_EvictsImageInToolResult(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	body := line1["message"].(map[string]any)["content"].([]any)[0].(map[string]any)["content"].(string)
-	if !strings.HasPrefix(body, EvictedMarker) {
+	if !isEvictedStub(body) {
 		t.Errorf("missing sentinel: %s", body)
 	}
-	// Original size in the stub message should reflect the base64
-	// bytes we accounted for, not just the text length.
-	if !strings.Contains(body, "4000") && !strings.Contains(body, "original 4") {
-		t.Errorf("stub should mention original size including image: %s", body)
+	// The size recorded in the stub must reflect the base64 bytes we
+	// accounted for, not just the text length.
+	if got := parseStubOriginalSize(body); got < 4000 {
+		t.Errorf("stub size %d should include the image payload: %s", got, body)
 	}
 }
 
@@ -679,4 +680,341 @@ not valid json at all
 	if !strings.Contains(string(out), "not valid json at all") {
 		t.Errorf("malformed line was dropped")
 	}
+}
+
+// ─── stub re-compression ───────────────────────────────────────────
+
+// legacyStub reproduces the verbose stub format written by earlier
+// versions of this package. Real transcripts are full of them: the
+// header alone runs ~115 bytes and repeats tool_use_id, which is
+// already present as a sibling field. On a 270-byte payload the stub
+// ended up LARGER than the content it replaced.
+func legacyStub(origSize int, toolUseID, tail string) string {
+	return fmt.Sprintf("%s — original %d bytes, tool_use_id=%s. Tail follows.]\n%s",
+		EvictedMarker, origSize, toolUseID, tail)
+}
+
+// legacyFieldStub reproduces the verbose tool_use input-field stub.
+func legacyFieldStub(field string, origSize int, tail string) string {
+	return fmt.Sprintf("%s — %s field, %d bytes evicted. Tail follows.]\n%s",
+		EvictedMarker, field, origSize, tail)
+}
+
+func stubbedFixture(t *testing.T, dir string, n int, tailLen int) string {
+	t.Helper()
+	lines := []map[string]any{{"type": "ai-title", "aiTitle": "test", "sessionId": "s1"}}
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("toolu_%030d", i)
+		lines = append(lines, map[string]any{
+			"type": "assistant", "uuid": fmt.Sprintf("a%d", i), "sessionId": "s1",
+			"message": map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": id, "name": "Read",
+					"input": map[string]any{"file_path": "/a.go"}},
+			}},
+		})
+		lines = append(lines, map[string]any{
+			"type": "user", "uuid": fmt.Sprintf("u%d", i), "sessionId": "s1",
+			"message": map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": id,
+					"content": legacyStub(270, id, strings.Repeat("T", tailLen))},
+			}},
+		})
+	}
+	return writeFixture(t, dir, lines)
+}
+
+// firstToolResultContent returns the content string of the first
+// tool_result block found in the transcript at path.
+func firstToolResultContent(t *testing.T, path string) string {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(readFileString(t, path)), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) != nil {
+			continue
+		}
+		msg, ok := m["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, b := range blocks {
+			blk, ok := b.(map[string]any)
+			if !ok || blk["type"] != "tool_result" {
+				continue
+			}
+			s, _ := blk["content"].(string)
+			return s
+		}
+	}
+	t.Fatalf("no tool_result found in %s", path)
+	return ""
+}
+
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+// A transcript already fully evicted by an older compact must still be
+// shrinkable: the verbose headers are pure overhead and the retained
+// tail is tunable. Without this, repeated Compact runs report success
+// while freeing nothing, which is exactly what a long-lived session
+// hits once every tool_result is a stub.
+func TestCompact_RecompressesLegacyStubs(t *testing.T) {
+	dir := t.TempDir()
+	path := stubbedFixture(t, dir, 20, 200)
+	before := fileSize(t, path)
+
+	res, err := Compact(path, Options{
+		KeepRecentToolResults: 2,
+		RecompressStubs:       true,
+		RestubTailBytes:       40,
+	}, nil)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	if res.Stats.StubsRecompressed == 0 {
+		t.Fatalf("expected legacy stubs to be re-compressed, got 0")
+	}
+	if after := fileSize(t, path); after >= before {
+		t.Errorf("file did not shrink: before=%d after=%d", before, after)
+	}
+
+	got := firstToolResultContent(t, path)
+	if !isEvictedStub(got) {
+		t.Errorf("re-compressed stub no longer detectable as evicted: %q", got)
+	}
+	if strings.Contains(got, "by grimoire compact") {
+		t.Errorf("verbose legacy header survived: %q", got)
+	}
+	if len(got) > 100 {
+		t.Errorf("re-compressed stub still bulky (%d bytes): %q", len(got), got)
+	}
+}
+
+// The tail is the only lossy knob here, so a caller must be able to
+// drop it entirely when the ledger already holds the detail.
+func TestCompact_RecompressStubsCanDropTail(t *testing.T) {
+	dir := t.TempDir()
+	path := stubbedFixture(t, dir, 5, 200)
+
+	if _, err := Compact(path, Options{
+		KeepRecentToolResults: 0,
+		RecompressStubs:       true,
+		RestubTailBytes:       0,
+	}, nil); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	got := firstToolResultContent(t, path)
+	if strings.Contains(got, "\n") {
+		t.Errorf("tail survived despite RestubTailBytes=0: %q", got)
+	}
+	if !isEvictedStub(got) {
+		t.Errorf("stub lost its sentinel: %q", got)
+	}
+}
+
+// Re-compression must be monotonic: running it against stubs that are
+// already minimal has to be a no-op, otherwise repeated Compact clicks
+// would rewrite (and re-archive) the transcript forever.
+func TestCompact_RecompressStubsNeverGrows(t *testing.T) {
+	dir := t.TempDir()
+	path := stubbedFixture(t, dir, 5, 200)
+
+	opts := Options{KeepRecentToolResults: 0, RecompressStubs: true, RestubTailBytes: 40}
+	if _, err := Compact(path, opts, nil); err != nil {
+		t.Fatalf("first compact: %v", err)
+	}
+	afterFirst := readFileString(t, path)
+
+	res, err := Compact(path, opts, nil)
+	if err != nil {
+		t.Fatalf("second compact: %v", err)
+	}
+	if !res.Stats.NoChange {
+		t.Errorf("second re-compression pass mutated an already-minimal transcript")
+	}
+	if got := readFileString(t, path); got != afterFirst {
+		t.Errorf("transcript changed on the second pass")
+	}
+}
+
+// Large input fields on tool_use carry the same verbose header.
+func TestCompact_RecompressesLegacyToolUseInput(t *testing.T) {
+	dir := t.TempDir()
+	lines := []map[string]any{
+		{"type": "ai-title", "sessionId": "s1"},
+		{
+			"type": "assistant", "uuid": "a1", "sessionId": "s1",
+			"message": map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "t1", "name": "Write",
+					"input": map[string]any{
+						"file_path": "/a.go",
+						"content":   legacyFieldStub("content", 4000, strings.Repeat("C", 200)),
+					}},
+			}},
+		},
+	}
+	path := writeFixture(t, dir, lines)
+	before := fileSize(t, path)
+
+	res, err := Compact(path, Options{
+		KeepRecentToolUses: 0,
+		RecompressStubs:    true,
+		RestubTailBytes:    40,
+	}, nil)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if res.Stats.StubsRecompressed == 0 {
+		t.Fatalf("tool_use input stub was not re-compressed")
+	}
+	if after := fileSize(t, path); after >= before {
+		t.Errorf("file did not shrink: before=%d after=%d", before, after)
+	}
+	if strings.Contains(readFileString(t, path), "by grimoire compact") {
+		t.Errorf("verbose legacy header survived in tool_use input")
+	}
+}
+
+// A freshly evicted block must use the compact marker AND stay
+// recognisable, so the next pass skips it instead of double-stubbing.
+func TestCompact_FreshEvictionUsesCompactMarker(t *testing.T) {
+	dir := t.TempDir()
+	lines := []map[string]any{
+		{"type": "ai-title", "sessionId": "s1"},
+		{
+			"type": "assistant", "uuid": "a1", "sessionId": "s1",
+			"message": map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "t1", "name": "Read",
+					"input": map[string]any{"file_path": "/a.go"}},
+			}},
+		},
+		{
+			"type": "user", "uuid": "u1", "sessionId": "s1",
+			"message": map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "t1",
+					"content": strings.Repeat("Z", 5000)},
+			}},
+		},
+		{
+			"type": "assistant", "uuid": "a2", "sessionId": "s1",
+			"message": map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "tool_use", "id": "t2", "name": "Read",
+					"input": map[string]any{"file_path": "/b.go"}},
+			}},
+		},
+		{
+			"type": "user", "uuid": "u2", "sessionId": "s1",
+			"message": map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "t2",
+					"content": strings.Repeat("Y", 5000)},
+			}},
+		},
+	}
+	path := writeFixture(t, dir, lines)
+
+	if _, err := Compact(path, Options{KeepRecentToolResults: 1}, nil); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	got := firstToolResultContent(t, path)
+	if !isEvictedStub(got) {
+		t.Fatalf("fresh stub not detectable: %q", got)
+	}
+	if strings.Contains(got, "by grimoire compact") {
+		t.Errorf("fresh eviction still writes the verbose header: %q", got)
+	}
+	header := got
+	if i := strings.Index(got, "\n"); i >= 0 {
+		header = got[:i]
+	}
+	if len(header) > 32 {
+		t.Errorf("stub header too long (%d bytes): %q", len(header), header)
+	}
+
+	// Second pass must treat it as already evicted.
+	res, err := Compact(path, Options{KeepRecentToolResults: 1}, nil)
+	if err != nil {
+		t.Fatalf("second compact: %v", err)
+	}
+	if res.Stats.AlreadyEvictedSkipped == 0 {
+		t.Errorf("compact marker not recognised on the second pass")
+	}
+}
+
+// message.usage is per-response billing metadata. Claude never resends
+// it as context, but it is the only record of how big the context grew,
+// so it must survive unless the caller explicitly asks to drop it.
+func TestCompact_KeepsUsageByDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := usageFixture(t, dir)
+
+	if _, err := Compact(path, Options{KeepRecentToolResults: 0}, nil); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if !strings.Contains(readFileString(t, path), "input_tokens") {
+		t.Errorf("usage was dropped without being asked")
+	}
+}
+
+func TestCompact_DropsUsageOnRequest(t *testing.T) {
+	dir := t.TempDir()
+	path := usageFixture(t, dir)
+	before := fileSize(t, path)
+
+	res, err := Compact(path, Options{KeepRecentToolResults: 0, DropUsage: true}, nil)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if res.Stats.UsageBlocksDropped == 0 {
+		t.Fatalf("no usage blocks reported dropped")
+	}
+	if strings.Contains(readFileString(t, path), "input_tokens") {
+		t.Errorf("usage survived DropUsage")
+	}
+	if after := fileSize(t, path); after >= before {
+		t.Errorf("file did not shrink: before=%d after=%d", before, after)
+	}
+}
+
+func usageFixture(t *testing.T, dir string) string {
+	t.Helper()
+	lines := []map[string]any{{"type": "ai-title", "sessionId": "s1"}}
+	for i := 0; i < 5; i++ {
+		lines = append(lines, map[string]any{
+			"type": "assistant", "uuid": fmt.Sprintf("a%d", i), "sessionId": "s1",
+			"message": map[string]any{
+				"role": "assistant",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hello"},
+				},
+				"usage": map[string]any{
+					"input_tokens":                12345,
+					"cache_read_input_tokens":     999888,
+					"cache_creation_input_tokens": 4321,
+					"output_tokens":               222,
+					"service_tier":                "standard",
+				},
+			},
+		})
+	}
+	return writeFixture(t, dir, lines)
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return fi.Size()
 }
