@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/ivanohotnikov/markdown-editor/internal/claude/compact"
 )
 
 // An empty body means "the Compact button was clicked". Those defaults
@@ -15,8 +17,8 @@ func TestCompactRequest_ResolveDefaults(t *testing.T) {
 	if !got.Options.RecompressStubs {
 		t.Errorf("RecompressStubs must default on: a session whose tool output is already stubbed cannot shrink otherwise")
 	}
-	if got.Options.RestubTailBytes != defaultRestubTailBytes {
-		t.Errorf("RestubTailBytes = %d, want %d", got.Options.RestubTailBytes, defaultRestubTailBytes)
+	if got.Options.RestubTailBytes != compact.DefaultRestubTailBytes {
+		t.Errorf("RestubTailBytes = %d, want %d", got.Options.RestubTailBytes, compact.DefaultRestubTailBytes)
 	}
 	if got.Options.DropUsage {
 		t.Errorf("DropUsage must default off: it is the only on-disk record of context growth")
@@ -70,7 +72,7 @@ func TestCompactRequest_ResolveExplicitZeroTail(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{}`), &absent); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got := absent.resolve(); got.Options.RestubTailBytes != defaultRestubTailBytes {
-		t.Errorf("absent tail = %d, want %d", got.Options.RestubTailBytes, defaultRestubTailBytes)
+	if got := absent.resolve(); got.Options.RestubTailBytes != compact.DefaultRestubTailBytes {
+		t.Errorf("absent tail = %d, want %d", got.Options.RestubTailBytes, compact.DefaultRestubTailBytes)
 	}
 }

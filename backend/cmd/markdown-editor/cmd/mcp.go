@@ -2645,9 +2645,12 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 	// is archived first so restore is one mv away.
 	s.AddTool(
 		mcp.NewTool("compact_my_session",
-			mcp.WithDescription("Shrink the current session's JSONL transcript by evicting bulky tool_result payloads from older turns. Preserves recent context verbatim, generates a structured ledger of all tool calls so nothing is lost, archives the original. Use when context feels heavy AND you want to keep working without a lossy /compact rewrite. The actual context-window benefit lands on the next resume — the in-memory conversation isn't shortened."),
+			mcp.WithDescription("Shrink the current session's JSONL transcript by evicting bulky tool_result payloads from older turns. Preserves recent context verbatim, generates a structured ledger of all tool calls so nothing is lost, archives the original. Stubs left by earlier compact runs are re-compressed too, so a session where every tool payload is already a stub still shrinks. Use when context feels heavy AND you want to keep working without a lossy /compact rewrite. The actual context-window benefit lands on the next resume — the in-memory conversation isn't shortened."),
 			mcp.WithNumber("keep_recent_tool_results", mcp.Description("Number of most-recent tool_result blocks to keep verbatim. Older ones get evicted to stubs. Default 30 (~ last 15 user/assistant exchanges).")),
 			mcp.WithNumber("max_stub_bytes", mcp.Description("Bytes of the original tool_result tail to keep inside the stub for recall. Default 200.")),
+			mcp.WithBoolean("recompress_stubs", mcp.Description("Re-process blocks a previous compact already evicted: trim their tail and drop the verbose legacy header. Default true — without it a fully-stubbed transcript cannot shrink further.")),
+			mcp.WithNumber("restub_tail_bytes", mcp.Description("Tail kept inside a re-compressed stub. 0 drops it entirely (the ledger still records the call). Default 40.")),
+			mcp.WithBoolean("drop_usage", mcp.Description("Also strip per-response token accounting (message.usage). Shrinks the file but not the prompt, and it is the only record of how far the context grew. Default false.")),
 			mcp.WithString("session_id", mcp.Description("Session ID (pass explicitly if auto-detection from GRIMOIRE_SESSION_ID fails)")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -2660,12 +2663,25 @@ func registerSessionTools(s *server.MCPServer, mcpCtx *MCPContext) {
 			if err != nil {
 				return &mcp.CallToolResult{Content: []mcp.Content{mcp.NewTextContent("Error: transcript not found for session " + sessionID)}}, nil
 			}
-			opts := compact.Options{DropToolUseResultMirror: true}
+			// Start from the shared defaults so this path and the HTTP
+			// endpoint stay in step: this tool used to set only the
+			// mirror drop, so Claude compacting its own session freed
+			// far less than the Compact button did.
+			opts := compact.DefaultOptions()
 			if v, ok := argsMap["keep_recent_tool_results"].(float64); ok && v > 0 {
 				opts.KeepRecentToolResults = int(v)
 			}
 			if v, ok := argsMap["max_stub_bytes"].(float64); ok && v > 0 {
 				opts.MaxStubBytes = int(v)
+			}
+			if v, ok := argsMap["recompress_stubs"].(bool); ok {
+				opts.RecompressStubs = v
+			}
+			if v, ok := argsMap["restub_tail_bytes"].(float64); ok && v >= 0 {
+				opts.RestubTailBytes = int(v)
+			}
+			if v, ok := argsMap["drop_usage"].(bool); ok {
+				opts.DropUsage = v
 			}
 
 			var ledgerBuf strings.Builder

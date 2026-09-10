@@ -2,12 +2,6 @@ package api
 
 import "github.com/ivanohotnikov/markdown-editor/internal/claude/compact"
 
-// defaultRestubTailBytes is how much of an already-evicted payload we
-// keep when re-compressing a stub written by an older compact pass.
-// Enough to recognise what the call returned, far below the ~115-byte
-// header those stubs used to carry on their own.
-const defaultRestubTailBytes = 40
-
 // compactRequest is the optional JSON body of POST
 // /api/sessions/{id}/compact. Pointer fields distinguish "absent" from
 // an explicit zero value, which matters for every flag that defaults
@@ -32,45 +26,38 @@ type compactSettings struct {
 	GenerateLedger bool
 }
 
-// resolve applies the defaults behind the Compact button.
-//
-// The drop-* family defaults on: none of it is content claude reads
-// back on --resume (file history is rebuilt from disk, the meta
-// sidecar is ours, thinking is an internal scratchpad).
-//
-// RecompressStubs defaults on too, and that is the difference between
-// a Compact button that works and one that reports success while
-// freeing nothing. Once every tool payload in a session is a stub,
-// there is nothing left for ordinary eviction to take, and the stub
-// boilerplate itself is what keeps the transcript from resuming.
-//
-// DropUsage defaults OFF: it never reaches the prompt, so dropping it
-// buys file size only, and it is the sole on-disk record of how far
-// the context grew.
+// resolve layers the request on top of compact.DefaultOptions, the
+// setting set shared with the compact_my_session MCP tool. Only fields
+// the caller actually sent are overridden, so a plain "Compact" click
+// (empty body) gets exactly the shared defaults.
 func (r compactRequest) resolve() compactSettings {
-	boolOr := func(v *bool, def bool) bool {
-		if v == nil {
-			return def
+	opts := compact.DefaultOptions()
+	opts.KeepRecentToolResults = r.KeepRecentToolResults
+	opts.MaxStubBytes = r.MaxStubBytes
+	opts.KeepRecentAttachments = r.KeepRecentAttachments
+
+	for _, o := range []struct {
+		v   *bool
+		dst *bool
+	}{
+		{r.DropToolUseResultMirror, &opts.DropToolUseResultMirror},
+		{r.DropFileHistorySnapshots, &opts.DropFileHistorySnapshots},
+		{r.DropMetaSidecar, &opts.DropMetaSidecar},
+		{r.DropThinking, &opts.DropThinking},
+		{r.RecompressStubs, &opts.RecompressStubs},
+		{r.DropUsage, &opts.DropUsage},
+	} {
+		if o.v != nil {
+			*o.dst = *o.v
 		}
-		return *v
 	}
-	tail := defaultRestubTailBytes
 	if r.RestubTailBytes != nil {
-		tail = *r.RestubTailBytes
+		opts.RestubTailBytes = *r.RestubTailBytes
 	}
-	return compactSettings{
-		Options: compact.Options{
-			KeepRecentToolResults:    r.KeepRecentToolResults,
-			MaxStubBytes:             r.MaxStubBytes,
-			KeepRecentAttachments:    r.KeepRecentAttachments,
-			DropToolUseResultMirror:  boolOr(r.DropToolUseResultMirror, true),
-			DropFileHistorySnapshots: boolOr(r.DropFileHistorySnapshots, true),
-			DropMetaSidecar:          boolOr(r.DropMetaSidecar, true),
-			DropThinking:             boolOr(r.DropThinking, true),
-			RecompressStubs:          boolOr(r.RecompressStubs, true),
-			RestubTailBytes:          tail,
-			DropUsage:                boolOr(r.DropUsage, false),
-		},
-		GenerateLedger: boolOr(r.GenerateLedger, true),
+
+	generateLedger := true
+	if r.GenerateLedger != nil {
+		generateLedger = *r.GenerateLedger
 	}
+	return compactSettings{Options: opts, GenerateLedger: generateLedger}
 }

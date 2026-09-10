@@ -269,6 +269,35 @@ type Options struct {
 	KeepRecentAttachments int
 }
 
+// DefaultRestubTailBytes is how much of an already-evicted payload a
+// re-compressed stub keeps: enough to recognise what the call
+// returned, far below the ~115-byte header the legacy stubs carried on
+// their own.
+const DefaultRestubTailBytes = 40
+
+// DefaultOptions is the setting set behind the user-facing "Compact"
+// action, shared by the HTTP endpoint and the compact_my_session MCP
+// tool so the two cannot drift apart.
+//
+// Everything in the drop-* family is content claude does not read back
+// on --resume: the tool_use result mirror is ours, file history is
+// rebuilt from disk, the meta sidecar is grimoire-side, and thinking is
+// an internal scratchpad.
+//
+// DropUsage is deliberately absent: it never reaches the prompt, so
+// dropping it buys file size only, and it is the sole on-disk record
+// of how far the context grew.
+func DefaultOptions() Options {
+	return Options{
+		DropToolUseResultMirror:  true,
+		DropFileHistorySnapshots: true,
+		DropMetaSidecar:          true,
+		DropThinking:             true,
+		RecompressStubs:          true,
+		RestubTailBytes:          DefaultRestubTailBytes,
+	}
+}
+
 func (o *Options) defaults() {
 	if o.KeepRecentToolResults <= 0 {
 		o.KeepRecentToolResults = 30

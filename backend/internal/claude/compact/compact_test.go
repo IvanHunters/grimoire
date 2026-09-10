@@ -1022,3 +1022,49 @@ func fileSize(t *testing.T, path string) int64 {
 	}
 	return fi.Size()
 }
+
+// The Compact action is reachable from the HTTP endpoint and from the
+// compact_my_session MCP tool. They drifted apart once already (the
+// MCP path skipped the drop-* family entirely, so Claude compacting
+// its own session freed far less than the button did), so the shared
+// defaults live here and both callers start from them.
+func TestDefaultOptions(t *testing.T) {
+	o := DefaultOptions()
+
+	for name, v := range map[string]bool{
+		"DropToolUseResultMirror":  o.DropToolUseResultMirror,
+		"DropFileHistorySnapshots": o.DropFileHistorySnapshots,
+		"DropMetaSidecar":          o.DropMetaSidecar,
+		"DropThinking":             o.DropThinking,
+		"RecompressStubs":          o.RecompressStubs,
+	} {
+		if !v {
+			t.Errorf("%s must be on by default", name)
+		}
+	}
+	if o.DropUsage {
+		t.Errorf("DropUsage must stay opt-in")
+	}
+	if o.RestubTailBytes != DefaultRestubTailBytes {
+		t.Errorf("RestubTailBytes = %d, want %d", o.RestubTailBytes, DefaultRestubTailBytes)
+	}
+}
+
+// Defaults must survive a full run end to end: the shared option set is
+// only useful if it actually shrinks a legacy-stubbed transcript.
+func TestDefaultOptions_ShrinkLegacyStubs(t *testing.T) {
+	dir := t.TempDir()
+	path := stubbedFixture(t, dir, 10, 200)
+	before := fileSize(t, path)
+
+	res, err := Compact(path, DefaultOptions(), nil)
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if res.Stats.StubsRecompressed == 0 {
+		t.Errorf("default options left legacy stubs untouched")
+	}
+	if after := fileSize(t, path); after >= before {
+		t.Errorf("default options did not shrink the transcript: %d to %d", before, after)
+	}
+}
