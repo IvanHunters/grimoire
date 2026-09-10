@@ -29,7 +29,11 @@ func writeFixture(t *testing.T, dir string, lines []map[string]any) string {
 	if err != nil {
 		t.Fatalf("create fixture: %v", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close fixture: %v", err)
+		}
+	}()
 	enc := json.NewEncoder(f)
 	for _, m := range lines {
 		if err := enc.Encode(m); err != nil {

@@ -1225,7 +1225,8 @@ func readLines(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	// Read-only handle: a failed close carries no data loss.
+	defer func() { _ = f.Close() }()
 	var lines []string
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
@@ -1289,7 +1290,8 @@ func copyFile(src, dst string) (err error) {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	// Read-only handle: a failed close carries no data loss.
+	defer func() { _ = in.Close() }()
 	out, err := os.Create(dst)
 	if err != nil {
 		return err
