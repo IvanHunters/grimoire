@@ -328,7 +328,15 @@ function ChatPanel({
       // Mobile: cover the whole viewport (top:0) so the page header
       // doesn't waste 56px when the terminal is open. Desktop keeps
       // the side-panel layout (top:14, w:680px).
-      className="fixed right-0 flex flex-col z-30 top-0 md:top-14 w-full md:w-[680px] terminal-panel"
+      //
+      // z-index: on mobile the panel overlaps the page header, which is
+      // z-50, so it has to sit above it — otherwise the header paints
+      // over the panel's own header row and every control there (close,
+      // kill, keyboard, repaint) becomes unclickable, with taps landing
+      // on the header buttons underneath. Desktop starts at top:14 and
+      // never overlaps the header, so it keeps z-30 and stays below the
+      // z-50 overlays (search modal and friends).
+      className="fixed right-0 flex flex-col z-[60] md:z-30 top-0 md:top-14 w-full md:w-[680px] terminal-panel"
       style={{ bottom: `${keyboardOffset}px`, display: visible ? undefined : 'none' }}
     >
 
