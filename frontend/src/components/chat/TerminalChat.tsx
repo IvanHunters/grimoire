@@ -372,7 +372,16 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
           )}
         </div>
       )}
-      <div ref={terminalRef} className="flex-1 min-h-0 overflow-hidden p-2" onPointerDown={() => onFocus?.()} />
+      {/* Padding lives on the outer wrapper, never on the element xterm
+          is opened into. FitAddon sizes the terminal from
+          getComputedStyle(parentElement).height, which under
+          box-sizing:border-box reports the border-box height and so
+          ignores that element's own padding. Padding here would make
+          FitAddon propose one row more than fits and the bottom row
+          (claude's status line) would be clipped by overflow-hidden. */}
+      <div className="flex-1 min-h-0 overflow-hidden p-2 flex flex-col">
+        <div ref={terminalRef} className="flex-1 min-h-0" onPointerDown={() => onFocus?.()} />
+      </div>
     </div>
   )
 })
