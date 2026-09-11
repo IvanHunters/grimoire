@@ -34,6 +34,31 @@ interface TerminalChatProps {
   onReady?: () => void
 }
 
+// Attaching to an existing session replays the daemon's recorded PTY
+// tail: raw ANSI, including absolute cursor moves and in-place
+// overwrites, produced at whatever width the session actually ran at.
+// Decoding that stream in a terminal narrower than the original makes
+// every overwrite land on the wrong column, and the replayed history
+// renders as interleaved character soup. The narrower the viewport the
+// worse it gets, which is why a phone is unusable while a desktop looks
+// fine. Widening afterwards cannot repair it: scrollback holds decoded
+// cells and claude only ever repaints the current frame.
+//
+// So decode the replay at a width no real session exceeds, then narrow
+// to whatever actually fits. Narrowing is lossless: xterm reflows the
+// buffer and soft-wraps the history, and claude repaints the live frame
+// from the SIGWINCH that the fit emits.
+const REPLAY_COLS = 120
+// Only kick in below the daemon's own default width (see daemon.Attach,
+// which falls back to 80x24): at or above it the recorded stream still
+// decodes correctly, so the desktop panel keeps rendering exactly as it
+// did instead of paying for a repaint it does not need.
+const REPLAY_MIN_COLS = 80
+// Narrow once the replay burst goes quiet, with a hard cap so a session
+// that never stops printing still ends up at the right width.
+const REPLAY_QUIET_MS = 250
+const REPLAY_MAX_MS = 2500
+
 export interface TerminalChatHandle {
   restart: () => void
   sendKey: (data: string) => void
@@ -52,6 +77,12 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
   const resizeTimeoutRef = useRef<number | undefined>(undefined)
   const isResizingRef = useRef(false)
 
+  // While true the terminal is held at REPLAY_COLS and every fit is
+  // suppressed, until finishWideReplay drops it back to the real width.
+  const wideReplayRef = useRef(false)
+  const replayQuietTimerRef = useRef<number | undefined>(undefined)
+  const replayDeadlineRef = useRef<number | undefined>(undefined)
+
   // Initial xterm dimensions. Gated > 0 so useTerminalWebSocket waits
   // for xterm to mount + fit before opening the connection. Without
   // this, init goes out with sessionId only — backend then has to
@@ -63,6 +94,23 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
   // when claude redraws.
   const [initialDims, setInitialDims] = useState<{ cols: number; rows: number } | null>(null)
 
+  const finishWideReplay = useCallback(() => {
+    if (replayQuietTimerRef.current) {
+      clearTimeout(replayQuietTimerRef.current)
+      replayQuietTimerRef.current = undefined
+    }
+    if (replayDeadlineRef.current) {
+      clearTimeout(replayDeadlineRef.current)
+      replayDeadlineRef.current = undefined
+    }
+    if (!wideReplayRef.current) return
+    wideReplayRef.current = false
+    // fit() reflows the buffer to the real width and emits onResize,
+    // which forwards the new size to the PTY.
+    try { fitAddonRef.current?.fit() } catch { /* terminal already gone */ }
+    xtermRef.current?.scrollToBottom()
+  }, [])
+
   // Handle output from WebSocket — accepts Uint8Array (decoded from base64)
   const handleOutput = useCallback((data: Uint8Array) => {
     if (!xtermRef.current) {
@@ -71,6 +119,14 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     }
 
     const term = xtermRef.current
+
+    if (wideReplayRef.current) {
+      if (replayQuietTimerRef.current) clearTimeout(replayQuietTimerRef.current)
+      replayQuietTimerRef.current = window.setTimeout(finishWideReplay, REPLAY_QUIET_MS)
+      if (replayDeadlineRef.current === undefined) {
+        replayDeadlineRef.current = window.setTimeout(finishWideReplay, REPLAY_MAX_MS)
+      }
+    }
 
     // Check if user is at the bottom before writing (within 2 lines tolerance)
     const buffer = term.buffer.active
@@ -85,7 +141,7 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
         }
       })
     }
-  }, [])
+  }, [finishWideReplay])
 
   // Setup WebSocket connection — gated on initialDims so the init
   // payload carries the correct cols/rows.
@@ -136,6 +192,9 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     },
     refit: () => {
       if (!fitAddonRef.current || !xtermRef.current) return
+      // Same reason as in handleResize: never narrow mid-replay. The
+      // fit that ends the replay does the resize anyway.
+      if (wideReplayRef.current) return
       const term = xtermRef.current
       const fit = fitAddonRef.current
       const vp = terminalRef.current?.querySelector('.xterm-viewport') as HTMLElement | null
@@ -220,6 +279,17 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     term.open(terminalRef.current)
     fitAddon.fit()
 
+    // Applies to every connection, not just the explicit attach/resume
+    // props: the sidebar reattaches to a live session through a plain
+    // sessionId, so the client cannot tell up front whether the backend
+    // will replay anything. Widening costs a freshly spawned session one
+    // extra repaint and nothing else, while skipping it corrupts every
+    // replay that does arrive.
+    if (term.cols < REPLAY_MIN_COLS) {
+      wideReplayRef.current = true
+      term.resize(REPLAY_COLS, term.rows)
+    }
+
     // Publish initial dimensions so the WS hook can finally connect
     // with cols/rows in the init payload.
     setInitialDims({ cols: term.cols, rows: term.rows })
@@ -267,6 +337,10 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     // Prevent infinite resize loops
     const handleResize = () => {
       if (isResizingRef.current) return
+      // Holding REPLAY_COLS until the replay is decoded — a fit here
+      // would narrow the terminal mid-stream, which is the corruption
+      // this is avoiding in the first place.
+      if (wideReplayRef.current) return
 
       if (resizeTimeoutRef.current) {
         clearTimeout(resizeTimeoutRef.current)
@@ -312,6 +386,7 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
     // Single delayed fit after container stabilizes
     let initialFitTimeout: number | undefined
     initialFitTimeout = window.setTimeout(() => {
+      if (wideReplayRef.current) return
       if (fitAddonRef.current && xtermRef.current) {
         try {
           fitAddonRef.current.fit()
@@ -333,6 +408,15 @@ export const TerminalChat = forwardRef<TerminalChatHandle, TerminalChatProps>(
       if (resizeTimeoutRef.current) {
         clearTimeout(resizeTimeoutRef.current)
       }
+      if (replayQuietTimerRef.current) {
+        clearTimeout(replayQuietTimerRef.current)
+        replayQuietTimerRef.current = undefined
+      }
+      if (replayDeadlineRef.current) {
+        clearTimeout(replayDeadlineRef.current)
+        replayDeadlineRef.current = undefined
+      }
+      wideReplayRef.current = false
       resizeObserver.disconnect()
 
       if (containerEl) {
